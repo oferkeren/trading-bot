@@ -1,0 +1,4253 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+
+    <meta
+        name="viewport"
+        content="width=device-width, initial-scale=1.0"
+    >
+
+    <title>TradingMax</title>
+
+    <style>
+        :root {
+            --bg: #080b10;
+            --panel: #111720;
+            --panel2: #161e28;
+            --border: #25303c;
+            --text: #edf3f8;
+            --muted: #8492a2;
+
+            --green: #45dfa0;
+            --red: #ff7070;
+            --yellow: #ffc85c;
+            --blue: #6dbaff;
+            --purple: #b58cff;
+        }
+
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            margin: 0;
+
+            font-family:
+                Inter,
+                system-ui,
+                Arial,
+                sans-serif;
+
+            color: var(--text);
+
+            background:
+                linear-gradient(
+                    180deg,
+                    #0c1219,
+                    var(--bg) 350px
+                );
+
+            min-height: 100vh;
+        }
+
+        header {
+            position: sticky;
+            top: 0;
+            z-index: 30;
+
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+
+            padding: 16px 26px;
+
+            background:
+                rgba(
+                    8,
+                    11,
+                    16,
+                    0.95
+                );
+
+            backdrop-filter: blur(16px);
+
+            border-bottom:
+                1px solid var(--border);
+        }
+
+        .brand {
+            display: flex;
+            gap: 12px;
+            align-items: center;
+        }
+
+        .logo {
+            width: 40px;
+            height: 40px;
+
+            border-radius: 11px;
+
+            display: grid;
+            place-items: center;
+
+            font-weight: 900;
+
+            color: #061019;
+
+            background:
+                linear-gradient(
+                    135deg,
+                    #268cff,
+                    #49dfa0
+                );
+        }
+
+        .title {
+            font-size: 21px;
+            font-weight: 800;
+        }
+
+        .subtitle {
+            margin-top: 2px;
+
+            font-size: 11px;
+
+            color: var(--muted);
+        }
+
+        .header-right {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .container {
+            max-width: 1700px;
+
+            margin:
+                22px auto
+                50px;
+
+            padding:
+                0 18px;
+        }
+
+        .badge {
+            display: inline-flex;
+            align-items: center;
+
+            padding:
+                5px 9px;
+
+            border-radius:
+                999px;
+
+            font-size: 11px;
+            font-weight: 800;
+        }
+
+        .good {
+            color: var(--green);
+
+            background:
+                rgba(
+                    69,
+                    223,
+                    160,
+                    0.13
+                );
+        }
+
+        .bad {
+            color: var(--red);
+
+            background:
+                rgba(
+                    255,
+                    112,
+                    112,
+                    0.13
+                );
+        }
+
+        .warn {
+            color: var(--yellow);
+
+            background:
+                rgba(
+                    255,
+                    200,
+                    92,
+                    0.13
+                );
+        }
+
+        .info {
+            color: var(--blue);
+
+            background:
+                rgba(
+                    109,
+                    186,
+                    255,
+                    0.13
+                );
+        }
+
+        .purple {
+            color: var(--purple);
+
+            background:
+                rgba(
+                    181,
+                    140,
+                    255,
+                    0.13
+                );
+        }
+
+        .alert {
+            display: none;
+
+            margin-bottom: 18px;
+
+            padding:
+                13px 16px;
+
+            border-radius:
+                10px;
+
+            font-size:
+                13px;
+        }
+
+        .alert.bad {
+            display: block;
+
+            border:
+                1px solid
+                rgba(
+                    255,
+                    112,
+                    112,
+                    0.3
+                );
+
+            background:
+                rgba(
+                    255,
+                    112,
+                    112,
+                    0.08
+                );
+
+            color: #ff9999;
+        }
+
+        .alert.warn {
+            display: block;
+
+            border:
+                1px solid
+                rgba(
+                    255,
+                    200,
+                    92,
+                    0.3
+                );
+
+            background:
+                rgba(
+                    255,
+                    200,
+                    92,
+                    0.08
+                );
+
+            color: #ffd783;
+        }
+
+        .top-grid {
+            display: grid;
+
+            grid-template-columns:
+                minmax(
+                    360px,
+                    1.4fr
+                )
+                minmax(
+                    320px,
+                    1fr
+                );
+
+            gap: 16px;
+
+            margin-bottom:
+                16px;
+        }
+
+        .panel {
+            background:
+                rgba(
+                    17,
+                    23,
+                    32,
+                    0.96
+                );
+
+            border:
+                1px solid
+                var(--border);
+
+            border-radius:
+                14px;
+
+            overflow: hidden;
+        }
+
+        .panel-header {
+            padding:
+                14px 17px;
+
+            border-bottom:
+                1px solid
+                var(--border);
+
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+
+            gap: 12px;
+
+            font-weight: 700;
+            font-size: 13px;
+        }
+
+        .panel-body {
+            padding:
+                17px;
+        }
+
+        .section {
+            margin-bottom:
+                16px;
+        }
+
+        .readiness-row {
+            display: flex;
+            gap: 20px;
+            align-items: center;
+        }
+
+        .readiness-circle {
+            min-width: 92px;
+
+            width: 92px;
+            height: 92px;
+
+            border-radius:
+                50%;
+
+            display: grid;
+            place-items: center;
+
+            border:
+                8px solid #303945;
+
+            font-size:
+                18px;
+
+            font-weight:
+                900;
+        }
+
+        .readiness-circle.ready {
+            border-color:
+                rgba(
+                    69,
+                    223,
+                    160,
+                    0.8
+                );
+
+            color:
+                var(--green);
+        }
+
+        .readiness-circle.blocked {
+            border-color:
+                rgba(
+                    255,
+                    112,
+                    112,
+                    0.75
+                );
+
+            color:
+                var(--red);
+        }
+
+        .readiness-title {
+            font-size:
+                22px;
+
+            font-weight:
+                850;
+        }
+
+        .readiness-sub {
+            margin-top:
+                5px;
+
+            color:
+                var(--muted);
+
+            font-size:
+                12px;
+        }
+
+        .control-box {
+            margin-top:
+                16px;
+
+            padding-top:
+                15px;
+
+            border-top:
+                1px solid
+                var(--border);
+        }
+
+        .kill-status {
+            margin-bottom:
+                11px;
+        }
+
+        button {
+            border: 0;
+
+            border-radius:
+                8px;
+
+            padding:
+                9px 13px;
+
+            color: white;
+
+            font-weight:
+                750;
+
+            cursor:
+                pointer;
+        }
+
+        button:hover {
+            filter:
+                brightness(
+                    1.1
+                );
+        }
+
+        button:disabled {
+            opacity:
+                0.45;
+
+            cursor:
+                not-allowed;
+        }
+
+        .stop-button {
+            background:
+                #c43c3c;
+        }
+
+        .resume-button {
+            background:
+                #19875b;
+        }
+
+        .calculate-button {
+            background:
+                #277fca;
+        }
+
+        .timeline-button {
+            background:
+                #55439b;
+
+            font-size:
+                10px;
+
+            padding:
+                6px 9px;
+        }
+
+        .close-button {
+            background:
+                #2c3541;
+
+            font-size:
+                11px;
+        }
+
+        .account-grid,
+        .metric-grid {
+            display: grid;
+
+            grid-template-columns:
+                repeat(
+                    2,
+                    minmax(
+                        0,
+                        1fr
+                    )
+                );
+
+            gap:
+                10px;
+        }
+
+        .metric-grid {
+            grid-template-columns:
+                repeat(
+                    6,
+                    minmax(
+                        150px,
+                        1fr
+                    )
+                );
+
+            margin-bottom:
+                16px;
+        }
+
+        .metric {
+            background:
+                var(--panel2);
+
+            border:
+                1px solid
+                var(--border);
+
+            border-radius:
+                11px;
+
+            padding:
+                13px;
+        }
+
+        .metric-label {
+            color:
+                var(--muted);
+
+            font-size:
+                10px;
+
+            text-transform:
+                uppercase;
+
+            letter-spacing:
+                0.7px;
+        }
+
+        .metric-value {
+            margin-top:
+                6px;
+
+            font-size:
+                21px;
+
+            font-weight:
+                800;
+        }
+
+        .metric-detail {
+            margin-top:
+                4px;
+
+            color:
+                var(--muted);
+
+            font-size:
+                11px;
+        }
+
+        .checks {
+            display: grid;
+
+            gap:
+                7px;
+        }
+
+        .check {
+            display: flex;
+            align-items:
+                flex-start;
+
+            gap:
+                9px;
+
+            padding:
+                8px 10px;
+
+            border-radius:
+                8px;
+
+            background:
+                #0d131a;
+
+            font-size:
+                12px;
+        }
+
+        .check-symbol {
+            width:
+                17px;
+
+            text-align:
+                center;
+
+            font-weight:
+                900;
+        }
+
+        .check.fail
+        .check-symbol {
+            color:
+                var(--red);
+        }
+
+        .check.pass
+        .check-symbol {
+            color:
+                var(--green);
+        }
+
+        .check.warning
+        .check-symbol {
+            color:
+                var(--yellow);
+        }
+
+        .risk-layout {
+            display: grid;
+
+            grid-template-columns:
+                1fr 1fr;
+
+            gap:
+                16px;
+        }
+
+        .preview-form {
+            display: grid;
+
+            grid-template-columns:
+                1fr 1fr auto;
+
+            gap:
+                9px;
+
+            align-items:
+                end;
+        }
+
+        label {
+            display: block;
+
+            color:
+                var(--muted);
+
+            font-size:
+                11px;
+
+            margin-bottom:
+                5px;
+        }
+
+        input {
+            width: 100%;
+
+            padding:
+                10px;
+
+            border-radius:
+                8px;
+
+            border:
+                1px solid #35414f;
+
+            background:
+                #0c1117;
+
+            color:
+                var(--text);
+        }
+
+        .preview-result {
+            margin-top:
+                13px;
+
+            padding:
+                12px;
+
+            border-radius:
+                9px;
+
+            border:
+                1px solid
+                var(--border);
+
+            background:
+                #0c1117;
+
+            display: none;
+        }
+
+        .preview-grid {
+            display: grid;
+
+            grid-template-columns:
+                repeat(
+                    3,
+                    minmax(
+                        0,
+                        1fr
+                    )
+                );
+
+            gap:
+                10px;
+        }
+
+        .preview-label {
+            color:
+                var(--muted);
+
+            font-size:
+                10px;
+        }
+
+        .preview-value {
+            margin-top:
+                3px;
+
+            font-weight:
+                800;
+        }
+
+        .table-wrap {
+            overflow-x:
+                auto;
+        }
+
+        table {
+            width:
+                100%;
+
+            border-collapse:
+                collapse;
+        }
+
+        th {
+            padding:
+                10px 13px;
+
+            text-align:
+                left;
+
+            font-size:
+                10px;
+
+            text-transform:
+                uppercase;
+
+            letter-spacing:
+                0.5px;
+
+            color:
+                var(--muted);
+
+            border-bottom:
+                1px solid
+                var(--border);
+        }
+
+        td {
+            padding:
+                11px 13px;
+
+            font-size:
+                12px;
+
+            border-bottom:
+                1px solid
+                #1d2630;
+
+            white-space:
+                nowrap;
+        }
+
+        tr:last-child td {
+            border-bottom:
+                0;
+        }
+
+        tr.clickable {
+            cursor: pointer;
+        }
+
+        tr.clickable:hover {
+            background:
+                rgba(
+                    109,
+                    186,
+                    255,
+                    0.04
+                );
+        }
+
+        .symbol {
+            font-weight:
+                800;
+        }
+
+        .muted {
+            color:
+                var(--muted);
+        }
+
+        .positive {
+            color:
+                var(--green);
+        }
+
+        .negative {
+            color:
+                var(--red);
+        }
+
+        .empty {
+            padding:
+                24px;
+
+            text-align:
+                center;
+
+            color:
+                var(--muted);
+        }
+
+        .event-source {
+            font-size:
+                10px;
+
+            text-transform:
+                uppercase;
+
+            color:
+                var(--muted);
+        }
+
+        .event-type {
+            font-weight:
+                750;
+        }
+
+        .state-arrow {
+            color:
+                var(--muted);
+        }
+
+        .timeline-overlay {
+            display: none;
+
+            position: fixed;
+
+            inset: 0;
+
+            z-index: 100;
+
+            background:
+                rgba(
+                    0,
+                    0,
+                    0,
+                    0.74
+                );
+
+            backdrop-filter:
+                blur(5px);
+
+            padding:
+                30px;
+
+            overflow-y:
+                auto;
+        }
+
+        .timeline-overlay.show {
+            display:
+                block;
+        }
+
+        .timeline-window {
+            max-width:
+                1000px;
+
+            margin:
+                0 auto;
+
+            background:
+                #10161e;
+
+            border:
+                1px solid
+                #303b48;
+
+            border-radius:
+                14px;
+
+            overflow:
+                hidden;
+
+            box-shadow:
+                0 30px 100px
+                rgba(
+                    0,
+                    0,
+                    0,
+                    0.55
+                );
+        }
+
+        .timeline-header {
+            padding:
+                16px 18px;
+
+            display: flex;
+            justify-content:
+                space-between;
+
+            align-items:
+                center;
+
+            border-bottom:
+                1px solid
+                var(--border);
+        }
+
+        .timeline-title {
+            font-size:
+                16px;
+
+            font-weight:
+                800;
+        }
+
+        .timeline-list {
+            padding:
+                18px 22px
+                24px;
+        }
+
+        .timeline-item {
+            position:
+                relative;
+
+            padding-left:
+                32px;
+
+            padding-bottom:
+                22px;
+        }
+
+        .timeline-item:last-child {
+            padding-bottom:
+                0;
+        }
+
+        .timeline-item::before {
+            content:
+                "";
+
+            position:
+                absolute;
+
+            left:
+                8px;
+
+            top:
+                18px;
+
+            bottom:
+                -4px;
+
+            width:
+                2px;
+
+            background:
+                #283440;
+        }
+
+        .timeline-item:last-child::before {
+            display:
+                none;
+        }
+
+        .timeline-dot {
+            position:
+                absolute;
+
+            left:
+                2px;
+
+            top:
+                4px;
+
+            width:
+                14px;
+
+            height:
+                14px;
+
+            border-radius:
+                50%;
+
+            background:
+                var(--blue);
+
+            border:
+                3px solid
+                #10161e;
+        }
+
+        .timeline-event {
+            font-weight:
+                800;
+
+            font-size:
+                13px;
+        }
+
+        .timeline-meta {
+            margin-top:
+                4px;
+
+            color:
+                var(--muted);
+
+            font-size:
+                11px;
+        }
+
+        .timeline-message {
+            margin-top:
+                7px;
+
+            font-size:
+                12px;
+        }
+
+        .timeline-state {
+            margin-top:
+                6px;
+
+            font-size:
+                11px;
+
+            color:
+                var(--blue);
+        }
+
+        .timeline-payload {
+            margin-top:
+                8px;
+
+            padding:
+                9px;
+
+            border-radius:
+                7px;
+
+            background:
+                #0a0f14;
+
+            border:
+                1px solid
+                #202a34;
+
+            font-family:
+                monospace;
+
+            font-size:
+                10px;
+
+            color:
+                #aebccc;
+
+            white-space:
+                pre-wrap;
+
+            overflow-wrap:
+                anywhere;
+        }
+
+        .footer {
+            text-align:
+                center;
+
+            color:
+                #687687;
+
+            font-size:
+                11px;
+
+            margin-top:
+                24px;
+        }
+
+        @media (
+            max-width: 1200px
+        ) {
+            .top-grid,
+            .risk-layout {
+                grid-template-columns:
+                    1fr;
+            }
+
+            .metric-grid {
+                grid-template-columns:
+                    repeat(
+                        3,
+                        1fr
+                    );
+            }
+        }
+
+        @media (
+            max-width: 720px
+        ) {
+            header {
+                padding:
+                    12px;
+            }
+
+            .container {
+                padding:
+                    0 10px;
+            }
+
+            .metric-grid {
+                grid-template-columns:
+                    repeat(
+                        2,
+                        1fr
+                    );
+            }
+
+            .preview-form {
+                grid-template-columns:
+                    1fr;
+            }
+
+            .preview-grid {
+                grid-template-columns:
+                    repeat(
+                        2,
+                        1fr
+                    );
+            }
+
+            .timeline-overlay {
+                padding:
+                    10px;
+            }
+        }
+    </style>
+</head>
+
+
+<body>
+
+
+<header>
+
+    <div class="brand">
+
+        <div class="logo">
+            TM
+        </div>
+
+        <div>
+
+            <div class="title">
+                TradingMax
+            </div>
+
+            <div class="subtitle">
+                Automated Trading Control Center
+            </div>
+
+        </div>
+
+    </div>
+
+
+    <div class="header-right">
+
+        <span
+            id="event-store-badge"
+            class="badge info"
+        >
+            EVENTS
+        </span>
+
+        <span
+            id="mode-badge"
+            class="badge info"
+        >
+            ...
+        </span>
+
+        <span
+            id="tws-badge"
+            class="badge warn"
+        >
+            TWS
+        </span>
+
+    </div>
+
+</header>
+
+
+<div class="container">
+
+    <div
+        id="alert"
+        class="alert"
+    ></div>
+
+
+    <!-- ================================================== -->
+    <!-- SAFETY + ACCOUNT -->
+    <!-- ================================================== -->
+
+    <div class="top-grid">
+
+        <div class="panel">
+
+            <div class="panel-header">
+
+                <span>
+                    System Safety
+                </span>
+
+                <span
+                    id="kill-badge"
+                    class="badge info"
+                >
+                    ...
+                </span>
+
+            </div>
+
+
+            <div class="panel-body">
+
+                <div class="readiness-row">
+
+                    <div
+                        id="ready-circle"
+                        class="
+                            readiness-circle
+                            blocked
+                        "
+                    >
+                        NO
+                    </div>
+
+
+                    <div>
+
+                        <div
+                            id="ready-title"
+                            class="readiness-title"
+                        >
+                            Loading
+                        </div>
+
+                        <div
+                            id="ready-sub"
+                            class="readiness-sub"
+                        >
+                            Reading safety state
+                        </div>
+
+                    </div>
+
+                </div>
+
+
+                <div
+                    id="checks"
+                    class="checks"
+                    style="
+                        margin-top:
+                        16px;
+                    "
+                ></div>
+
+
+                <div class="control-box">
+
+                    <div
+                        id="kill-status"
+                        class="
+                            kill-status
+                            muted
+                        "
+                    ></div>
+
+
+                    <button
+                        id="kill-button"
+                        class="stop-button"
+                        onclick="
+                            toggleKillSwitch()
+                        "
+                    >
+                        STOP NEW TRADES
+                    </button>
+
+                </div>
+
+            </div>
+
+        </div>
+
+
+        <div class="panel">
+
+            <div class="panel-header">
+                IBKR Account
+            </div>
+
+
+            <div class="panel-body">
+
+                <div class="account-grid">
+
+                    <div class="metric">
+
+                        <div class="metric-label">
+                            Net Liquidation
+                        </div>
+
+                        <div
+                            id="net-liq"
+                            class="metric-value"
+                        >
+                            -
+                        </div>
+
+                    </div>
+
+
+                    <div class="metric">
+
+                        <div class="metric-label">
+                            Available Funds
+                        </div>
+
+                        <div
+                            id="available-funds"
+                            class="metric-value"
+                        >
+                            -
+                        </div>
+
+                    </div>
+
+
+                    <div class="metric">
+
+                        <div class="metric-label">
+                            Buying Power
+                        </div>
+
+                        <div
+                            id="buying-power"
+                            class="metric-value"
+                        >
+                            -
+                        </div>
+
+                    </div>
+
+
+                    <div class="metric">
+
+                        <div class="metric-label">
+                            Cash
+                        </div>
+
+                        <div
+                            id="cash"
+                            class="metric-value"
+                        >
+                            -
+                        </div>
+
+                    </div>
+
+
+                    <div class="metric">
+
+                        <div class="metric-label">
+                            Daily P/L
+                        </div>
+
+                        <div
+                            id="daily-pnl"
+                            class="metric-value"
+                        >
+                            -
+                        </div>
+
+                    </div>
+
+
+                    <div class="metric">
+
+                        <div class="metric-label">
+                            Realized P/L
+                        </div>
+
+                        <div
+                            id="realized-pnl"
+                            class="metric-value"
+                        >
+                            -
+                        </div>
+
+                    </div>
+
+
+                    <div class="metric">
+
+                        <div class="metric-label">
+                            Unrealized P/L
+                        </div>
+
+                        <div
+                            id="unrealized-pnl"
+                            class="metric-value"
+                        >
+                            -
+                        </div>
+
+                    </div>
+
+
+                    <div class="metric">
+
+                        <div class="metric-label">
+                            Excess Liquidity
+                        </div>
+
+                        <div
+                            id="excess-liquidity"
+                            class="metric-value"
+                        >
+                            -
+                        </div>
+
+                    </div>
+
+                </div>
+
+            </div>
+
+        </div>
+
+    </div>
+
+
+    <!-- ================================================== -->
+    <!-- SUMMARY -->
+    <!-- ================================================== -->
+
+    <div class="metric-grid">
+
+        <div class="metric">
+
+            <div class="metric-label">
+                Positions
+            </div>
+
+            <div
+                id="position-count"
+                class="metric-value"
+            >
+                -
+            </div>
+
+            <div
+                id="position-limit"
+                class="metric-detail"
+            ></div>
+
+        </div>
+
+
+        <div class="metric">
+
+            <div class="metric-label">
+                Open Orders
+            </div>
+
+            <div
+                id="open-orders"
+                class="metric-value"
+            >
+                -
+            </div>
+
+        </div>
+
+
+        <div class="metric">
+
+            <div class="metric-label">
+                Pending Cancel
+            </div>
+
+            <div
+                id="pending-cancel"
+                class="metric-value"
+            >
+                -
+            </div>
+
+        </div>
+
+
+        <div class="metric">
+
+            <div class="metric-label">
+                Trades Today
+            </div>
+
+            <div
+                id="trades-today"
+                class="metric-value"
+            >
+                -
+            </div>
+
+            <div
+                id="trades-limit"
+                class="metric-detail"
+            ></div>
+
+        </div>
+
+
+        <div class="metric">
+
+            <div class="metric-label">
+                Risk / Trade
+            </div>
+
+            <div
+                id="risk-pct"
+                class="metric-value"
+            >
+                -
+            </div>
+
+            <div
+                id="risk-hard-cap"
+                class="metric-detail"
+            ></div>
+
+        </div>
+
+
+        <div class="metric">
+
+            <div class="metric-label">
+                Snapshot Age
+            </div>
+
+            <div
+                id="snapshot-age"
+                class="metric-value"
+            >
+                -
+            </div>
+
+        </div>
+
+    </div>
+
+
+    <!-- ================================================== -->
+    <!-- RISK -->
+    <!-- ================================================== -->
+
+    <div class="panel section">
+
+        <div class="panel-header">
+            Risk Engine
+        </div>
+
+
+        <div
+            class="
+                panel-body
+                risk-layout
+            "
+        >
+
+            <div class="account-grid">
+
+                <div class="metric">
+
+                    <div class="metric-label">
+                        Mode
+                    </div>
+
+                    <div
+                        id="risk-mode"
+                        class="metric-value"
+                    >
+                        -
+                    </div>
+
+                </div>
+
+
+                <div class="metric">
+
+                    <div class="metric-label">
+                        Max Position
+                    </div>
+
+                    <div
+                        id="max-position"
+                        class="metric-value"
+                    >
+                        -
+                    </div>
+
+                </div>
+
+
+                <div class="metric">
+
+                    <div class="metric-label">
+                        Capital / Trade
+                    </div>
+
+                    <div
+                        id="capital-pct"
+                        class="metric-value"
+                    >
+                        -
+                    </div>
+
+                </div>
+
+
+                <div class="metric">
+
+                    <div class="metric-label">
+                        Daily Loss Limit
+                    </div>
+
+                    <div
+                        id="daily-loss-limit"
+                        class="metric-value"
+                    >
+                        -
+                    </div>
+
+                </div>
+
+            </div>
+
+
+            <div>
+
+                <div
+                    style="
+                        font-weight:700;
+                        margin-bottom:11px;
+                    "
+                >
+                    Position Size Preview
+                </div>
+
+
+                <div class="preview-form">
+
+                    <div>
+
+                        <label>
+                            Entry
+                        </label>
+
+                        <input
+                            id="preview-entry"
+                            type="number"
+                            step="0.01"
+                            value="2"
+                        >
+
+                    </div>
+
+
+                    <div>
+
+                        <label>
+                            Stop
+                        </label>
+
+                        <input
+                            id="preview-stop"
+                            type="number"
+                            step="0.01"
+                            value="1.90"
+                        >
+
+                    </div>
+
+
+                    <button
+                        class="
+                            calculate-button
+                        "
+                        onclick="
+                            calculatePreview()
+                        "
+                    >
+                        CALCULATE
+                    </button>
+
+                </div>
+
+
+                <div
+                    id="preview-result"
+                    class="preview-result"
+                ></div>
+
+            </div>
+
+        </div>
+
+    </div>
+
+
+    <!-- ================================================== -->
+    <!-- POSITIONS -->
+    <!-- ================================================== -->
+
+    <div class="panel section">
+
+        <div class="panel-header">
+            Current Positions
+        </div>
+
+        <div class="table-wrap">
+
+            <table>
+
+                <thead>
+
+                    <tr>
+
+                        <th>
+                            Symbol
+                        </th>
+
+                        <th>
+                            Qty
+                        </th>
+
+                        <th>
+                            Average Cost
+                        </th>
+
+                        <th>
+                            Cost Value
+                        </th>
+
+                    </tr>
+
+                </thead>
+
+
+                <tbody
+                    id="positions-body"
+                ></tbody>
+
+            </table>
+
+        </div>
+
+    </div>
+
+
+    <!-- ================================================== -->
+    <!-- ORDERS -->
+    <!-- ================================================== -->
+
+    <div class="panel section">
+
+        <div class="panel-header">
+            IBKR Open Orders
+        </div>
+
+        <div class="table-wrap">
+
+            <table>
+
+                <thead>
+
+                    <tr>
+
+                        <th>ID</th>
+                        <th>Symbol</th>
+                        <th>Side</th>
+                        <th>Type</th>
+                        <th>Qty</th>
+                        <th>Status</th>
+                        <th>Parent</th>
+                        <th>Perm ID</th>
+                        <th>Order Ref</th>
+
+                    </tr>
+
+                </thead>
+
+
+                <tbody
+                    id="orders-body"
+                ></tbody>
+
+            </table>
+
+        </div>
+
+    </div>
+
+
+    <!-- ================================================== -->
+    <!-- TRADES -->
+    <!-- ================================================== -->
+
+    <div class="panel section">
+
+        <div class="panel-header">
+            Trade Lifecycle
+        </div>
+
+        <div class="table-wrap">
+
+            <table>
+
+                <thead>
+
+                    <tr>
+
+                        <th>Symbol</th>
+                        <th>Qty</th>
+                        <th>Entry</th>
+                        <th>Stop</th>
+                        <th>Target</th>
+
+                        <th>
+                            Entry Fill
+                        </th>
+
+                        <th>
+                            Exit Fill
+                        </th>
+
+                        <th>Risk</th>
+                        <th>P/L</th>
+                        <th>Status</th>
+                        <th></th>
+
+                    </tr>
+
+                </thead>
+
+
+                <tbody
+                    id="trades-body"
+                ></tbody>
+
+            </table>
+
+        </div>
+
+    </div>
+
+
+    <!-- ================================================== -->
+    <!-- SIGNALS -->
+    <!-- ================================================== -->
+
+    <div class="panel section">
+
+        <div class="panel-header">
+
+            <span>
+                Recent Signals
+            </span>
+
+            <span class="muted">
+                Click Timeline for full audit trail
+            </span>
+
+        </div>
+
+
+        <div class="table-wrap">
+
+            <table>
+
+                <thead>
+
+                    <tr>
+
+                        <th>
+                            Signal
+                        </th>
+
+                        <th>
+                            Strategy
+                        </th>
+
+                        <th>
+                            TF
+                        </th>
+
+                        <th>
+                            Symbol
+                        </th>
+
+                        <th>
+                            Qty
+                        </th>
+
+                        <th>
+                            Sizing
+                        </th>
+
+                        <th>
+                            Value
+                        </th>
+
+                        <th>
+                            Risk
+                        </th>
+
+                        <th>
+                            Status
+                        </th>
+
+                        <th>
+                            Updated
+                        </th>
+
+                        <th></th>
+
+                    </tr>
+
+                </thead>
+
+
+                <tbody
+                    id="signals-body"
+                ></tbody>
+
+            </table>
+
+        </div>
+
+    </div>
+
+
+    <!-- ================================================== -->
+    <!-- SYSTEM EVENTS -->
+    <!-- ================================================== -->
+
+    <div class="panel section">
+
+        <div class="panel-header">
+
+            <span>
+                System Events
+            </span>
+
+            <span
+                id="event-count"
+                class="badge purple"
+            >
+                0
+            </span>
+
+        </div>
+
+
+        <div class="table-wrap">
+
+            <table>
+
+                <thead>
+
+                    <tr>
+
+                        <th>ID</th>
+
+                        <th>
+                            Time
+                        </th>
+
+                        <th>
+                            Signal
+                        </th>
+
+                        <th>
+                            Source
+                        </th>
+
+                        <th>
+                            Event
+                        </th>
+
+                        <th>
+                            State
+                        </th>
+
+                        <th>
+                            Message
+                        </th>
+
+                    </tr>
+
+                </thead>
+
+
+                <tbody
+                    id="events-body"
+                ></tbody>
+
+            </table>
+
+        </div>
+
+    </div>
+
+
+    <div class="footer">
+        TradingMax · Auto refresh every 5 seconds
+    </div>
+
+</div>
+
+
+<!-- ====================================================== -->
+<!-- TIMELINE MODAL -->
+<!-- ====================================================== -->
+
+<div
+    id="timeline-overlay"
+    class="timeline-overlay"
+    onclick="
+        overlayClick(event)
+    "
+>
+
+    <div
+        class="timeline-window"
+        onclick="
+            event.stopPropagation()
+        "
+    >
+
+        <div class="timeline-header">
+
+            <div>
+
+                <div
+                    id="timeline-title"
+                    class="timeline-title"
+                >
+                    Signal Timeline
+                </div>
+
+                <div
+                    id="timeline-subtitle"
+                    class="muted"
+                    style="
+                        margin-top:
+                        4px;
+                        font-size:
+                        11px;
+                    "
+                ></div>
+
+            </div>
+
+
+            <button
+                class="close-button"
+                onclick="
+                    closeTimeline()
+                "
+            >
+                CLOSE
+            </button>
+
+        </div>
+
+
+        <div
+            id="timeline-list"
+            class="timeline-list"
+        >
+        </div>
+
+    </div>
+
+</div>
+
+
+<script>
+
+let currentStatus = null;
+
+
+function escapeHtml(
+    value
+) {
+
+    if (
+        value === null ||
+        value === undefined
+    ) {
+        return "";
+    }
+
+
+    return String(
+        value
+    )
+        .replaceAll(
+            "&",
+            "&amp;"
+        )
+        .replaceAll(
+            "<",
+            "&lt;"
+        )
+        .replaceAll(
+            ">",
+            "&gt;"
+        )
+        .replaceAll(
+            '"',
+            "&quot;"
+        );
+}
+
+
+function money(
+    value
+) {
+
+    if (
+        value === null ||
+        value === undefined ||
+        Number.isNaN(
+            Number(
+                value
+            )
+        )
+    ) {
+        return "-";
+    }
+
+
+    return "$"
+        + Number(
+            value
+        ).toLocaleString(
+            undefined,
+            {
+                minimumFractionDigits:
+                    2,
+
+                maximumFractionDigits:
+                    2
+            }
+        );
+}
+
+
+function formatTime(
+    value
+) {
+
+    if (!value) {
+        return "-";
+    }
+
+
+    try {
+        return new Date(
+            value
+        ).toLocaleString();
+
+    } catch {
+        return value;
+    }
+}
+
+
+function pnlClass(
+    value
+) {
+
+    if (
+        value === null ||
+        value === undefined
+    ) {
+        return "";
+    }
+
+
+    return Number(
+        value
+    ) >= 0
+        ? "positive"
+        : "negative";
+}
+
+
+function statusBadge(
+    status
+) {
+
+    const value =
+        status || "UNKNOWN";
+
+
+    let type =
+        "info";
+
+
+    if (
+        [
+            "TESTED",
+            "FILLED",
+            "OPEN_POSITION",
+            "CANCELLED",
+            "CLOSED_TP"
+        ].includes(
+            value
+        )
+    ) {
+        type =
+            "good";
+    }
+
+
+    if (
+        [
+            "ERROR",
+            "UNKNOWN",
+            "REJECTED",
+            "BLOCKED",
+            "CANCEL_UNKNOWN",
+            "CLOSED_SL"
+        ].includes(
+            value
+        )
+    ) {
+        type =
+            "bad";
+    }
+
+
+    if (
+        [
+            "PendingCancel",
+            "CANCEL_PENDING",
+            "CANCEL_REQUESTED",
+            "CANCELLING",
+            "ACCEPTED_WAITING_MARKET",
+            "QUEUED",
+            "PROCESSING"
+        ].includes(
+            value
+        )
+    ) {
+        type =
+            "warn";
+    }
+
+
+    return `
+        <span class="badge ${type}">
+            ${escapeHtml(value)}
+        </span>
+    `;
+}
+
+
+function sourceBadge(
+    source
+) {
+
+    let type =
+        "info";
+
+
+    if (
+        source
+        === "worker"
+    ) {
+        type =
+            "warn";
+    }
+
+
+    if (
+        source
+        === "monitor"
+    ) {
+        type =
+            "purple";
+    }
+
+
+    if (
+        source
+        === "api"
+    ) {
+        type =
+            "good";
+    }
+
+
+    return `
+        <span class="badge ${type}">
+            ${escapeHtml(
+                source || "?"
+            )}
+        </span>
+    `;
+}
+
+
+async function loadJson(
+    url,
+    options = {}
+) {
+
+    const response =
+        await fetch(
+            url,
+            {
+                credentials:
+                    "same-origin",
+
+                ...options
+            }
+        );
+
+
+    let data =
+        null;
+
+
+    try {
+        data =
+            await response.json();
+
+    } catch {
+        data =
+            null;
+    }
+
+
+    if (!response.ok) {
+
+        let message =
+            `HTTP ${response.status}`;
+
+
+        if (
+            data
+            &&
+            data.detail
+        ) {
+
+            if (
+                typeof data.detail
+                === "string"
+            ) {
+                message =
+                    data.detail;
+
+            } else {
+                message =
+                    JSON.stringify(
+                        data.detail
+                    );
+            }
+        }
+
+
+        throw new Error(
+            message
+        );
+    }
+
+
+    return data;
+}
+
+
+/* ==========================================================
+   SAFETY
+   ========================================================== */
+
+function renderSafety(
+    data
+) {
+
+    const safety =
+        data.safety || {};
+
+    const system =
+        data.system || {};
+
+
+    const circle =
+        document.getElementById(
+            "ready-circle"
+        );
+
+
+    const title =
+        document.getElementById(
+            "ready-title"
+        );
+
+
+    const sub =
+        document.getElementById(
+            "ready-sub"
+        );
+
+
+    if (
+        safety.live_ready
+    ) {
+
+        circle.textContent =
+            "YES";
+
+        circle.className =
+            "readiness-circle ready";
+
+        title.textContent =
+            "LIVE READY";
+
+        sub.textContent =
+            "All safety checks are passing.";
+
+    } else {
+
+        circle.textContent =
+            "NO";
+
+        circle.className =
+            "readiness-circle blocked";
+
+        title.textContent =
+            "LIVE BLOCKED";
+
+        sub.textContent =
+            `${
+                (
+                    safety.blockers
+                    || []
+                ).length
+            } blocking condition(s)`;
+    }
+
+
+    const checks =
+        document.getElementById(
+            "checks"
+        );
+
+
+    const blockers =
+        safety.blockers || [];
+
+
+    const warnings =
+        safety.warnings || [];
+
+
+    const rows = [];
+
+
+    if (
+        blockers.length === 0
+    ) {
+        rows.push(`
+            <div class="check pass">
+
+                <span class="check-symbol">
+                    ✓
+                </span>
+
+                <span>
+                    No blocking safety conditions
+                </span>
+
+            </div>
+        `);
+    }
+
+
+    blockers.forEach(
+        blocker => {
+
+            rows.push(`
+                <div class="check fail">
+
+                    <span class="check-symbol">
+                        ✕
+                    </span>
+
+                    <span>
+                        ${escapeHtml(
+                            blocker
+                        )}
+                    </span>
+
+                </div>
+            `);
+        }
+    );
+
+
+    warnings.forEach(
+        warning => {
+
+            rows.push(`
+                <div class="check warning">
+
+                    <span class="check-symbol">
+                        !
+                    </span>
+
+                    <span>
+                        ${escapeHtml(
+                            warning
+                        )}
+                    </span>
+
+                </div>
+            `);
+        }
+    );
+
+
+    checks.innerHTML =
+        rows.join("");
+
+
+    const killBadge =
+        document.getElementById(
+            "kill-badge"
+        );
+
+
+    const killButton =
+        document.getElementById(
+            "kill-button"
+        );
+
+
+    const killStatus =
+        document.getElementById(
+            "kill-status"
+        );
+
+
+    if (
+        safety.kill_switch
+    ) {
+
+        killBadge.textContent =
+            "KILL SWITCH ON";
+
+        killBadge.className =
+            "badge bad";
+
+
+        killButton.textContent =
+            "RESUME TRADING";
+
+        killButton.className =
+            "resume-button";
+
+
+        killStatus.innerHTML =
+            "New LIVE trades are blocked"
+            + (
+                safety.kill_switch_reason
+                ? " · "
+                    + escapeHtml(
+                        safety.kill_switch_reason
+                    )
+                : ""
+            );
+
+    } else {
+
+        killBadge.textContent =
+            "KILL SWITCH OFF";
+
+        killBadge.className =
+            "badge good";
+
+
+        killButton.textContent =
+            "STOP NEW TRADES";
+
+        killButton.className =
+            "stop-button";
+
+
+        killStatus.textContent =
+            "New trades are not manually blocked.";
+    }
+
+
+    const mode =
+        document.getElementById(
+            "mode-badge"
+        );
+
+
+    if (
+        system.test_mode
+    ) {
+
+        mode.textContent =
+            "TEST MODE";
+
+        mode.className =
+            "badge warn";
+
+    } else {
+
+        mode.textContent =
+            "LIVE MODE";
+
+        mode.className =
+            "badge bad";
+    }
+
+
+    const eventStore =
+        document.getElementById(
+            "event-store-badge"
+        );
+
+
+    if (
+        system.event_store
+    ) {
+        eventStore.textContent =
+            "AUDIT ON";
+
+        eventStore.className =
+            "badge purple";
+
+    } else {
+        eventStore.textContent =
+            "AUDIT OFF";
+
+        eventStore.className =
+            "badge bad";
+    }
+}
+
+
+/* ==========================================================
+   ACCOUNT
+   ========================================================== */
+
+function renderAccount(
+    data
+) {
+
+    const account =
+        data.account || {};
+
+
+    const fields = [
+        [
+            "net-liq",
+            account.net_liquidation
+        ],
+
+        [
+            "available-funds",
+            account.available_funds
+        ],
+
+        [
+            "buying-power",
+            account.buying_power
+        ],
+
+        [
+            "cash",
+            account.total_cash_value
+        ],
+
+        [
+            "daily-pnl",
+            account.daily_pnl
+        ],
+
+        [
+            "realized-pnl",
+            account.realized_pnl
+        ],
+
+        [
+            "unrealized-pnl",
+            account.unrealized_pnl
+        ],
+
+        [
+            "excess-liquidity",
+            account.excess_liquidity
+        ]
+    ];
+
+
+    fields.forEach(
+        item => {
+
+            const element =
+                document.getElementById(
+                    item[0]
+                );
+
+
+            element.textContent =
+                money(
+                    item[1]
+                );
+
+
+            if (
+                [
+                    "daily-pnl",
+                    "realized-pnl",
+                    "unrealized-pnl"
+                ].includes(
+                    item[0]
+                )
+            ) {
+                element.className =
+                    "metric-value "
+                    + pnlClass(
+                        item[1]
+                    );
+            }
+        }
+    );
+}
+
+
+/* ==========================================================
+   SUMMARY
+   ========================================================== */
+
+function renderSummary(
+    data
+) {
+
+    const summary =
+        data.summary || {};
+
+    const limits =
+        data.limits || {};
+
+    const risk =
+        data.risk || {};
+
+    const broker =
+        data.broker || {};
+
+
+    document.getElementById(
+        "position-count"
+    ).textContent =
+        summary.position_count
+        ?? 0;
+
+
+    document.getElementById(
+        "position-limit"
+    ).textContent =
+        `limit ${
+            limits.max_open_positions
+            ?? "-"
+        }`;
+
+
+    document.getElementById(
+        "open-orders"
+    ).textContent =
+        summary.open_order_count
+        ?? 0;
+
+
+    document.getElementById(
+        "pending-cancel"
+    ).textContent =
+        summary.pending_cancel_count
+        ?? 0;
+
+
+    document.getElementById(
+        "trades-today"
+    ).textContent =
+        summary.trades_today
+        ?? 0;
+
+
+    document.getElementById(
+        "trades-limit"
+    ).textContent =
+        `limit ${
+            limits.max_trades_per_day
+            ?? "-"
+        }`;
+
+
+    document.getElementById(
+        "risk-pct"
+    ).textContent =
+        `${
+            risk.risk_per_trade_pct
+            ?? "-"
+        }%`;
+
+
+    document.getElementById(
+        "risk-hard-cap"
+    ).textContent =
+        `hard cap ${
+            money(
+                risk.max_risk_per_trade_usd
+            )
+        }`;
+
+
+    document.getElementById(
+        "snapshot-age"
+    ).textContent =
+        (
+            broker.snapshot_age_seconds
+            === null
+            ||
+            broker.snapshot_age_seconds
+            === undefined
+        )
+        ? "-"
+        : Number(
+            broker.snapshot_age_seconds
+        ).toFixed(
+            1
+        )
+        + "s";
+
+
+    document.getElementById(
+        "risk-mode"
+    ).textContent =
+        risk.risk_mode
+        || "-";
+
+
+    document.getElementById(
+        "max-position"
+    ).textContent =
+        money(
+            risk.max_position_usd
+        );
+
+
+    document.getElementById(
+        "capital-pct"
+    ).textContent =
+        `${
+            risk.max_capital_per_trade_pct
+            ?? "-"
+        }%`;
+
+
+    document.getElementById(
+        "daily-loss-limit"
+    ).textContent =
+        money(
+            limits.max_daily_loss_usd
+        );
+}
+
+
+/* ==========================================================
+   POSITIONS
+   ========================================================== */
+
+function renderPositions(
+    positions
+) {
+
+    const body =
+        document.getElementById(
+            "positions-body"
+        );
+
+
+    if (
+        !positions
+        ||
+        positions.length === 0
+    ) {
+
+        body.innerHTML = `
+            <tr>
+
+                <td
+                    colspan="4"
+                    class="empty"
+                >
+                    No positions
+                </td>
+
+            </tr>
+        `;
+
+        return;
+    }
+
+
+    body.innerHTML =
+        positions.map(
+            position => {
+
+                const value =
+                    Number(
+                        position.quantity
+                        || 0
+                    )
+                    *
+                    Number(
+                        position.avg_cost
+                        || 0
+                    );
+
+
+                return `
+                    <tr>
+
+                        <td class="symbol">
+                            ${escapeHtml(
+                                position.symbol
+                            )}
+                        </td>
+
+                        <td>
+                            ${escapeHtml(
+                                position.quantity
+                            )}
+                        </td>
+
+                        <td>
+                            ${money(
+                                position.avg_cost
+                            )}
+                        </td>
+
+                        <td>
+                            ${money(
+                                value
+                            )}
+                        </td>
+
+                    </tr>
+                `;
+            }
+        ).join("");
+}
+
+
+/* ==========================================================
+   ORDERS
+   ========================================================== */
+
+function renderOrders(
+    orders
+) {
+
+    const body =
+        document.getElementById(
+            "orders-body"
+        );
+
+
+    if (
+        !orders
+        ||
+        orders.length === 0
+    ) {
+
+        body.innerHTML = `
+            <tr>
+
+                <td
+                    colspan="9"
+                    class="empty"
+                >
+                    No open broker orders
+                </td>
+
+            </tr>
+        `;
+
+        return;
+    }
+
+
+    body.innerHTML =
+        orders.map(
+            order => `
+                <tr>
+
+                    <td>
+                        ${escapeHtml(
+                            order.order_id
+                        )}
+                    </td>
+
+                    <td class="symbol">
+                        ${escapeHtml(
+                            order.symbol
+                        )}
+                    </td>
+
+                    <td>
+                        ${escapeHtml(
+                            order.action
+                        )}
+                    </td>
+
+                    <td>
+                        ${escapeHtml(
+                            order.order_type
+                        )}
+                    </td>
+
+                    <td>
+                        ${escapeHtml(
+                            order.quantity
+                        )}
+                    </td>
+
+                    <td>
+                        ${statusBadge(
+                            order.status
+                        )}
+                    </td>
+
+                    <td>
+                        ${escapeHtml(
+                            order.parent_id
+                        )}
+                    </td>
+
+                    <td class="muted">
+                        ${escapeHtml(
+                            order.perm_id
+                        )}
+                    </td>
+
+                    <td class="muted">
+                        ${escapeHtml(
+                            order.order_ref
+                            || "-"
+                        )}
+                    </td>
+
+                </tr>
+            `
+        ).join("");
+}
+
+
+/* ==========================================================
+   TRADES
+   ========================================================== */
+
+function renderTrades(
+    trades
+) {
+
+    const body =
+        document.getElementById(
+            "trades-body"
+        );
+
+
+    if (
+        !trades
+        ||
+        trades.length === 0
+    ) {
+
+        body.innerHTML = `
+            <tr>
+
+                <td
+                    colspan="11"
+                    class="empty"
+                >
+                    No recorded LIVE trades
+                </td>
+
+            </tr>
+        `;
+
+        return;
+    }
+
+
+    body.innerHTML =
+        trades.map(
+            trade => `
+                <tr>
+
+                    <td class="symbol">
+                        ${escapeHtml(
+                            trade.symbol
+                        )}
+                    </td>
+
+                    <td>
+                        ${escapeHtml(
+                            trade.quantity
+                        )}
+                    </td>
+
+                    <td>
+                        ${money(
+                            trade.entry
+                        )}
+                    </td>
+
+                    <td>
+                        ${money(
+                            trade.stop
+                        )}
+                    </td>
+
+                    <td>
+                        ${money(
+                            trade.target
+                        )}
+                    </td>
+
+                    <td>
+                        ${money(
+                            trade.entry_fill_price
+                        )}
+                    </td>
+
+                    <td>
+                        ${money(
+                            trade.exit_fill_price
+                        )}
+                    </td>
+
+                    <td>
+                        ${money(
+                            trade.planned_risk
+                        )}
+                    </td>
+
+                    <td class="${
+                        pnlClass(
+                            trade.realized_pnl
+                        )
+                    }">
+                        ${money(
+                            trade.realized_pnl
+                        )}
+                    </td>
+
+                    <td>
+                        ${statusBadge(
+                            trade.status
+                        )}
+                    </td>
+
+                    <td>
+                        <button
+                            class="timeline-button"
+                            onclick='openTimeline(
+                                ${JSON.stringify(
+                                    trade.signal_id
+                                )}
+                            )'
+                        >
+                            TIMELINE
+                        </button>
+                    </td>
+
+                </tr>
+            `
+        ).join("");
+}
+
+
+/* ==========================================================
+   SIGNALS
+   ========================================================== */
+
+function renderSignals(
+    signals
+) {
+
+    const body =
+        document.getElementById(
+            "signals-body"
+        );
+
+
+    if (
+        !signals
+        ||
+        signals.length === 0
+    ) {
+
+        body.innerHTML = `
+            <tr>
+
+                <td
+                    colspan="11"
+                    class="empty"
+                >
+                    No signals
+                </td>
+
+            </tr>
+        `;
+
+        return;
+    }
+
+
+    body.innerHTML =
+        signals.map(
+            signal => `
+                <tr>
+
+                    <td>
+                        ${escapeHtml(
+                            signal.signal_id
+                        )}
+                    </td>
+
+                    <td>
+                        ${escapeHtml(
+                            signal.strategy
+                            || "-"
+                        )}
+                    </td>
+
+                    <td>
+                        ${escapeHtml(
+                            signal.timeframe
+                            || "-"
+                        )}
+                    </td>
+
+                    <td class="symbol">
+                        ${escapeHtml(
+                            signal.symbol
+                        )}
+                    </td>
+
+                    <td>
+                        ${escapeHtml(
+                            signal.quantity
+                        )}
+                    </td>
+
+                    <td>
+                        ${escapeHtml(
+                            signal.sizing_mode
+                        )}
+                    </td>
+
+                    <td>
+                        ${money(
+                            signal.position_value
+                        )}
+                    </td>
+
+                    <td>
+                        ${money(
+                            signal.planned_risk
+                        )}
+                    </td>
+
+                    <td>
+                        ${statusBadge(
+                            signal.status
+                        )}
+                    </td>
+
+                    <td class="muted">
+                        ${formatTime(
+                            signal.updated_at
+                        )}
+                    </td>
+
+                    <td>
+                        <button
+                            class="timeline-button"
+                            onclick='openTimeline(
+                                ${JSON.stringify(
+                                    signal.signal_id
+                                )}
+                            )'
+                        >
+                            TIMELINE
+                        </button>
+                    </td>
+
+                </tr>
+            `
+        ).join("");
+}
+
+
+/* ==========================================================
+   RECENT EVENTS
+   ========================================================== */
+
+function renderEvents(
+    events
+) {
+
+    const body =
+        document.getElementById(
+            "events-body"
+        );
+
+
+    document.getElementById(
+        "event-count"
+    ).textContent =
+        events
+        ? events.length
+        : 0;
+
+
+    if (
+        !events
+        ||
+        events.length === 0
+    ) {
+
+        body.innerHTML = `
+            <tr>
+
+                <td
+                    colspan="7"
+                    class="empty"
+                >
+                    No audit events
+                </td>
+
+            </tr>
+        `;
+
+        return;
+    }
+
+
+    body.innerHTML =
+        events.map(
+            event => {
+
+                let state =
+                    "-";
+
+
+                if (
+                    event.old_status
+                    ||
+                    event.new_status
+                ) {
+                    state = `
+                        ${
+                            escapeHtml(
+                                event.old_status
+                                || "-"
+                            )
+                        }
+
+                        <span class="state-arrow">
+                            →
+                        </span>
+
+                        ${
+                            escapeHtml(
+                                event.new_status
+                                || "-"
+                            )
+                        }
+                    `;
+                }
+
+
+                const signal =
+                    event.signal_id
+                    || "SYSTEM";
+
+
+                return `
+                    <tr
+                        class="${
+                            event.signal_id
+                            ? "clickable"
+                            : ""
+                        }"
+
+                        ${
+                            event.signal_id
+                            ? `onclick='openTimeline(
+                                ${JSON.stringify(
+                                    event.signal_id
+                                )}
+                            )'`
+                            : ""
+                        }
+                    >
+
+                        <td class="muted">
+                            ${escapeHtml(
+                                event.event_id
+                            )}
+                        </td>
+
+                        <td class="muted">
+                            ${formatTime(
+                                event.created_at
+                            )}
+                        </td>
+
+                        <td>
+                            ${escapeHtml(
+                                signal
+                            )}
+                        </td>
+
+                        <td>
+                            ${sourceBadge(
+                                event.source
+                            )}
+                        </td>
+
+                        <td class="event-type">
+                            ${escapeHtml(
+                                event.event_type
+                            )}
+                        </td>
+
+                        <td>
+                            ${state}
+                        </td>
+
+                        <td>
+                            ${escapeHtml(
+                                event.message
+                                || ""
+                            )}
+                        </td>
+
+                    </tr>
+                `;
+            }
+        ).join("");
+}
+
+
+/* ==========================================================
+   TIMELINE
+   ========================================================== */
+
+async function openTimeline(
+    signalId
+) {
+
+    const overlay =
+        document.getElementById(
+            "timeline-overlay"
+        );
+
+
+    const list =
+        document.getElementById(
+            "timeline-list"
+        );
+
+
+    document.getElementById(
+        "timeline-title"
+    ).textContent =
+        "Signal Timeline";
+
+
+    document.getElementById(
+        "timeline-subtitle"
+    ).textContent =
+        signalId;
+
+
+    list.innerHTML =
+        `
+            <div class="empty">
+                Loading audit trail...
+            </div>
+        `;
+
+
+    overlay.classList.add(
+        "show"
+    );
+
+
+    try {
+
+        const events =
+            await loadJson(
+                "/events/"
+                + encodeURIComponent(
+                    signalId
+                )
+            );
+
+
+        if (
+            !events
+            ||
+            events.length === 0
+        ) {
+
+            list.innerHTML =
+                `
+                    <div class="empty">
+                        No events found for this signal
+                    </div>
+                `;
+
+            return;
+        }
+
+
+        list.innerHTML =
+            events.map(
+                event => {
+
+                    let stateHtml =
+                        "";
+
+
+                    if (
+                        event.old_status
+                        ||
+                        event.new_status
+                    ) {
+
+                        stateHtml = `
+                            <div class="timeline-state">
+
+                                ${
+                                    escapeHtml(
+                                        event.old_status
+                                        || "-"
+                                    )
+                                }
+
+                                →
+
+                                ${
+                                    escapeHtml(
+                                        event.new_status
+                                        || "-"
+                                    )
+                                }
+
+                            </div>
+                        `;
+                    }
+
+
+                    let payloadHtml =
+                        "";
+
+
+                    if (
+                        event.payload
+                        !== null
+                        &&
+                        event.payload
+                        !== undefined
+                    ) {
+
+                        payloadHtml = `
+                            <div class="timeline-payload">${
+                                escapeHtml(
+                                    JSON.stringify(
+                                        event.payload,
+                                        null,
+                                        2
+                                    )
+                                )
+                            }</div>
+                        `;
+                    }
+
+
+                    return `
+                        <div class="timeline-item">
+
+                            <div class="timeline-dot">
+                            </div>
+
+                            <div class="timeline-event">
+
+                                ${escapeHtml(
+                                    event.event_type
+                                )}
+
+                            </div>
+
+                            <div class="timeline-meta">
+
+                                ${formatTime(
+                                    event.created_at
+                                )}
+
+                                ·
+
+                                ${escapeHtml(
+                                    event.source
+                                )}
+
+                                · event #
+
+                                ${escapeHtml(
+                                    event.event_id
+                                )}
+
+                            </div>
+
+                            ${stateHtml}
+
+                            ${
+                                event.message
+                                ? `
+                                    <div class="timeline-message">
+                                        ${escapeHtml(
+                                            event.message
+                                        )}
+                                    </div>
+                                `
+                                : ""
+                            }
+
+                            ${payloadHtml}
+
+                        </div>
+                    `;
+                }
+            ).join("");
+
+
+    } catch (
+        error
+    ) {
+
+        list.innerHTML = `
+            <div class="empty negative">
+                Failed to load timeline:
+                ${escapeHtml(
+                    error.message
+                )}
+            </div>
+        `;
+    }
+}
+
+
+function closeTimeline() {
+
+    document.getElementById(
+        "timeline-overlay"
+    ).classList.remove(
+        "show"
+    );
+}
+
+
+function overlayClick(
+    event
+) {
+
+    if (
+        event.target.id
+        === "timeline-overlay"
+    ) {
+        closeTimeline();
+    }
+}
+
+
+document.addEventListener(
+    "keydown",
+    event => {
+
+        if (
+            event.key
+            === "Escape"
+        ) {
+            closeTimeline();
+        }
+    }
+);
+
+
+/* ==========================================================
+   RISK PREVIEW
+   ========================================================== */
+
+async function calculatePreview() {
+
+    const entry =
+        document.getElementById(
+            "preview-entry"
+        ).value;
+
+
+    const stop =
+        document.getElementById(
+            "preview-stop"
+        ).value;
+
+
+    const box =
+        document.getElementById(
+            "preview-result"
+        );
+
+
+    box.style.display =
+        "block";
+
+
+    box.innerHTML =
+        "Calculating...";
+
+
+    try {
+
+        const result =
+            await loadJson(
+                "/risk-preview"
+                + "?entry="
+                + encodeURIComponent(
+                    entry
+                )
+                + "&stop="
+                + encodeURIComponent(
+                    stop
+                )
+            );
+
+
+        box.innerHTML = `
+            <div class="preview-grid">
+
+                <div>
+                    <div class="preview-label">
+                        Quantity
+                    </div>
+
+                    <div class="preview-value">
+                        ${escapeHtml(
+                            result.quantity
+                        )}
+                    </div>
+                </div>
+
+
+                <div>
+                    <div class="preview-label">
+                        Position
+                    </div>
+
+                    <div class="preview-value">
+                        ${money(
+                            result.position_value
+                        )}
+                    </div>
+                </div>
+
+
+                <div>
+                    <div class="preview-label">
+                        Planned Risk
+                    </div>
+
+                    <div class="preview-value">
+                        ${money(
+                            result.planned_risk
+                        )}
+                    </div>
+                </div>
+
+
+                <div>
+                    <div class="preview-label">
+                        Risk Budget
+                    </div>
+
+                    <div class="preview-value">
+                        ${money(
+                            result.risk_budget
+                        )}
+                    </div>
+                </div>
+
+
+                <div>
+                    <div class="preview-label">
+                        Capital Budget
+                    </div>
+
+                    <div class="preview-value">
+                        ${money(
+                            result.capital_budget
+                        )}
+                    </div>
+                </div>
+
+
+                <div>
+                    <div class="preview-label">
+                        Risk / Share
+                    </div>
+
+                    <div class="preview-value">
+                        ${money(
+                            result.risk_per_share
+                        )}
+                    </div>
+                </div>
+
+            </div>
+        `;
+
+
+    } catch (
+        error
+    ) {
+
+        box.innerHTML = `
+            <span class="negative">
+                ${escapeHtml(
+                    error.message
+                )}
+            </span>
+        `;
+    }
+}
+
+
+/* ==========================================================
+   KILL SWITCH
+   ========================================================== */
+
+async function toggleKillSwitch() {
+
+    if (!currentStatus) {
+        return;
+    }
+
+
+    const safety =
+        currentStatus.safety
+        || {};
+
+
+    const currentlyEnabled =
+        Boolean(
+            safety.kill_switch
+        );
+
+
+    let reason =
+        null;
+
+
+    if (!currentlyEnabled) {
+
+        reason =
+            window.prompt(
+                "Reason for stopping new trades:",
+                "Manual dashboard stop"
+            );
+
+
+        if (
+            reason === null
+        ) {
+            return;
+        }
+
+
+        const confirmed =
+            window.confirm(
+                "Block all NEW LIVE trades?\n\n"
+                + "Existing positions and protective "
+                + "orders will NOT be cancelled."
+            );
+
+
+        if (!confirmed) {
+            return;
+        }
+
+
+    } else {
+
+        const confirmed =
+            window.confirm(
+                "Remove the manual kill switch?\n\n"
+                + "Other safety blockers will still "
+                + "prevent LIVE trading."
+            );
+
+
+        if (!confirmed) {
+            return;
+        }
+    }
+
+
+    const button =
+        document.getElementById(
+            "kill-button"
+        );
+
+
+    button.disabled =
+        true;
+
+
+    try {
+
+        await loadJson(
+            "/control/kill-switch",
+            {
+                method:
+                    "POST",
+
+                headers: {
+                    "Content-Type":
+                        "application/json"
+                },
+
+                body:
+                    JSON.stringify({
+                        enabled:
+                            !currentlyEnabled,
+
+                        reason:
+                            currentlyEnabled
+                            ? null
+                            : reason
+                    })
+            }
+        );
+
+
+        await refreshDashboard();
+
+
+    } catch (
+        error
+    ) {
+
+        window.alert(
+            "Kill switch request failed: "
+            + error.message
+        );
+
+
+    } finally {
+
+        button.disabled =
+            false;
+    }
+}
+
+
+/* ==========================================================
+   STATUS
+   ========================================================== */
+
+function renderStatus(
+    data
+) {
+
+    currentStatus =
+        data;
+
+
+    renderSafety(
+        data
+    );
+
+
+    renderAccount(
+        data
+    );
+
+
+    renderSummary(
+        data
+    );
+
+
+    const broker =
+        data.broker
+        || {};
+
+
+    const tws =
+        document.getElementById(
+            "tws-badge"
+        );
+
+
+    if (
+        broker.tws_connected
+    ) {
+
+        tws.textContent =
+            "TWS ONLINE";
+
+        tws.className =
+            "badge good";
+
+    } else {
+
+        tws.textContent =
+            "TWS OFFLINE";
+
+        tws.className =
+            "badge bad";
+    }
+
+
+    renderPositions(
+        broker.positions
+        || []
+    );
+
+
+    renderOrders(
+        broker.open_orders
+        || []
+    );
+
+
+    renderSignals(
+        data.recent_signals
+        || []
+    );
+
+
+    renderEvents(
+        data.recent_events
+        || []
+    );
+
+
+    const alert =
+        document.getElementById(
+            "alert"
+        );
+
+
+    alert.style.display =
+        "";
+
+
+    if (
+        data.safety
+        &&
+        data.safety.kill_switch
+    ) {
+
+        alert.className =
+            "alert bad";
+
+        alert.textContent =
+            "KILL SWITCH ACTIVE: "
+            + (
+                data.safety
+                    .kill_switch_reason
+                ||
+                "New LIVE trades are blocked."
+            );
+
+
+    } else if (
+        data.summary
+        &&
+        data.summary
+            .pending_cancel_count
+        > 0
+    ) {
+
+        alert.className =
+            "alert warn";
+
+        alert.textContent =
+            data.summary
+                .pending_cancel_count
+            + " order(s) are PendingCancel. "
+            + "LIVE trading remains blocked.";
+
+
+    } else {
+
+        alert.className =
+            "alert";
+
+        alert.textContent =
+            "";
+
+        alert.style.display =
+            "none";
+    }
+}
+
+
+/* ==========================================================
+   REFRESH
+   ========================================================== */
+
+async function refreshDashboard() {
+
+    try {
+
+        const [
+            status,
+            trades
+        ] = await Promise.all([
+            loadJson(
+                "/status"
+            ),
+
+            loadJson(
+                "/trades"
+            )
+        ]);
+
+
+        renderStatus(
+            status
+        );
+
+
+        renderTrades(
+            trades
+        );
+
+
+    } catch (
+        error
+    ) {
+
+        const alert =
+            document.getElementById(
+                "alert"
+            );
+
+
+        alert.className =
+            "alert bad";
+
+
+        alert.textContent =
+            "Dashboard refresh failed: "
+            + error.message;
+    }
+}
+
+
+refreshDashboard();
+
+
+setInterval(
+    refreshDashboard,
+    5000
+);
+
+</script>
+
+
+</body>
+</html>
