@@ -1,22 +1,10 @@
 # TradingMax
 
-מערכת מסחר אוטומטית המבוססת על:
+TradingMax is an automated trading system that receives signals from TradingView, validates them, applies risk and safety controls, queues them in SQLite, and executes approved trades through Interactive Brokers TWS.
 
-- TradingView
-- Cloudflare Tunnel
-- FastAPI
-- SQLite
-- Python worker
-- Interactive Brokers TWS
-- IBKR API
-- Trade lifecycle monitor
-- Runtime status collector
-- Watchdog
-- systemd
+The system is designed to fail closed.
 
-המערכת בנויה בגישת fail-closed.
-
-אם אחד מרכיבי הבטיחות אינו תקין, המערכת אמורה לחסום יצירת עסקה ולא לנסות "להסתדר לבד".
+If broker data is missing, stale, inconsistent, or ambiguous, TradingMax should block trading rather than guess.
 
 ---
 
@@ -26,20 +14,17 @@
 TradingView
     |
     v
-https://trade.tradingmax.bid
-    |
-    v
 Cloudflare Tunnel
     |
     v
-FastAPI
+FastAPI API
 signal_server.py
     |
-    +--> authentication
-    +--> signal validation
-    +--> signal freshness
-    +--> risk sizing
-    +--> execution safety
+    +--> Secret validation
+    +--> Signal validation
+    +--> Signal freshness
+    +--> Risk sizing
+    +--> Live safety checks
     |
     v
 SQLite
@@ -48,31 +33,30 @@ trading.db
     v
 worker.py
     |
-    +--> atomic queue claim
-    +--> execution freshness
-    +--> safety guard
-    +--> market-session guard
-    +--> position policy
-    +--> broker-wide open-order check
-    +--> account/P&L validation
+    +--> Atomic queue claim
+    +--> Freshness validation
+    +--> Execution guard
+    +--> TWS connection
+    +--> Position policy
+    +--> Account-wide open orders
+    +--> Market session validation
+    +--> Account / P&L validation
     +--> PRELIVE_DRY_RUN gate
     |
     v
-IBKR TWS
+Interactive Brokers TWS
     |
     v
 Bracket Order
-ENTRY + TP + SL
+ENTRY + TAKE PROFIT + STOP LOSS
     |
     v
 trade_monitor.py
     |
-    +--> orderRef matching
-    +--> permId matching
-    +--> orderId matching
-    +--> broker parentId matching
-    +--> executions
-    +--> lifecycle
+    +--> Order identity
+    +--> Execution tracking
+    +--> Position lifecycle
+    +--> Exit detection
     |
     v
-SQLite / Dashboard / system_report.py
+SQLite / Dashboard / System Report

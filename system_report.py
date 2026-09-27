@@ -1,18 +1,24 @@
 import json
 import math
 import os
+import shlex
 import sqlite3
 import subprocess
 
 from datetime import datetime, timezone
+
 from dotenv import load_dotenv
 
 from position_policy import (
     evaluate_position_limits,
     count_trades_today,
-    PositionPolicyError
+    PositionPolicyError,
 )
 
+
+# ============================================================
+# PATHS / ENVIRONMENT
+# ============================================================
 
 BASE_DIR = os.path.dirname(
     os.path.abspath(__file__)
@@ -23,6 +29,7 @@ DB_FILE = os.path.join(
     "trading.db"
 )
 
+
 load_dotenv(
     os.path.join(
         BASE_DIR,
@@ -30,6 +37,10 @@ load_dotenv(
     )
 )
 
+
+# ============================================================
+# CONFIG
+# ============================================================
 
 EXPECTED_ACCOUNT = os.getenv(
     "IB_ACCOUNT",
@@ -112,9 +123,18 @@ SERVICES = [
     "trading-monitor",
     "trading-status",
     "trading-watchdog",
-    "cloudflared"
+    "cloudflared",
 ]
 
+
+WORKER_SERVICE = (
+    "trading-worker"
+)
+
+
+# ============================================================
+# DATABASE
+# ============================================================
 
 def db_connect():
     conn = sqlite3.connect(
@@ -127,16 +147,56 @@ def db_connect():
     return conn
 
 
+# ============================================================
+# GENERIC HELPERS
+# ============================================================
+
+def parse_bool(
+    value,
+    default=None
+):
+    if value is None:
+        return default
+
+
+    text = str(
+        value
+    ).strip().lower()
+
+
+    if text in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        return True
+
+
+    if text in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }:
+        return False
+
+
+    return default
+
+
 def parse_time(
     value
 ):
     if not value:
         return None
 
+
     try:
         text = str(
             value
         ).strip()
+
 
         if text.endswith(
             "Z"
@@ -146,18 +206,22 @@ def parse_time(
                 + "+00:00"
             )
 
+
         result = datetime.fromisoformat(
             text
         )
+
 
         if result.tzinfo is None:
             result = result.replace(
                 tzinfo=timezone.utc
             )
 
+
         return result.astimezone(
             timezone.utc
         )
+
 
     except Exception:
         return None
@@ -170,8 +234,10 @@ def age_seconds(
         value
     )
 
+
     if timestamp is None:
         return None
+
 
     return max(
         0.0,
@@ -179,7 +245,8 @@ def age_seconds(
             datetime.now(
                 timezone.utc
             )
-            - timestamp
+            -
+            timestamp
         ).total_seconds()
     )
 
@@ -192,17 +259,21 @@ def safe_number(
             value
         )
 
+
         if not math.isfinite(
             number
         ):
             return None
+
 
         if abs(
             number
         ) > 1e100:
             return None
 
+
         return number
+
 
     except Exception:
         return None
@@ -214,13 +285,16 @@ def strict_json_list(
     if value is None:
         return None
 
+
     try:
         result = json.loads(
             value
         )
 
+
     except Exception:
         return None
+
 
     if not isinstance(
         result,
@@ -228,39 +302,324 @@ def strict_json_list(
     ):
         return None
 
+
     return result
 
+
+def print_title(
+    title
+):
+    print()
+
+    print(
+        "=" * 78
+    )
+
+    print(
+        title
+    )
+
+    print(
+        "=" * 78
+    )
+
+
+# ============================================================
+# SYSTEMD HELPERS
+# ============================================================
 
 def service_status():
     result = {}
 
+
     for service in SERVICES:
+        try:
+            proc = subprocess.run(
+                [
+                    "systemctl",
+                    "is-active",
+                    service,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
 
-        proc = subprocess.run(
-            [
-                "systemctl",
-                "is-active",
-                service
-            ],
-            capture_output=True,
-            text=True
-        )
 
-        state = (
-            proc.stdout
-            or proc.stderr
-            or ""
-        ).strip()
+            state = (
+                proc.stdout
+                or
+                proc.stderr
+                or ""
+            ).strip()
+
+
+            if not state:
+                state = "unknown"
+
+
+        except Exception as exc:
+            state = (
+                f"error:{exc}"
+            )
+
 
         result[
             service
         ] = state
 
+
     return result
 
 
+def read_service_environment(
+    service
+):
+    try:
+        proc = subprocess.run(
+            [
+                "systemctl",
+                "show",
+                service,
+                "-p",
+                "Environment",
+                "--value",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+
+
+        if proc.returncode != 0:
+            message = (
+                proc.stderr
+                or proc.stdout
+                or "systemctl failed"
+            ).strip()
+
+
+            return {
+                "ok":
+                    False,
+
+                "values":
+                    {},
+
+                "error":
+                    message,
+            }
+
+
+        raw = (
+            proc.stdout
+            or ""
+        ).strip()
+
+
+        values = {}
+
+
+        if raw:
+            try:
+                parts = shlex.split(
+                    raw
+                )
+
+
+            except Exception:
+                parts = raw.split()
+
+
+            for part in parts:
+                if "=" not in part:
+                    continue
+
+
+                key, value = part.split(
+                    "=",
+                    1
+                )
+
+
+                key = key.strip()
+
+
+                if not key:
+                    continue
+
+
+                values[
+                    key
+                ] = value
+
+
+        return {
+            "ok":
+                True,
+
+            "values":
+                values,
+
+            "error":
+                None,
+        }
+
+
+    except Exception as exc:
+        return {
+            "ok":
+                False,
+
+            "values":
+                {},
+
+            "error":
+                str(
+                    exc
+                ),
+        }
+
+
+def resolve_worker_prelive_mode():
+    service_env = read_service_environment(
+        WORKER_SERVICE
+    )
+
+
+    if service_env[
+        "ok"
+    ]:
+
+        raw = service_env[
+            "values"
+        ].get(
+            "PRELIVE_DRY_RUN"
+        )
+
+
+        if raw is not None:
+            parsed = parse_bool(
+                raw,
+                default=None
+            )
+
+
+            if parsed is not None:
+                return {
+                    "value":
+                        parsed,
+
+                    "source":
+                        "systemd",
+
+                    "raw":
+                        raw,
+
+                    "error":
+                        None,
+                }
+
+
+            return {
+                "value":
+                    True,
+
+                "source":
+                    "systemd-invalid",
+
+                "raw":
+                    raw,
+
+                "error":
+                    (
+                        "Invalid PRELIVE_DRY_RUN "
+                        f"value in systemd: {raw}"
+                    ),
+            }
+
+
+    env_raw = os.getenv(
+        "PRELIVE_DRY_RUN"
+    )
+
+
+    if env_raw is not None:
+        parsed = parse_bool(
+            env_raw,
+            default=None
+        )
+
+
+        if parsed is not None:
+            return {
+                "value":
+                    parsed,
+
+                "source":
+                    ".env/process",
+
+                "raw":
+                    env_raw,
+
+                "error":
+                    (
+                        None
+                        if service_env["ok"]
+                        else service_env["error"]
+                    ),
+            }
+
+
+        return {
+            "value":
+                True,
+
+            "source":
+                ".env-invalid",
+
+            "raw":
+                env_raw,
+
+            "error":
+                (
+                    "Invalid PRELIVE_DRY_RUN "
+                    f"value: {env_raw}"
+                ),
+        }
+
+
+    #
+    # worker.py itself defaults PRELIVE_DRY_RUN to true.
+    #
+    # The report must fail closed as well.
+    #
+    return {
+        "value":
+            True,
+
+        "source":
+            "safe-default",
+
+        "raw":
+            None,
+
+        "error":
+            (
+                None
+                if service_env["ok"]
+                else service_env["error"]
+            ),
+    }
+
+
+# ============================================================
+# RUNTIME DATABASE
+# ============================================================
+
 def read_runtime():
     conn = db_connect()
+
 
     try:
         row = conn.execute(
@@ -271,11 +630,14 @@ def read_runtime():
             """
         ).fetchone()
 
+
     finally:
         conn.close()
 
+
     if row is None:
         return None
+
 
     return dict(
         row
@@ -284,6 +646,7 @@ def read_runtime():
 
 def read_components():
     conn = db_connect()
+
 
     try:
         rows = conn.execute(
@@ -299,13 +662,19 @@ def read_components():
             """
         ).fetchall()
 
+
         return [
-            dict(row)
-            for row in rows
+            dict(
+                row
+            )
+            for row
+            in rows
         ]
+
 
     except sqlite3.Error:
         return []
+
 
     finally:
         conn.close()
@@ -313,6 +682,7 @@ def read_components():
 
 def read_control():
     conn = db_connect()
+
 
     try:
         row = conn.execute(
@@ -326,11 +696,14 @@ def read_control():
             """
         ).fetchone()
 
+
     finally:
         conn.close()
 
+
     if row is None:
         return None
+
 
     return dict(
         row
@@ -339,6 +712,7 @@ def read_control():
 
 def read_signal_summary():
     conn = db_connect()
+
 
     try:
         status_rows = conn.execute(
@@ -400,8 +774,11 @@ def read_signal_summary():
 
 
         active = [
-            dict(row)
-            for row in active_rows
+            dict(
+                row
+            )
+            for row
+            in active_rows
         ]
 
 
@@ -424,42 +801,47 @@ def read_signal_summary():
 
 
         events = [
-            dict(row)
-            for row in event_rows
+            dict(
+                row
+            )
+            for row
+            in event_rows
         ]
 
 
         return (
             status_counts,
             active,
-            events
+            events,
         )
+
 
     finally:
         conn.close()
 
 
-def print_title(
-    title
-):
-    print()
-
-    print(
-        "=" * 78
-    )
-
-    print(
-        title
-    )
-
-    print(
-        "=" * 78
-    )
-
+# ============================================================
+# MAIN REPORT
+# ============================================================
 
 def main():
     blockers = []
 
+
+    prelive = (
+        resolve_worker_prelive_mode()
+    )
+
+    PRELIVE_DRY_RUN = bool(
+        prelive[
+            "value"
+        ]
+    )
+
+
+    # ========================================================
+    # HEADER
+    # ========================================================
 
     print_title(
         "TRADINGMAX SYSTEM REPORT"
@@ -467,24 +849,44 @@ def main():
 
 
     print(
-        f"Generated UTC : "
+        f"Generated UTC     : "
         f"{datetime.now(timezone.utc).isoformat()}"
     )
 
     print(
-        f"LIVE_TRADING  : "
+        f"LIVE_TRADING      : "
         f"{LIVE_TRADING}"
     )
 
     print(
-        f"TEST_MODE     : "
+        f"TEST_MODE         : "
         f"{WEBHOOK_TEST_MODE}"
     )
 
     print(
-        f"IB_ACCOUNT    : "
+        f"PRELIVE_DRY_RUN   : "
+        f"{PRELIVE_DRY_RUN}"
+    )
+
+    print(
+        f"PRELIVE source    : "
+        f"{prelive['source']}"
+    )
+
+    print(
+        f"IB_ACCOUNT        : "
         f"{EXPECTED_ACCOUNT or 'NOT CONFIGURED'}"
     )
+
+
+    if prelive[
+        "error"
+    ]:
+
+        print(
+            f"PRELIVE warning   : "
+            f"{prelive['error']}"
+        )
 
 
     # ========================================================
@@ -496,18 +898,22 @@ def main():
     )
 
 
-    services = service_status()
+    services = (
+        service_status()
+    )
 
 
-    for service, state in (
-        services.items()
-    ):
+    for (
+        service,
+        state
+    ) in services.items():
 
         marker = (
             "OK"
             if state == "active"
             else "FAIL"
         )
+
 
         print(
             f"{marker:4}  "
@@ -517,9 +923,11 @@ def main():
 
 
         if (
-            service != "cloudflared"
+            service
+            != "cloudflared"
             and
-            state != "active"
+            state
+            != "active"
         ):
 
             blockers.append(
@@ -539,7 +947,9 @@ def main():
     )
 
 
-    components = read_components()
+    components = (
+        read_components()
+    )
 
 
     if not components:
@@ -630,7 +1040,9 @@ def main():
     )
 
 
-    control = read_control()
+    control = (
+        read_control()
+    )
 
 
     if control is None:
@@ -672,7 +1084,7 @@ def main():
 
 
     # ========================================================
-    # BROKER
+    # BROKER SNAPSHOT
     # ========================================================
 
     print_title(
@@ -680,7 +1092,9 @@ def main():
     )
 
 
-    runtime = read_runtime()
+    runtime = (
+        read_runtime()
+    )
 
     positions = None
 
@@ -818,7 +1232,7 @@ def main():
                         MAX_MANAGED_POSITIONS,
 
                     max_total_broker_positions=
-                        MAX_TOTAL_BROKER_POSITIONS
+                        MAX_TOTAL_BROKER_POSITIONS,
                 )
             )
 
@@ -912,15 +1326,12 @@ def main():
             order
             for order
             in open_orders
-
             if (
                 isinstance(
                     order,
                     dict
                 )
-
                 and
-
                 str(
                     order.get(
                         "status",
@@ -1175,9 +1586,11 @@ def main():
     # SIGNALS / EVENTS
     # ========================================================
 
-    status_counts, active, events = (
-        read_signal_summary()
-    )
+    (
+        status_counts,
+        active,
+        events,
+    ) = read_signal_summary()
 
 
     print_title(
@@ -1185,12 +1598,14 @@ def main():
     )
 
 
-    for status, count in (
-        status_counts.items()
-    ):
+    for (
+        status,
+        count
+    ) in status_counts.items():
 
         print(
-            f"{status:28} {count}"
+            f"{status:28} "
+            f"{count}"
         )
 
 
@@ -1221,6 +1636,26 @@ def main():
                 f"ref="
                 f"{signal['entry_order_ref'] or '-'}"
             )
+
+
+            if signal.get(
+                "monitor_message"
+            ):
+
+                print(
+                    f"    monitor: "
+                    f"{signal['monitor_message']}"
+                )
+
+
+            if signal.get(
+                "error_message"
+            ):
+
+                print(
+                    f"    error  : "
+                    f"{signal['error_message']}"
+                )
 
 
     print_title(
@@ -1275,6 +1710,10 @@ def main():
     # LIVE READINESS
     # ========================================================
 
+    #
+    # WEBHOOK_TEST_MODE=true means signals are still running
+    # through TEST mode.
+    #
     if WEBHOOK_TEST_MODE:
 
         blockers.append(
@@ -1282,10 +1721,48 @@ def main():
         )
 
 
+    #
+    # LIVE_TRADING must be enabled for the real execution
+    # pipeline to be considered live-capable.
+    #
     if not LIVE_TRADING:
 
         blockers.append(
             "LIVE_TRADING=false"
+        )
+
+
+    #
+    # PRELIVE_DRY_RUN is a deliberately separate execution
+    # barrier inside trading-worker.
+    #
+    # The value must be read from the worker's systemd
+    # environment because it does not necessarily exist in
+    # .env.
+    #
+    if PRELIVE_DRY_RUN:
+
+        blockers.append(
+            "PRELIVE_DRY_RUN=true"
+        )
+
+
+    #
+    # If systemd explicitly contained a malformed value,
+    # fail closed.
+    #
+    if (
+        prelive[
+            "source"
+        ]
+        in {
+            "systemd-invalid",
+            ".env-invalid",
+        }
+    ):
+
+        blockers.append(
+            "PRELIVE_DRY_RUN configuration invalid"
         )
 
 
@@ -1332,6 +1809,10 @@ def main():
             "RESULT: READY"
         )
 
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
 
 if __name__ == "__main__":
     main()
