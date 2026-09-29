@@ -1,725 +1,298 @@
-import os
-import json
-import secrets
 import sqlite3
+import subprocess
+import time
 
 from datetime import datetime, timezone
-from typing import Optional, Union
 
-from dotenv import load_dotenv
+from fastapi import Depends
 
-from fastapi import (
-    FastAPI,
-    HTTPException,
-    Depends,
-)
-
-from fastapi.responses import HTMLResponse
-
-from fastapi.security import (
-    HTTPBasic,
-    HTTPBasicCredentials,
-)
-
-from pydantic import BaseModel
-
-from risk_engine import (
-    calculate_position_size,
-    RiskError,
-)
-
-from safety_controller import (
-    evaluate_live_readiness,
-)
-
-from system_state import (
-    get_control_state,
-    set_kill_switch,
-)
-
-from execution_guard import (
-    check_pre_execution,
-    ExecutionBlocked,
-)
-
-from position_policy import (
-    evaluate_position_limits,
-    count_trades_today,
-    PositionPolicyError,
-)
-
-from signal_contract import (
-    validate_signal_metadata,
-    SignalContractError,
-)
-
-from trade_state import (
-    init_trade_state,
-    record_event,
-    transition_signal,
-    InvalidStateTransition,
-)
+from signal_server_core import *
+from strategy_status import read_snapshot
 
 
-load_dotenv()
+DASHBOARD_SERVICES = [
+    "trading-bot.service",
+    "trading-worker.service",
+    "trading-monitor.service",
+    "trading-status.service",
+    "trading-watchdog.service",
+    "trading-signal-runner.service",
+    "cloudflared.service",
+]
 
 
-# ============================================================
-# CONFIG
-# ============================================================
-
-BASE_DIR = os.path.dirname(
-    os.path.abspath(__file__)
-)
-
-DB_FILE = os.path.join(
-    BASE_DIR,
-    "trading.db",
-)
-
-DASHBOARD_FILE = os.path.join(
-    BASE_DIR,
-    "dashboard.html",
-)
+ACTIVE_SIGNAL_STATUSES = {
+    "PROCESSING",
+    "SUBMITTED",
+    "ACCEPTED_WAITING_MARKET",
+    "FILLED",
+    "OPEN_POSITION",
+    "CANCEL_REQUESTED",
+    "CANCELLING",
+    "CANCEL_PENDING",
+    "CANCEL_UNKNOWN",
+    "UNKNOWN",
+    "ERROR",
+}
 
 
-WEBHOOK_SECRET = os.getenv(
-    "WEBHOOK_SECRET",
-    "",
-)
+SIGNAL_DETAIL_COLUMNS = [
+    "signal_id",
+    "symbol",
+    "action",
+    "status",
+    "quantity",
 
-DASHBOARD_USER = os.getenv(
-    "DASHBOARD_USER",
-    "",
-)
+    "entry",
+    "target",
+    "stop",
 
-DASHBOARD_PASSWORD = os.getenv(
-    "DASHBOARD_PASSWORD",
-    "",
-)
+    "entry_fill_price",
+    "filled_quantity",
 
+    "parent_order_id",
+    "entry_order_id",
+    "target_order_id",
+    "stop_order_id",
 
-LIVE_TRADING = (
-    os.getenv(
-        "LIVE_TRADING",
-        "false",
-    ).lower()
-    == "true"
-)
+    "parent_perm_id",
+    "target_perm_id",
+    "stop_perm_id",
 
-WEBHOOK_TEST_MODE = (
-    os.getenv(
-        "WEBHOOK_TEST_MODE",
-        "true",
-    ).lower()
-    == "true"
-)
+    "entry_order_ref",
+    "target_order_ref",
+    "stop_order_ref",
 
-
-MAX_POSITION_USD = float(
-    os.getenv(
-        "MAX_POSITION_USD",
-        "500",
-    )
-)
-
-MAX_RISK_PER_TRADE_USD = float(
-    os.getenv(
-        "MAX_RISK_PER_TRADE_USD",
-        "25",
-    )
-)
-
-MAX_TRADES_PER_DAY = int(
-    os.getenv(
-        "MAX_TRADES_PER_DAY",
-        "5",
-    )
-)
+    "entry_time",
+    "updated_at",
+]
 
 
-# Kept as a backward-compatible fallback.
-MAX_OPEN_POSITIONS = int(
-    os.getenv(
-        "MAX_OPEN_POSITIONS",
-        "3",
-    )
-)
-
-
-MAX_MANAGED_POSITIONS = int(
-    os.getenv(
-        "MAX_MANAGED_POSITIONS",
-        str(
-            MAX_OPEN_POSITIONS
-        ),
-    )
-)
-
-MAX_TOTAL_BROKER_POSITIONS = int(
-    os.getenv(
-        "MAX_TOTAL_BROKER_POSITIONS",
-        "10",
-    )
-)
-
-
-MAX_DAILY_LOSS_USD = float(
-    os.getenv(
-        "MAX_DAILY_LOSS_USD",
-        "100",
-    )
-)
-
-
-RISK_MODE = os.getenv(
-    "RISK_MODE",
-    "PERCENT_EQUITY",
-).upper()
-
-RISK_PER_TRADE_PCT = float(
-    os.getenv(
-        "RISK_PER_TRADE_PCT",
-        "0.50",
-    )
-)
-
-MAX_CAPITAL_PER_TRADE_PCT = float(
-    os.getenv(
-        "MAX_CAPITAL_PER_TRADE_PCT",
-        "5.0",
-    )
-)
-
-MIN_ACCOUNT_EQUITY_USD = float(
-    os.getenv(
-        "MIN_ACCOUNT_EQUITY_USD",
-        "100",
-    )
-)
-
-
-STATUS_MAX_AGE_SECONDS = int(
-    os.getenv(
-        "STATUS_MAX_AGE_SECONDS",
-        "30",
-    )
-)
-
-BLOCK_LIVE_ON_PENDING_CANCEL = (
-    os.getenv(
-        "BLOCK_LIVE_ON_PENDING_CANCEL",
-        "true",
-    ).lower()
-    == "true"
-)
-
-
-MAX_SIGNAL_AGE_SECONDS = int(
-    os.getenv(
-        "MAX_SIGNAL_AGE_SECONDS",
-        "60",
-    )
-)
-
-MAX_SIGNAL_FUTURE_SKEW_SECONDS = int(
-    os.getenv(
-        "MAX_SIGNAL_FUTURE_SKEW_SECONDS",
-        "10",
-    )
-)
-
-
-app = FastAPI(
-    title="TradingMax",
-)
-
-security = HTTPBasic()
-
-
-# ============================================================
-# DATABASE
-# ============================================================
-
-def db_connect():
-    conn = sqlite3.connect(
-        DB_FILE,
-        timeout=10,
-    )
-
-    conn.row_factory = sqlite3.Row
-
-    return conn
-
-
-def now_iso():
-    return datetime.now(
-        timezone.utc
-    ).isoformat()
-
-
-def column_exists(
-    conn,
-    table,
-    column,
+def service_state(
+    service_name,
 ):
-    cur = conn.cursor()
+    try:
+        result = subprocess.run(
+            [
+                "systemctl",
+                "is-active",
+                service_name,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
 
-    cur.execute(
-        f"PRAGMA table_info({table})"
+        state = (
+            result.stdout.strip()
+            or
+            result.stderr.strip()
+            or
+            "unknown"
+        )
+
+        return {
+            "name":
+                service_name,
+
+            "active":
+                state == "active",
+
+            "state":
+                state,
+        }
+
+    except subprocess.TimeoutExpired:
+        return {
+            "name":
+                service_name,
+
+            "active":
+                False,
+
+            "state":
+                "timeout",
+        }
+
+    except Exception as exc:
+        return {
+            "name":
+                service_name,
+
+            "active":
+                False,
+
+            "state":
+                (
+                    f"{type(exc).__name__}: "
+                    f"{exc}"
+                ),
+        }
+
+
+def strategy_age_seconds(
+    snapshot,
+):
+    heartbeat = (
+        snapshot.get(
+            "heartbeat_epoch"
+        )
     )
 
-    return column in {
-        row[1]
-        for row
-        in cur.fetchall()
-    }
-
-
-def ensure_column(
-    conn,
-    table,
-    column,
-    definition,
-):
-    if not column_exists(
-        conn,
-        table,
-        column,
-    ):
-        conn.execute(
-            f"""
-            ALTER TABLE {table}
-            ADD COLUMN {column} {definition}
-            """
-        )
-
-
-def init_db():
-    conn = db_connect()
-
-    signal_columns = {
-        "strategy":
-            "TEXT",
-
-        "timeframe":
-            "TEXT",
-
-        "signal_time":
-            "TEXT",
-
-        "signal_age_seconds":
-            "REAL",
-
-        "entry_order_ref":
-            "TEXT",
-
-        "target_order_ref":
-            "TEXT",
-
-        "stop_order_ref":
-            "TEXT",
-    }
-
-
-    for (
-        column,
-        definition,
-    ) in signal_columns.items():
-
-        ensure_column(
-            conn,
-            "signals",
-            column,
-            definition,
-        )
-
-
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS system_control (
-            id INTEGER PRIMARY KEY CHECK(id=1),
-            kill_switch INTEGER NOT NULL DEFAULT 0,
-            reason TEXT,
-            updated_at TEXT
-        )
-        """
-    )
-
-
-    conn.execute(
-        """
-        INSERT OR IGNORE INTO system_control (
-            id,
-            kill_switch,
-            reason,
-            updated_at
-        )
-        VALUES (
-            1,
-            0,
-            NULL,
-            ?
-        )
-        """,
-        (
-            now_iso(),
-        ),
-    )
-
-
-    conn.commit()
-    conn.close()
-
-
-    init_trade_state(
-        DB_FILE
-    )
-
-
-init_db()
-
-
-# ============================================================
-# MODELS
-# ============================================================
-
-class TradeSignal(
-    BaseModel
-):
-    secret: str
-
-    signal_id: str
-
-    strategy: str
-
-    timeframe: str
-
-    signal_time: Union[
-        str,
-        int,
-        float,
-    ]
-
-    symbol: str
-
-    action: str = "BUY"
-
-    entry: float
-
-    target: float
-
-    stop: float
-
-    quantity: Optional[int] = None
-
-
-class CancelRequest(
-    BaseModel
-):
-    secret: str
-
-
-class KillSwitchRequest(
-    BaseModel
-):
-    enabled: bool
-
-    reason: Optional[str] = None
-
-
-# ============================================================
-# AUTH
-# ============================================================
-
-def dashboard_auth(
-    credentials:
-        HTTPBasicCredentials
-        =
-        Depends(
-            security
-        ),
-):
-    if (
-        not DASHBOARD_USER
-        or
-        not DASHBOARD_PASSWORD
-    ):
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                "Dashboard authentication "
-                "not configured"
-            ),
-        )
-
-
-    username_ok = secrets.compare_digest(
-        credentials.username,
-        DASHBOARD_USER,
-    )
-
-    password_ok = secrets.compare_digest(
-        credentials.password,
-        DASHBOARD_PASSWORD,
-    )
-
-
-    if (
-        not username_ok
-        or
-        not password_ok
-    ):
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid credentials",
-            headers={
-                "WWW-Authenticate":
-                    "Basic",
-            },
-        )
-
-
-    return credentials.username
-
-
-def validate_secret(
-    value,
-):
-    if (
-        not WEBHOOK_SECRET
-        or
-        not secrets.compare_digest(
-            value,
-            WEBHOOK_SECRET,
-        )
-    ):
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid secret",
-        )
-
-
-# ============================================================
-# STRICT SNAPSHOT PARSING
-# ============================================================
-
-def strict_json_list(
-    value,
-):
-    if value is None:
+    if heartbeat is None:
         return None
 
-
     try:
-        parsed = json.loads(
-            value
+        return max(
+            0.0,
+            time.time()
+            -
+            float(
+                heartbeat
+            ),
         )
 
     except Exception:
         return None
 
 
-    if not isinstance(
-        parsed,
-        list,
-    ):
+def age_seconds_from_iso(
+    value,
+):
+    if not value:
+        return None
+
+    try:
+        text = str(
+            value
+        ).strip()
+
+        if text.endswith(
+            "Z"
+        ):
+            text = (
+                text[:-1]
+                +
+                "+00:00"
+            )
+
+        parsed = (
+            datetime.fromisoformat(
+                text
+            )
+        )
+
+        if parsed.tzinfo is None:
+            parsed = (
+                parsed.replace(
+                    tzinfo=
+                        timezone.utc
+                )
+            )
+
+        return max(
+            0.0,
+            (
+                datetime.now(
+                    timezone.utc
+                )
+                -
+                parsed.astimezone(
+                    timezone.utc
+                )
+            ).total_seconds(),
+        )
+
+    except Exception:
         return None
 
 
-    return parsed
+def safe_number(
+    value,
+):
+    if value is None:
+        return None
 
+    try:
+        value = float(
+            value
+        )
 
-def get_runtime_snapshot():
-    conn = db_connect()
+        if abs(
+            value
+        ) > 1e100:
+            return None
 
-    cur = conn.cursor()
+        return value
 
-
-    cur.execute(
-        """
-        SELECT *
-        FROM runtime_status
-        WHERE id=1
-        """
-    )
-
-
-    row = cur.fetchone()
-
-    conn.close()
-
-
-    if row is None:
+    except Exception:
         return None
 
 
-    data = dict(
-        row
-    )
-
-
-    positions = strict_json_list(
-        data.get(
-            "positions_json"
+def valid_order_id(
+    value,
+):
+    try:
+        value = int(
+            value
         )
-    )
+
+    except Exception:
+        return None
+
+    if value < 0:
+        return None
+
+    return value
 
 
-    open_orders = strict_json_list(
-        data.get(
-            "open_orders_json"
+def valid_perm_id(
+    value,
+):
+    try:
+        value = int(
+            value
         )
-    )
+
+    except Exception:
+        return None
+
+    if value <= 0:
+        return None
+
+    return value
 
 
-    data[
-        "positions_valid"
-    ] = (
-        positions
-        is not None
-    )
+def clean_ref(
+    value,
+):
+    if value is None:
+        return None
 
-    data[
-        "open_orders_valid"
-    ] = (
-        open_orders
-        is not None
-    )
+    value = str(
+        value
+    ).strip()
 
+    if not value:
+        return None
 
-    #
-    # IMPORTANT:
-    #
-    # Invalid JSON stays None.
-    #
-    # We do NOT silently turn malformed broker data
-    # into an empty account.
-    #
-    data[
-        "positions"
-    ] = positions
-
-    data[
-        "open_orders"
-    ] = open_orders
+    return value
 
 
-    data[
-        "tws_connected"
-    ] = bool(
-        data.get(
-            "tws_connected"
-        )
-    )
-
-
-    return data
-
-
-# ============================================================
-# SAFETY
-# ============================================================
-
-def build_safety_state():
-    snapshot = (
-        get_runtime_snapshot()
-        or {}
-    )
-
-
-    control = get_control_state(
-        DB_FILE
-    )
-
-
-    extra_blockers = []
-
-
-    positions_valid = bool(
-        snapshot.get(
-            "positions_valid",
-            False,
-        )
-    )
-
-    open_orders_valid = bool(
-        snapshot.get(
-            "open_orders_valid",
-            False,
-        )
-    )
-
-
+def get_position_classification(
+    runtime,
+):
     positions = (
-        snapshot.get(
+        runtime.get(
             "positions"
         )
-        if positions_valid
-        else []
+        or
+        []
     )
 
-    open_orders = (
-        snapshot.get(
-            "open_orders"
-        )
-        if open_orders_valid
-        else []
-    )
-
-
-    if not positions_valid:
-        extra_blockers.append(
-            "positions_json invalid"
-        )
-
-
-    if not open_orders_valid:
-        extra_blockers.append(
-            "open_orders_json invalid"
-        )
-
-
-    # --------------------------------------------------------
-    # NEW YORK TRADING DAY
-    # --------------------------------------------------------
-
     try:
-        trading_day = (
-            count_trades_today(
-                DB_FILE
-            )
-        )
-
-        today_count = trading_day[
-            "count"
-        ]
-
-
-    except Exception as exc:
-        #
-        # Fail closed.
-        #
-        trading_day = None
-
-        today_count = (
-            MAX_TRADES_PER_DAY
-        )
-
-        extra_blockers.append(
-            (
-                "Trading-day calculation "
-                f"failed: {exc}"
-            )
-        )
-
-
-    # --------------------------------------------------------
-    # POSITION OWNERSHIP POLICY
-    # --------------------------------------------------------
-
-    try:
-        position_state = (
+        return (
             evaluate_position_limits(
                 db_file=
                     DB_FILE,
@@ -735,861 +308,1748 @@ def build_safety_state():
             )
         )
 
+    except Exception as exc:
+        return {
+            "broker_position_count":
+                len(
+                    positions
+                ),
 
-        managed_positions = (
-            position_state[
-                "managed_positions"
-            ]
-        )
+            "managed_position_count":
+                None,
+
+            "legacy_position_count":
+                None,
+
+            "managed_positions":
+                [],
+
+            "legacy_positions":
+                [],
+
+            "max_managed_positions":
+                MAX_MANAGED_POSITIONS,
+
+            "max_total_broker_positions":
+                MAX_TOTAL_BROKER_POSITIONS,
+
+            "blockers": [
+                (
+                    "Position classification "
+                    f"failed: {exc}"
+                )
+            ],
+        }
 
 
-        extra_blockers.extend(
-            position_state[
-                "blockers"
-            ]
-        )
+def table_columns(
+    conn,
+    table,
+):
+    rows = conn.execute(
+        f"PRAGMA table_info({table})"
+    ).fetchall()
+
+    return {
+        row[
+            1
+        ]
+        for row
+        in rows
+    }
 
 
-    except PositionPolicyError as exc:
-        #
-        # Fail closed.
-        #
-        position_state = None
+def load_signal_details():
+    conn = db_connect()
 
-        managed_positions = []
-
-        extra_blockers.append(
-            (
-                "Position policy failed: "
-                f"{exc}"
+    try:
+        available = (
+            table_columns(
+                conn,
+                "signals"
             )
         )
 
+        selected_columns = [
+            column
+            for column
+            in SIGNAL_DETAIL_COLUMNS
+            if column in available
+        ]
 
-    # --------------------------------------------------------
-    # EXISTING SAFETY CONTROLLER
-    # --------------------------------------------------------
-    #
-    # Important:
-    # positions=managed_positions
-    #
-    # Legacy holdings do NOT consume the bot's managed limit.
-    #
-    result = evaluate_live_readiness(
-        live_trading=
-            LIVE_TRADING,
+        if (
+            "signal_id"
+            not in selected_columns
+            or
+            "symbol"
+            not in selected_columns
+        ):
+            return {}
 
-        test_mode=
-            WEBHOOK_TEST_MODE,
+        placeholders = ",".join(
+            "?"
+            for _
+            in ACTIVE_SIGNAL_STATUSES
+        )
 
-        tws_connected=
-            snapshot.get(
-                "tws_connected",
-                False,
+        columns_sql = ", ".join(
+            selected_columns
+        )
+
+        query = (
+            f"""
+            SELECT
+                {columns_sql}
+
+            FROM signals
+
+            WHERE
+                test_mode = 0
+
+                AND status IN (
+                    {placeholders}
+                )
+
+            ORDER BY updated_at DESC
+            """
+        )
+
+        rows = (
+            conn.execute(
+                query,
+                tuple(
+                    ACTIVE_SIGNAL_STATUSES
+                )
+            )
+            .fetchall()
+        )
+
+        result = {}
+
+        for row in rows:
+            item = dict(
+                row
+            )
+
+            signal_id = clean_ref(
+                item.get(
+                    "signal_id"
+                )
+            )
+
+            if not signal_id:
+                continue
+
+            result[
+                signal_id
+            ] = item
+
+        return result
+
+    except sqlite3.Error:
+        return {}
+
+    finally:
+        conn.close()
+
+
+def normalize_order(
+    order,
+):
+    return {
+        "order_id":
+            valid_order_id(
+                order.get(
+                    "order_id"
+                )
             ),
 
-        snapshot_updated_at=
-            snapshot.get(
+        "perm_id":
+            valid_perm_id(
+                order.get(
+                    "perm_id"
+                )
+            ),
+
+        "symbol":
+            (
+                str(
+                    order.get(
+                        "symbol"
+                    )
+                    or
+                    ""
+                )
+                .upper()
+                .strip()
+            ),
+
+        "action":
+            (
+                str(
+                    order.get(
+                        "action"
+                    )
+                    or
+                    ""
+                )
+                .upper()
+                .strip()
+            ),
+
+        "order_type":
+            (
+                str(
+                    order.get(
+                        "order_type"
+                    )
+                    or
+                    ""
+                )
+                .upper()
+                .strip()
+            ),
+
+        "quantity":
+            safe_number(
+                order.get(
+                    "quantity"
+                )
+            ),
+
+        "status":
+            order.get(
+                "status"
+            ),
+
+        "parent_id":
+            valid_order_id(
+                order.get(
+                    "parent_id"
+                )
+            ),
+
+        "order_ref":
+            clean_ref(
+                order.get(
+                    "order_ref"
+                )
+            ),
+
+        "limit_price":
+            safe_number(
+                order.get(
+                    "limit_price"
+                )
+            ),
+
+        "stop_price":
+            safe_number(
+                order.get(
+                    "stop_price"
+                )
+            ),
+
+        "price":
+            safe_number(
+                order.get(
+                    "price"
+                )
+            ),
+
+        "tif":
+            order.get(
+                "tif"
+            ),
+
+        "outside_rth":
+            order.get(
+                "outside_rth"
+            ),
+
+        "transmit":
+            order.get(
+                "transmit"
+            ),
+    }
+
+
+def order_price(
+    order,
+):
+    if not order:
+        return None
+
+    price = safe_number(
+        order.get(
+            "price"
+        )
+    )
+
+    if price is not None:
+        return price
+
+    order_type = (
+        str(
+            order.get(
+                "order_type"
+            )
+            or
+            ""
+        )
+        .upper()
+        .strip()
+    )
+
+    if order_type in {
+        "STP",
+        "STOP",
+        "STP LMT",
+    }:
+        return safe_number(
+            order.get(
+                "stop_price"
+            )
+        )
+
+    return safe_number(
+        order.get(
+            "limit_price"
+        )
+    )
+
+
+def find_order_by_ref(
+    open_orders,
+    order_ref,
+):
+    wanted = clean_ref(
+        order_ref
+    )
+
+    if wanted is None:
+        return None
+
+    for order in open_orders:
+        if (
+            clean_ref(
+                order.get(
+                    "order_ref"
+                )
+            )
+            ==
+            wanted
+        ):
+            return order
+
+    return None
+
+
+def find_order_by_id(
+    open_orders,
+    order_id,
+):
+    wanted = valid_order_id(
+        order_id
+    )
+
+    if wanted is None:
+        return None
+
+    matches = [
+        order
+        for order
+        in open_orders
+        if (
+            valid_order_id(
+                order.get(
+                    "order_id"
+                )
+            )
+            ==
+            wanted
+        )
+    ]
+
+    if not matches:
+        return None
+
+    if (
+        wanted == 0
+        and
+        len(
+            matches
+        )
+        > 1
+    ):
+        return None
+
+    return matches[
+        0
+    ]
+
+
+def find_order_by_perm_id(
+    open_orders,
+    perm_id,
+):
+    wanted = valid_perm_id(
+        perm_id
+    )
+
+    if wanted is None:
+        return None
+
+    for order in open_orders:
+        if (
+            valid_perm_id(
+                order.get(
+                    "perm_id"
+                )
+            )
+            ==
+            wanted
+        ):
+            return order
+
+    return None
+
+
+def find_child_by_parent(
+    open_orders,
+    *,
+    parent_id,
+    role,
+):
+    wanted_parent = (
+        valid_order_id(
+            parent_id
+        )
+    )
+
+    if wanted_parent is None:
+        return None
+
+    candidates = [
+        order
+        for order
+        in open_orders
+        if (
+            valid_order_id(
+                order.get(
+                    "parent_id"
+                )
+            )
+            ==
+            wanted_parent
+        )
+    ]
+
+    if role == "TARGET":
+        candidates = [
+            order
+            for order
+            in candidates
+            if (
+                str(
+                    order.get(
+                        "order_type"
+                    )
+                    or
+                    ""
+                )
+                .upper()
+                .strip()
+                in {
+                    "LMT",
+                    "LOC",
+                }
+            )
+        ]
+
+    elif role == "STOP":
+        candidates = [
+            order
+            for order
+            in candidates
+            if (
+                str(
+                    order.get(
+                        "order_type"
+                    )
+                    or
+                    ""
+                )
+                .upper()
+                .strip()
+                in {
+                    "STP",
+                    "STOP",
+                    "STP LMT",
+                }
+            )
+        ]
+
+    if len(
+        candidates
+    ) != 1:
+        return None
+
+    return candidates[
+        0
+    ]
+
+
+def resolve_signal_order(
+    signal,
+    open_orders,
+    role,
+):
+    if role == "ENTRY":
+        ref_field = (
+            "entry_order_ref"
+        )
+
+        id_field = (
+            "entry_order_id"
+        )
+
+        perm_field = (
+            "parent_perm_id"
+        )
+
+    elif role == "TARGET":
+        ref_field = (
+            "target_order_ref"
+        )
+
+        id_field = (
+            "target_order_id"
+        )
+
+        perm_field = (
+            "target_perm_id"
+        )
+
+    elif role == "STOP":
+        ref_field = (
+            "stop_order_ref"
+        )
+
+        id_field = (
+            "stop_order_id"
+        )
+
+        perm_field = (
+            "stop_perm_id"
+        )
+
+    else:
+        return None
+
+    result = (
+        find_order_by_ref(
+            open_orders,
+            signal.get(
+                ref_field
+            )
+        )
+    )
+
+    if result:
+        return result
+
+    result = (
+        find_order_by_perm_id(
+            open_orders,
+            signal.get(
+                perm_field
+            )
+        )
+    )
+
+    if result:
+        return result
+
+    result = (
+        find_order_by_id(
+            open_orders,
+            signal.get(
+                id_field
+            )
+        )
+    )
+
+    if result:
+        return result
+
+    if role == "ENTRY":
+        return (
+            find_order_by_id(
+                open_orders,
+                signal.get(
+                    "parent_order_id"
+                )
+            )
+        )
+
+    return (
+        find_child_by_parent(
+            open_orders,
+            parent_id=
+                signal.get(
+                    "parent_order_id"
+                ),
+            role=
+                role,
+        )
+    )
+
+
+def enrich_signal(
+    base_signal,
+    signal_details,
+    open_orders,
+):
+    signal_id = clean_ref(
+        base_signal.get(
+            "signal_id"
+        )
+    )
+
+    full = {}
+
+    if signal_id:
+        full.update(
+            signal_details.get(
+                signal_id,
+                {}
+            )
+        )
+
+    full.update(
+        base_signal
+    )
+
+    entry_order = (
+        resolve_signal_order(
+            full,
+            open_orders,
+            "ENTRY"
+        )
+    )
+
+    target_order = (
+        resolve_signal_order(
+            full,
+            open_orders,
+            "TARGET"
+        )
+    )
+
+    stop_order = (
+        resolve_signal_order(
+            full,
+            open_orders,
+            "STOP"
+        )
+    )
+
+    entry_fill_price = (
+        safe_number(
+            full.get(
+                "entry_fill_price"
+            )
+        )
+    )
+
+    planned_entry = (
+        safe_number(
+            full.get(
+                "entry"
+            )
+        )
+    )
+
+    planned_target = (
+        safe_number(
+            full.get(
+                "target"
+            )
+        )
+    )
+
+    planned_stop = (
+        safe_number(
+            full.get(
+                "stop"
+            )
+        )
+    )
+
+    actual_entry = (
+        entry_fill_price
+        if entry_fill_price is not None
+        else planned_entry
+    )
+
+    broker_target = (
+        order_price(
+            target_order
+        )
+    )
+
+    broker_stop = (
+        order_price(
+            stop_order
+        )
+    )
+
+    actual_target = (
+        broker_target
+        if broker_target is not None
+        else planned_target
+    )
+
+    actual_stop = (
+        broker_stop
+        if broker_stop is not None
+        else planned_stop
+    )
+
+    target_status = (
+        target_order.get(
+            "status"
+        )
+        if target_order
+        else None
+    )
+
+    stop_status = (
+        stop_order.get(
+            "status"
+        )
+        if stop_order
+        else None
+    )
+
+    protection_complete = (
+        target_order is not None
+        and
+        stop_order is not None
+    )
+
+    return {
+        "signal_id":
+            signal_id,
+
+        "symbol":
+            full.get(
+                "symbol"
+            ),
+
+        "action":
+            full.get(
+                "action"
+            ),
+
+        "status":
+            full.get(
+                "status"
+            ),
+
+        "quantity":
+            safe_number(
+                full.get(
+                    "quantity"
+                )
+            ),
+
+        "filled_quantity":
+            safe_number(
+                full.get(
+                    "filled_quantity"
+                )
+            ),
+
+        "planned_entry":
+            planned_entry,
+
+        "entry_fill_price":
+            entry_fill_price,
+
+        "entry_price":
+            actual_entry,
+
+        "planned_target":
+            planned_target,
+
+        "target_price":
+            actual_target,
+
+        "target_price_source":
+            (
+                "BROKER"
+                if broker_target is not None
+                else
+                (
+                    "SIGNAL"
+                    if planned_target is not None
+                    else
+                    None
+                )
+            ),
+
+        "planned_stop":
+            planned_stop,
+
+        "stop_price":
+            actual_stop,
+
+        "stop_price_source":
+            (
+                "BROKER"
+                if broker_stop is not None
+                else
+                (
+                    "SIGNAL"
+                    if planned_stop is not None
+                    else
+                    None
+                )
+            ),
+
+        "parent_order_id":
+            valid_order_id(
+                full.get(
+                    "parent_order_id"
+                )
+            ),
+
+        "entry_order_id":
+            (
+                entry_order.get(
+                    "order_id"
+                )
+                if entry_order
+                else
+                valid_order_id(
+                    full.get(
+                        "entry_order_id"
+                    )
+                )
+            ),
+
+        "target_order_id":
+            (
+                target_order.get(
+                    "order_id"
+                )
+                if target_order
+                else
+                valid_order_id(
+                    full.get(
+                        "target_order_id"
+                    )
+                )
+            ),
+
+        "stop_order_id":
+            (
+                stop_order.get(
+                    "order_id"
+                )
+                if stop_order
+                else
+                valid_order_id(
+                    full.get(
+                        "stop_order_id"
+                    )
+                )
+            ),
+
+        "entry_order_ref":
+            (
+                entry_order.get(
+                    "order_ref"
+                )
+                if entry_order
+                else
+                clean_ref(
+                    full.get(
+                        "entry_order_ref"
+                    )
+                )
+            ),
+
+        "target_order_ref":
+            (
+                target_order.get(
+                    "order_ref"
+                )
+                if target_order
+                else
+                clean_ref(
+                    full.get(
+                        "target_order_ref"
+                    )
+                )
+            ),
+
+        "stop_order_ref":
+            (
+                stop_order.get(
+                    "order_ref"
+                )
+                if stop_order
+                else
+                clean_ref(
+                    full.get(
+                        "stop_order_ref"
+                    )
+                )
+            ),
+
+        "entry_order_status":
+            (
+                entry_order.get(
+                    "status"
+                )
+                if entry_order
+                else None
+            ),
+
+        "target_order_status":
+            target_status,
+
+        "stop_order_status":
+            stop_status,
+
+        "target_order_open":
+            target_order
+            is not None,
+
+        "stop_order_open":
+            stop_order
+            is not None,
+
+        "protection_complete":
+            protection_complete,
+
+        "updated_at":
+            full.get(
                 "updated_at"
             ),
+    }
 
-        snapshot_max_age_seconds=
-            STATUS_MAX_AGE_SECONDS,
 
-        positions=
-            managed_positions,
+def normalize_position(
+    position,
+    *,
+    signal_details,
+    open_orders,
+):
+    quantity = (
+        safe_number(
+            position.get(
+                "quantity"
+            )
+        )
+    )
 
-        open_orders=
-            open_orders,
+    if quantity is None:
+        side = "UNKNOWN"
 
-        max_open_positions=
-            MAX_MANAGED_POSITIONS,
+    elif quantity > 0:
+        side = "LONG"
 
-        trades_today=
-            today_count,
+    elif quantity < 0:
+        side = "SHORT"
 
-        max_trades_per_day=
-            MAX_TRADES_PER_DAY,
+    else:
+        side = "FLAT"
 
-        daily_pnl=
-            snapshot.get(
+    avg_cost = (
+        safe_number(
+            position.get(
+                "avg_cost"
+            )
+        )
+    )
+
+    market_price = (
+        safe_number(
+            position.get(
+                "market_price"
+            )
+        )
+    )
+
+    market_value = (
+        safe_number(
+            position.get(
+                "market_value"
+            )
+        )
+    )
+
+    daily_pnl = (
+        safe_number(
+            position.get(
                 "daily_pnl"
-            ),
-
-        max_daily_loss_usd=
-            MAX_DAILY_LOSS_USD,
-
-        net_liquidation=
-            snapshot.get(
-                "net_liquidation"
-            ),
-
-        minimum_account_equity=
-            MIN_ACCOUNT_EQUITY_USD,
-
-        available_funds=
-            snapshot.get(
-                "available_funds"
-            ),
-
-        block_live_on_pending_cancel=
-            BLOCK_LIVE_ON_PENDING_CANCEL,
+            )
+        )
     )
 
-
-    # --------------------------------------------------------
-    # EXTRA FAIL-CLOSED BLOCKERS
-    # --------------------------------------------------------
-
-    for blocker in extra_blockers:
-
-        if blocker not in result[
-            "blockers"
-        ]:
-            result[
-                "blockers"
-            ].append(
-                blocker
+    unrealized_pnl = (
+        safe_number(
+            position.get(
+                "unrealized_pnl"
             )
+        )
+    )
 
+    realized_pnl = (
+        safe_number(
+            position.get(
+                "realized_pnl"
+            )
+        )
+    )
 
-    # --------------------------------------------------------
-    # KILL SWITCH
-    # --------------------------------------------------------
+    if (
+        market_value is None
+        and
+        market_price is not None
+        and
+        quantity is not None
+    ):
+        market_value = (
+            market_price
+            *
+            quantity
+        )
 
-    if control[
-        "kill_switch"
-    ]:
+    if (
+        market_price is None
+        and
+        market_value is not None
+        and
+        quantity is not None
+        and
+        quantity != 0
+    ):
+        market_price = abs(
+            market_value
+            /
+            quantity
+        )
 
-        message = (
-            "Kill switch enabled"
-            +
+    managed_signals_raw = (
+        position.get(
+            "managed_signals"
+        )
+        or
+        []
+    )
+
+    managed_signals = [
+        enrich_signal(
+            signal,
+            signal_details,
+            open_orders,
+        )
+
+        for signal
+        in managed_signals_raw
+    ]
+
+    protection_complete = (
+        bool(
+            managed_signals
+        )
+        and
+        all(
+            signal.get(
+                "protection_complete",
+                False
+            )
+            for signal
+            in managed_signals
+        )
+    )
+
+    return {
+        "symbol":
+            position.get(
+                "symbol"
+            ),
+
+        "con_id":
+            position.get(
+                "con_id"
+            ),
+
+        "currency":
+            position.get(
+                "currency"
+            ),
+
+        "quantity":
+            quantity,
+
+        "side":
+            side,
+
+        "avg_cost":
+            avg_cost,
+
+        "market_price":
+            market_price,
+
+        "market_value":
+            market_value,
+
+        "daily_pnl":
+            daily_pnl,
+
+        "unrealized_pnl":
+            unrealized_pnl,
+
+        "realized_pnl":
+            realized_pnl,
+
+        "position_pnl_available":
+            bool(
+                position.get(
+                    "position_pnl_available",
+                    (
+                        market_price
+                        is not None
+                        or
+                        unrealized_pnl
+                        is not None
+                    ),
+                )
+            ),
+
+        "ownership":
+            position.get(
+                "ownership",
+                "UNKNOWN",
+            ),
+
+        "managed_signals":
+            managed_signals,
+
+        "protection_complete":
             (
-                f": {control['reason']}"
-                if control[
-                    "reason"
-                ]
-                else ""
+                protection_complete
+                if managed_signals
+                else None
+            ),
+    }
+
+
+def read_runtime_components():
+    conn = db_connect()
+
+    try:
+        cur = conn.cursor()
+
+        cur.execute(
+            """
+            SELECT
+                component,
+                healthy,
+                critical,
+                detail,
+                checked_at
+
+            FROM runtime_components
+
+            ORDER BY component
+            """
+        )
+
+        rows = [
+            dict(
+                row
+            )
+
+            for row
+            in cur.fetchall()
+        ]
+
+    except sqlite3.Error:
+        rows = []
+
+    finally:
+        conn.close()
+
+    result = []
+
+    for item in rows:
+        age = (
+            age_seconds_from_iso(
+                item.get(
+                    "checked_at"
+                )
             )
         )
 
-
-        if message not in result[
-            "blockers"
-        ]:
-
-            result[
-                "blockers"
-            ].insert(
-                0,
-                message,
+        healthy = bool(
+            item.get(
+                "healthy"
             )
-
-
-    #
-    # Recalculate readiness after adding our own blockers.
-    #
-    result[
-        "live_ready"
-    ] = (
-        len(
-            result[
-                "blockers"
-            ]
         )
-        == 0
-    )
 
+        critical = bool(
+            item.get(
+                "critical"
+            )
+        )
 
-    result[
-        "kill_switch"
-    ] = control[
-        "kill_switch"
-    ]
+        result.append({
+            "component":
+                item.get(
+                    "component"
+                ),
 
-    result[
-        "kill_switch_reason"
-    ] = control[
-        "reason"
-    ]
+            "healthy":
+                healthy,
 
-    result[
-        "kill_switch_updated_at"
-    ] = control[
-        "updated_at"
-    ]
+            "critical":
+                critical,
 
+            "detail":
+                item.get(
+                    "detail"
+                ),
 
-    result[
-        "positions_json_valid"
-    ] = positions_valid
+            "checked_at":
+                item.get(
+                    "checked_at"
+                ),
 
-    result[
-        "open_orders_json_valid"
-    ] = open_orders_valid
+            "age_seconds":
+                age,
 
+            "fresh":
+                (
+                    age is not None
+                    and
+                    age <= 30
+                ),
 
-    result[
-        "managed_position_count"
-    ] = (
-        position_state[
-            "managed_position_count"
-        ]
-        if position_state
-        else None
-    )
-
-    result[
-        "legacy_position_count"
-    ] = (
-        position_state[
-            "legacy_position_count"
-        ]
-        if position_state
-        else None
-    )
-
-    result[
-        "total_broker_position_count"
-    ] = (
-        position_state[
-            "broker_position_count"
-        ]
-        if position_state
-        else None
-    )
-
-
-    result[
-        "max_managed_positions"
-    ] = (
-        MAX_MANAGED_POSITIONS
-    )
-
-    result[
-        "max_total_broker_positions"
-    ] = (
-        MAX_TOTAL_BROKER_POSITIONS
-    )
-
-
-    result[
-        "trading_day"
-    ] = trading_day
-
+            "effective_healthy":
+                (
+                    healthy
+                    and
+                    age is not None
+                    and
+                    age <= 30
+                ),
+        })
 
     return result
 
 
-def enforce_live_safety():
-    #
-    # Test-mode webhook never creates a live signal.
-    #
-    if WEBHOOK_TEST_MODE:
-        return
-
-
-    #
-    # Authoritative LIVE gate.
-    #
-    # This is intentionally the SAME execution guard
-    # used by worker.py.
-    #
-    try:
-        check_pre_execution(
-            db_file=
-                DB_FILE,
-
-            max_snapshot_age_seconds=
-                STATUS_MAX_AGE_SECONDS,
-
-            max_open_positions=
-                MAX_MANAGED_POSITIONS,
-
-            max_trades_per_day=
-                MAX_TRADES_PER_DAY,
-
-            max_daily_loss_usd=
-                MAX_DAILY_LOSS_USD,
-
-            minimum_account_equity=
-                MIN_ACCOUNT_EQUITY_USD,
-
-            block_on_pending_cancel=
-                BLOCK_LIVE_ON_PENDING_CANCEL,
-        )
-
-
-    except ExecutionBlocked as exc:
-
-        raise HTTPException(
-            status_code=409,
-
-            detail={
-                "message":
-                    "LIVE trading blocked",
-
-                "blockers": [
-                    str(
-                        exc
-                    )
-                ],
-            },
-        )
-
-
-# ============================================================
-# SIGNAL VALIDATION
-# ============================================================
-
-def validate_prices(
-    signal,
-):
-    symbol = (
-        signal.symbol
-        or ""
-    ).strip().upper()
-
-
-    if not symbol:
-        raise HTTPException(
-            status_code=400,
-            detail="symbol is required",
-        )
-
-
-    if len(
-        symbol
-    ) > 16:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid symbol",
-        )
-
-
-    if (
-        signal.action.upper()
-        != "BUY"
-    ):
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "Only BUY currently supported"
-            ),
-        )
-
-
-    if signal.entry <= 0:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid entry",
-        )
-
-
-    if signal.stop <= 0:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid stop",
-        )
-
-
-    if signal.target <= 0:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid target",
-        )
-
-
-    if (
-        signal.stop
-        >= signal.entry
-    ):
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "Stop must be below entry"
-            ),
-        )
-
-
-    if (
-        signal.target
-        <= signal.entry
-    ):
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "Target must be above entry"
-            ),
-        )
-
-
-def validate_signal_contract(
-    signal,
-):
-    try:
-        return validate_signal_metadata(
-            strategy=
-                signal.strategy,
-
-            timeframe=
-                signal.timeframe,
-
-            signal_time=
-                signal.signal_time,
-
-            max_age_seconds=
-                MAX_SIGNAL_AGE_SECONDS,
-
-            max_future_skew_seconds=
-                MAX_SIGNAL_FUTURE_SKEW_SECONDS,
-        )
-
-
-    except SignalContractError as exc:
-
-        raise HTTPException(
-            status_code=400,
-            detail=str(
-                exc
-            ),
-        )
-
-
-# ============================================================
-# POSITION SIZE
-# ============================================================
-
-def calculate_dynamic_budget(
-    signal,
-    snapshot,
-):
-    try:
-        return calculate_position_size(
-            entry=
-                signal.entry,
-
-            stop=
-                signal.stop,
-
-            net_liquidation=
-                snapshot.get(
-                    "net_liquidation"
-                ),
-
-            available_funds=
-                snapshot.get(
-                    "available_funds"
-                ),
-
-            risk_mode=
-                RISK_MODE,
-
-            risk_per_trade_pct=
-                RISK_PER_TRADE_PCT,
-
-            max_capital_per_trade_pct=
-                MAX_CAPITAL_PER_TRADE_PCT,
-
-            max_risk_usd=
-                MAX_RISK_PER_TRADE_USD,
-
-            max_position_usd=
-                MAX_POSITION_USD,
-
-            minimum_equity_usd=
-                MIN_ACCOUNT_EQUITY_USD,
-        )
-
-
-    except (
-        RiskError,
-        TypeError,
-        ValueError,
-    ) as exc:
-
-        raise HTTPException(
-            status_code=400,
-            detail=str(
-                exc
-            ),
-        )
-
-
-def resolve_position_size(
-    signal,
+@app.get(
+    "/strategy-status"
+)
+def strategy_status_endpoint(
+    user=
+        Depends(
+            dashboard_auth
+        ),
 ):
     snapshot = (
-        get_runtime_snapshot()
+        read_snapshot()
     )
 
+    age = (
+        strategy_age_seconds(
+            snapshot
+        )
+    )
 
-    if snapshot is None:
+    snapshot[
+        "age_seconds"
+    ] = age
 
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                "Broker snapshot unavailable"
+    snapshot[
+        "fresh"
+    ] = (
+        age is not None
+        and
+        age <= 120
+    )
+
+    return snapshot
+
+
+@app.get(
+    "/dashboard-services"
+)
+def dashboard_services(
+    user=
+        Depends(
+            dashboard_auth
+        ),
+):
+    services = [
+        service_state(
+            service
+        )
+
+        for service
+        in DASHBOARD_SERVICES
+    ]
+
+    active_count = sum(
+        1
+
+        for item
+        in services
+
+        if item[
+            "active"
+        ]
+    )
+
+    return {
+        "total":
+            len(
+                services
             ),
-        )
+
+        "active":
+            active_count,
+
+        "all_active":
+            active_count
+            ==
+            len(
+                services
+            ),
+
+        "services":
+            services,
+    }
 
 
-    dynamic = calculate_dynamic_budget(
-        signal,
-        snapshot,
+@app.get(
+    "/dashboard-components"
+)
+def dashboard_components(
+    user=
+        Depends(
+            dashboard_auth
+        ),
+):
+    components = (
+        read_runtime_components()
     )
 
+    critical_failures = [
+        item
 
-    if signal.quantity is not None:
-
-        quantity = int(
-            signal.quantity
-        )
-
-
-        if quantity <= 0:
-
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "Quantity must be positive"
-                ),
-            )
-
-
-        risk_per_share = (
-            signal.entry
-            -
-            signal.stop
-        )
-
-
-        position_value = (
-            signal.entry
-            *
-            quantity
-        )
-
-
-        planned_risk = (
-            risk_per_share
-            *
-            quantity
-        )
-
+        for item
+        in components
 
         if (
-            position_value
-            > MAX_POSITION_USD
-        ):
-
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "Manual quantity exceeds "
-                    "MAX_POSITION_USD"
-                ),
-            )
-
-
-        if (
-            planned_risk
-            > MAX_RISK_PER_TRADE_USD
-        ):
-
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "Manual quantity exceeds "
-                    "MAX_RISK_PER_TRADE_USD"
-                ),
-            )
-
-
-        if (
-            position_value
-            >
-            dynamic[
-                "capital_budget"
+            item[
+                "critical"
             ]
-        ):
-
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "Manual quantity exceeds "
-                    "current capital budget "
-                    f"(${dynamic['capital_budget']:.2f})"
-                ),
-            )
-
-
-        if (
-            planned_risk
-            >
-            dynamic[
-                "risk_budget"
+            and
+            not item[
+                "effective_healthy"
             ]
-        ):
+        )
+    ]
 
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "Manual quantity exceeds "
-                    "current risk budget "
-                    f"(${dynamic['risk_budget']:.2f})"
-                ),
+    unhealthy = [
+        item
+
+        for item
+        in components
+
+        if not item[
+            "effective_healthy"
+        ]
+    ]
+
+    return {
+        "total":
+            len(
+                components
+            ),
+
+        "healthy":
+            (
+                len(
+                    components
+                )
+                -
+                len(
+                    unhealthy
+                )
+            ),
+
+        "unhealthy":
+            len(
+                unhealthy
+            ),
+
+        "critical_failures":
+            len(
+                critical_failures
+            ),
+
+        "all_critical_healthy":
+            len(
+                critical_failures
             )
+            ==
+            0,
+
+        "components":
+            components,
+    }
 
 
-        return {
-            "quantity":
-                quantity,
+@app.get(
+    "/dashboard-portfolio"
+)
+def dashboard_portfolio(
+    user=
+        Depends(
+            dashboard_auth
+        ),
+):
+    runtime = (
+        get_runtime_snapshot()
+        or
+        {}
+    )
 
-            "sizing_mode":
-                "MANUAL",
+    raw_open_orders = (
+        runtime.get(
+            "open_orders"
+        )
+        or
+        []
+    )
 
-            "risk_per_share":
-                risk_per_share,
+    open_orders = [
+        normalize_order(
+            item
+        )
 
-            "planned_risk":
-                planned_risk,
+        for item
+        in raw_open_orders
 
-            "position_value":
-                position_value,
+        if isinstance(
+            item,
+            dict,
+        )
+    ]
 
-            "risk_budget":
-                dynamic[
-                    "risk_budget"
-                ],
+    signal_details = (
+        load_signal_details()
+    )
 
-            "capital_budget":
-                dynamic[
-                    "capital_budget"
-                ],
+    classification = (
+        get_position_classification(
+            runtime
+        )
+    )
 
-            "account_equity":
-                dynamic[
-                    "net_liquidation"
-                ],
+    managed = [
+        normalize_position(
+            item,
+            signal_details=
+                signal_details,
+            open_orders=
+                open_orders,
+        )
 
-            "available_funds":
-                dynamic[
-                    "available_funds"
-                ],
+        for item
+        in (
+            classification.get(
+                "managed_positions"
+            )
+            or
+            []
+        )
+    ]
 
-            "equity_risk_budget":
-                dynamic.get(
-                    "equity_risk_budget"
+    legacy = [
+        normalize_position(
+            item,
+            signal_details=
+                signal_details,
+            open_orders=
+                open_orders,
+        )
+
+        for item
+        in (
+            classification.get(
+                "legacy_positions"
+            )
+            or
+            []
+        )
+    ]
+
+    all_positions = (
+        managed
+        +
+        legacy
+    )
+
+    total_market_value = sum(
+        abs(
+            item[
+                "market_value"
+            ]
+        )
+
+        for item
+        in all_positions
+
+        if item[
+            "market_value"
+        ]
+        is not None
+    )
+
+    total_position_unrealized = sum(
+        item[
+            "unrealized_pnl"
+        ]
+
+        for item
+        in all_positions
+
+        if item[
+            "unrealized_pnl"
+        ]
+        is not None
+    )
+
+    pnl_available_count = sum(
+        1
+
+        for item
+        in all_positions
+
+        if item[
+            "position_pnl_available"
+        ]
+    )
+
+    managed_protected_count = sum(
+        1
+
+        for item
+        in managed
+
+        if item.get(
+            "protection_complete"
+        )
+        is True
+    )
+
+    managed_unprotected = [
+        {
+            "symbol":
+                item.get(
+                    "symbol"
                 ),
 
-            "equity_capital_budget":
-                dynamic.get(
-                    "equity_capital_budget"
-                ),
+            "signal_ids": [
+                signal.get(
+                    "signal_id"
+                )
+                for signal
+                in (
+                    item.get(
+                        "managed_signals"
+                    )
+                    or
+                    []
+                )
+            ],
         }
 
+        for item
+        in managed
+
+        if item.get(
+            "protection_complete"
+        )
+        is False
+    ]
 
     return {
-        **dynamic,
+        "account":
+            runtime.get(
+                "account"
+            ),
 
-        "sizing_mode":
-            "AUTO_RISK",
+        "snapshot_updated_at":
+            runtime.get(
+                "updated_at"
+            ),
 
-        "account_equity":
-            dynamic[
-                "net_liquidation"
-            ],
+        "managed_positions":
+            managed,
+
+        "legacy_positions":
+            legacy,
+
+        "open_orders":
+            open_orders,
+
+        "managed_count":
+            classification.get(
+                "managed_position_count"
+            ),
+
+        "legacy_count":
+            classification.get(
+                "legacy_position_count"
+            ),
+
+        "total_count":
+            classification.get(
+                "broker_position_count"
+            ),
+
+        "max_managed":
+            classification.get(
+                "max_managed_positions",
+                MAX_MANAGED_POSITIONS,
+            ),
+
+        "max_total":
+            classification.get(
+                "max_total_broker_positions",
+                MAX_TOTAL_BROKER_POSITIONS,
+            ),
+
+        "position_blockers":
+            classification.get(
+                "blockers",
+                [],
+            ),
+
+        "total_market_value":
+            total_market_value,
+
+        "total_position_unrealized_pnl":
+            total_position_unrealized,
+
+        "pnl_available_count":
+            pnl_available_count,
+
+        "managed_protected_count":
+            managed_protected_count,
+
+        "managed_unprotected_count":
+            len(
+                managed_unprotected
+            ),
+
+        "managed_unprotected":
+            managed_unprotected,
     }
 
 
-# ============================================================
-# HEALTH
-# ============================================================
-
 @app.get(
-    "/health"
+    "/dashboard-summary"
 )
-def health():
-    return {
-        "status":
-            "ok",
-
-        "live_trading":
-            LIVE_TRADING,
-
-        "test_mode":
-            WEBHOOK_TEST_MODE,
-
-        "signal_max_age_seconds":
-            MAX_SIGNAL_AGE_SECONDS,
-
-        "max_managed_positions":
-            MAX_MANAGED_POSITIONS,
-
-        "max_total_broker_positions":
-            MAX_TOTAL_BROKER_POSITIONS,
-
-        "event_store":
-            True,
-    }
-
-
-# ============================================================
-# DASHBOARD
-# ============================================================
-
-@app.get(
-    "/dashboard",
-    response_class=HTMLResponse,
-)
-def dashboard(
-    user=Depends(
-        dashboard_auth
-    ),
+def dashboard_summary(
+    user=
+        Depends(
+            dashboard_auth
+        ),
 ):
-    with open(
-        DASHBOARD_FILE,
-        "r",
-        encoding="utf-8",
-    ) as handle:
-
-        return handle.read()
-
-
-# ============================================================
-# STATUS
-# ============================================================
-
-@app.get(
-    "/status"
-)
-def status(
-    user=Depends(
-        dashboard_auth
-    ),
-):
-    snapshot = (
+    runtime = (
         get_runtime_snapshot()
-        or {}
+        or
+        {}
     )
-
 
     safety = (
         build_safety_state()
     )
 
-
-    conn = db_connect()
-
-    cur = conn.cursor()
-
-
-    cur.execute(
-        """
-        SELECT
-            status,
-            COUNT(*) AS count
-        FROM signals
-        GROUP BY status
-        """
+    control_state = (
+        get_control_state(
+            DB_FILE
+        )
     )
 
+    strategy = (
+        read_snapshot()
+    )
 
-    signal_counts = {
-        row[
-            "status"
-        ]:
-            row[
-                "count"
+    strategy_age = (
+        strategy_age_seconds(
+            strategy
+        )
+    )
+
+    services = [
+        service_state(
+            service
+        )
+
+        for service
+        in DASHBOARD_SERVICES
+    ]
+
+    service_active_count = sum(
+        1
+
+        for item
+        in services
+
+        if item[
+            "active"
+        ]
+    )
+
+    classification = (
+        get_position_classification(
+            runtime
+        )
+    )
+
+    components = (
+        read_runtime_components()
+    )
+
+    critical_component_failures = sum(
+        1
+
+        for item
+        in components
+
+        if (
+            item[
+                "critical"
             ]
-
-        for row
-        in cur.fetchall()
-    }
-
-
-    cur.execute(
-        """
-        SELECT
-            signal_id,
-
-            strategy,
-            timeframe,
-            signal_time,
-            signal_age_seconds,
-
-            symbol,
-            quantity,
-            sizing_mode,
-
-            position_value,
-            planned_risk,
-
-            status,
-
-            parent_order_id,
-
-            entry_order_ref,
-            target_order_ref,
-            stop_order_ref,
-
-            updated_at,
-            error_message,
-            monitor_message
-
-        FROM signals
-
-        ORDER BY updated_at DESC
-
-        LIMIT 20
-        """
-    )
-
-
-    recent_signals = [
-        dict(
-            row
+            and
+            not item[
+                "effective_healthy"
+            ]
         )
-
-        for row
-        in cur.fetchall()
-    ]
-
-
-    cur.execute(
-        """
-        SELECT
-            event_id,
-            signal_id,
-            event_type,
-            source,
-            old_status,
-            new_status,
-            message,
-            created_at
-
-        FROM trade_events
-
-        ORDER BY event_id DESC
-
-        LIMIT 30
-        """
     )
-
-
-    recent_events = [
-        dict(
-            row
-        )
-
-        for row
-        in cur.fetchall()
-    ]
-
-
-    conn.close()
-
 
     return {
         "system": {
@@ -1600,1299 +2060,242 @@ def status(
                 WEBHOOK_TEST_MODE,
 
             "live_ready":
-                safety[
-                    "live_ready"
-                ],
-
-            "event_store":
-                True,
-        },
-
-
-        "signal_policy": {
-            "max_signal_age_seconds":
-                MAX_SIGNAL_AGE_SECONDS,
-
-            "max_future_skew_seconds":
-                MAX_SIGNAL_FUTURE_SKEW_SECONDS,
-        },
-
-
-        "safety":
-            safety,
-
-
-        "account": {
-            "net_liquidation":
-                snapshot.get(
-                    "net_liquidation"
+                safety.get(
+                    "live_ready",
+                    False,
                 ),
 
-            "available_funds":
-                snapshot.get(
-                    "available_funds"
+            "kill_switch":
+                control_state.get(
+                    "kill_switch",
+                    False,
                 ),
 
-            "buying_power":
-                snapshot.get(
-                    "buying_power"
-                ),
-
-            "total_cash_value":
-                snapshot.get(
-                    "total_cash_value"
-                ),
-
-            "excess_liquidity":
-                snapshot.get(
-                    "excess_liquidity"
-                ),
-
-            "daily_pnl":
-                snapshot.get(
-                    "daily_pnl"
-                ),
-
-            "unrealized_pnl":
-                snapshot.get(
-                    "unrealized_pnl"
-                ),
-
-            "realized_pnl":
-                snapshot.get(
-                    "realized_pnl"
+            "kill_switch_reason":
+                control_state.get(
+                    "reason"
                 ),
         },
 
 
         "broker": {
-            "updated_at":
-                snapshot.get(
-                    "updated_at"
-                ),
-
-            "snapshot_age_seconds":
-                safety[
-                    "snapshot_age_seconds"
-                ],
-
             "tws_connected":
-                snapshot.get(
+                runtime.get(
                     "tws_connected",
                     False,
                 ),
 
             "account":
-                snapshot.get(
+                runtime.get(
                     "account"
                 ),
 
-            "positions":
-                (
-                    snapshot.get(
-                        "positions"
-                    )
-                    or []
+            "snapshot_updated_at":
+                runtime.get(
+                    "updated_at"
                 ),
 
-            "open_orders":
-                (
-                    snapshot.get(
-                        "open_orders"
-                    )
-                    or []
-                ),
-
-            "last_error":
-                snapshot.get(
-                    "last_error"
-                ),
-        },
-
-
-        "risk": {
-            "risk_mode":
-                RISK_MODE,
-
-            "risk_per_trade_pct":
-                RISK_PER_TRADE_PCT,
-
-            "max_capital_per_trade_pct":
-                MAX_CAPITAL_PER_TRADE_PCT,
-
-            "max_risk_per_trade_usd":
-                MAX_RISK_PER_TRADE_USD,
-
-            "max_position_usd":
-                MAX_POSITION_USD,
-        },
-
-
-        "limits": {
-            "max_managed_positions":
-                MAX_MANAGED_POSITIONS,
-
-            "max_total_broker_positions":
-                MAX_TOTAL_BROKER_POSITIONS,
-
-            "max_open_positions_legacy_fallback":
-                MAX_OPEN_POSITIONS,
-
-            "max_trades_per_day":
-                MAX_TRADES_PER_DAY,
-
-            "max_daily_loss_usd":
-                MAX_DAILY_LOSS_USD,
-
-            "minimum_account_equity":
-                MIN_ACCOUNT_EQUITY_USD,
-        },
-
-
-        "summary": {
-            "managed_position_count":
+            "snapshot_age_seconds":
                 safety.get(
-                    "managed_position_count"
+                    "snapshot_age_seconds"
                 ),
 
-            "legacy_position_count":
-                safety.get(
-                    "legacy_position_count"
-                ),
-
-            "total_broker_position_count":
-                safety.get(
-                    "total_broker_position_count"
-                ),
-
-            #
-            # Compatibility field for the existing dashboard.
-            #
-            "position_count":
-                safety.get(
-                    "managed_position_count"
-                ),
-
-            "open_order_count":
-                len(
-                    snapshot.get(
-                        "open_orders"
-                    )
-                    or []
-                ),
-
-            "pending_cancel_count":
-                safety[
-                    "pending_cancel_count"
-                ],
-
-            "trades_today":
-                safety[
-                    "trades_today"
-                ],
-
-            "signal_counts":
-                signal_counts,
-        },
-
-
-        "recent_signals":
-            recent_signals,
-
-        "recent_events":
-            recent_events,
-    }
-
-
-# ============================================================
-# EVENTS
-# ============================================================
-
-@app.get(
-    "/events/{signal_id}"
-)
-def signal_events(
-    signal_id: str,
-
-    user=Depends(
-        dashboard_auth
-    ),
-):
-    conn = db_connect()
-
-    cur = conn.cursor()
-
-
-    cur.execute(
-        """
-        SELECT
-            event_id,
-            event_key,
-            signal_id,
-            event_type,
-            source,
-            old_status,
-            new_status,
-            message,
-            payload_json,
-            created_at
-
-        FROM trade_events
-
-        WHERE signal_id = ?
-
-        ORDER BY event_id ASC
-
-        LIMIT 500
-        """,
-        (
-            signal_id,
-        ),
-    )
-
-
-    result = []
-
-
-    for row in cur.fetchall():
-
-        item = dict(
-            row
-        )
-
-
-        raw_payload = item.pop(
-            "payload_json",
-            None,
-        )
-
-
-        if raw_payload:
-
-            try:
-                item[
-                    "payload"
-                ] = json.loads(
-                    raw_payload
-                )
-
-            except Exception:
-                item[
-                    "payload"
-                ] = None
-
-        else:
-            item[
-                "payload"
-            ] = None
-
-
-        result.append(
-            item
-        )
-
-
-    conn.close()
-
-
-    return result
-
-
-# ============================================================
-# RISK PREVIEW
-# ============================================================
-
-@app.get(
-    "/risk-preview"
-)
-def risk_preview(
-    entry: float,
-    stop: float,
-
-    user=Depends(
-        dashboard_auth
-    ),
-):
-    class PreviewSignal:
-        pass
-
-
-    signal = PreviewSignal()
-
-    signal.entry = entry
-
-    signal.stop = stop
-
-    signal.quantity = None
-
-
-    return resolve_position_size(
-        signal
-    )
-
-
-# ============================================================
-# CONTROL
-# ============================================================
-
-@app.get(
-    "/control"
-)
-def control(
-    user=Depends(
-        dashboard_auth
-    ),
-):
-    return get_control_state(
-        DB_FILE
-    )
-
-
-@app.post(
-    "/control/kill-switch"
-)
-def control_kill_switch(
-    request:
-        KillSwitchRequest,
-
-    user=Depends(
-        dashboard_auth
-    ),
-):
-    state = set_kill_switch(
-        DB_FILE,
-        request.enabled,
-        request.reason,
-    )
-
-
-    record_event(
-        db_file=
-            DB_FILE,
-
-        signal_id=
-            None,
-
-        event_type=(
-            "KILL_SWITCH_ENABLED"
-            if request.enabled
-            else
-            "KILL_SWITCH_DISABLED"
-        ),
-
-        source=
-            "api",
-
-        message=
-            request.reason,
-
-        payload={
-            "enabled":
-                request.enabled,
-
-            "user":
-                user,
-        },
-    )
-
-
-    print(
-        f"KILL SWITCH | "
-        f"enabled="
-        f"{state['kill_switch']} | "
-        f"reason="
-        f"{state['reason']}"
-    )
-
-
-    return state
-
-
-# ============================================================
-# TRADES
-# ============================================================
-
-@app.get(
-    "/trades"
-)
-def trades(
-    user=Depends(
-        dashboard_auth
-    ),
-):
-    conn = db_connect()
-
-    cur = conn.cursor()
-
-
-    cur.execute(
-        """
-        SELECT
-            signal_id,
-            strategy,
-            timeframe,
-
-            symbol,
-            quantity,
-
-            entry,
-            stop,
-            target,
-
-            sizing_mode,
-
-            position_value,
-            planned_risk,
-
-            status,
-
-            entry_fill_price,
-            exit_fill_price,
-
-            realized_pnl,
-
-            exit_reason,
-
-            updated_at
-
-        FROM signals
-
-        WHERE
-            test_mode = 0
-
-            AND parent_order_id
-                IS NOT NULL
-
-        ORDER BY updated_at DESC
-
-        LIMIT 100
-        """
-    )
-
-
-    rows = [
-        dict(
-            row
-        )
-
-        for row
-        in cur.fetchall()
-    ]
-
-
-    conn.close()
-
-
-    return rows
-
-
-# ============================================================
-# QUEUE
-# ============================================================
-
-@app.get(
-    "/queue"
-)
-def queue(
-    user=Depends(
-        dashboard_auth
-    ),
-):
-    conn = db_connect()
-
-    cur = conn.cursor()
-
-
-    cur.execute(
-        """
-        SELECT *
-        FROM signals
-        ORDER BY created_at DESC
-        LIMIT 100
-        """
-    )
-
-
-    rows = [
-        dict(
-            row
-        )
-
-        for row
-        in cur.fetchall()
-    ]
-
-
-    conn.close()
-
-
-    return rows
-
-
-# ============================================================
-# WEBHOOK
-# ============================================================
-
-@app.post(
-    "/webhook/tradingview"
-)
-def webhook(
-    signal:
-        TradeSignal,
-):
-    # --------------------------------------------------------
-    # SECRET
-    # --------------------------------------------------------
-
-    validate_secret(
-        signal.secret
-    )
-
-
-    signal_id = (
-        signal.signal_id
-        or ""
-    ).strip()
-
-
-    if not signal_id:
-
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "signal_id is required"
-            ),
-        )
-
-
-    if len(
-        signal_id
-    ) > 120:
-
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "signal_id is too long"
-            ),
-        )
-
-
-    # --------------------------------------------------------
-    # SIGNAL VALIDATION
-    # --------------------------------------------------------
-
-    validate_prices(
-        signal
-    )
-
-
-    metadata = (
-        validate_signal_contract(
-            signal
-        )
-    )
-
-
-    # --------------------------------------------------------
-    # DUPLICATE CHECK
-    # --------------------------------------------------------
-
-    conn = db_connect()
-
-    cur = conn.cursor()
-
-
-    cur.execute(
-        """
-        SELECT status
-        FROM signals
-        WHERE signal_id = ?
-        """,
-        (
-            signal_id,
-        ),
-    )
-
-
-    existing = (
-        cur.fetchone()
-    )
-
-
-    conn.close()
-
-
-    if existing is not None:
-
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                "Duplicate signal_id"
-            ),
-        )
-
-
-    # --------------------------------------------------------
-    # KILL SWITCH
-    # --------------------------------------------------------
-    #
-    # Test-mode signals remain useful for system tests.
-    # Kill switch prevents creation of LIVE signals.
-    #
-
-    control = get_control_state(
-        DB_FILE
-    )
-
-
-    if (
-        not WEBHOOK_TEST_MODE
-        and
-        control[
-            "kill_switch"
-        ]
-    ):
-
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                "LIVE blocked: "
-                "kill switch enabled"
-            ),
-        )
-
-
-    # --------------------------------------------------------
-    # POSITION SIZE
-    # --------------------------------------------------------
-
-    sizing = resolve_position_size(
-        signal
-    )
-
-
-    # --------------------------------------------------------
-    # AUTHORITATIVE LIVE SAFETY GATE
-    # --------------------------------------------------------
-
-    enforce_live_safety()
-
-
-    timestamp = now_iso()
-
-
-    # --------------------------------------------------------
-    # INSERT SIGNAL
-    # --------------------------------------------------------
-
-    conn = db_connect()
-
-    cur = conn.cursor()
-
-
-    try:
-        cur.execute(
-            "BEGIN IMMEDIATE"
-        )
-
-
-        cur.execute(
-            """
-            INSERT INTO signals (
-                signal_id,
-
-                strategy,
-                timeframe,
-                signal_time,
-                signal_age_seconds,
-
-                symbol,
-                action,
-
-                quantity,
-
-                entry,
-                target,
-                stop,
-
-                status,
-
-                created_at,
-                updated_at,
-
-                test_mode,
-                attempts,
-
-                sizing_mode,
-
-                position_value,
-                planned_risk,
-                risk_per_share,
-
-                account_equity,
-                available_funds_at_signal,
-
-                risk_budget,
-                capital_budget,
-
-                equity_risk_budget,
-                equity_capital_budget
-            )
-
-            VALUES (
-                ?,
-
-                ?, ?, ?, ?,
-
-                ?, ?,
-
-                ?,
-
-                ?, ?, ?,
-
-                ?,
-
-                ?, ?,
-
-                ?, ?,
-
-                ?,
-
-                ?, ?, ?,
-
-                ?, ?,
-
-                ?, ?,
-
-                ?, ?
-            )
-            """,
-            (
-                signal_id,
-
-                metadata[
-                    "strategy"
-                ],
-
-                metadata[
-                    "timeframe"
-                ],
-
-                metadata[
-                    "signal_time"
-                ],
-
-                metadata[
-                    "signal_age_seconds"
-                ],
-
-                signal.symbol.upper(),
-
-                signal.action.upper(),
-
-                sizing[
-                    "quantity"
-                ],
-
-                signal.entry,
-
-                signal.target,
-
-                signal.stop,
-
-                "QUEUED",
-
-                timestamp,
-
-                timestamp,
-
-                1
-                if WEBHOOK_TEST_MODE
-                else 0,
-
-                0,
-
-                sizing[
-                    "sizing_mode"
-                ],
-
-                sizing[
-                    "position_value"
-                ],
-
-                sizing[
-                    "planned_risk"
-                ],
-
-                sizing[
-                    "risk_per_share"
-                ],
-
-                sizing.get(
-                    "account_equity"
-                ),
-
-                sizing.get(
-                    "available_funds"
-                ),
-
-                sizing.get(
-                    "risk_budget"
-                ),
-
-                sizing.get(
-                    "capital_budget"
-                ),
-
-                sizing.get(
-                    "equity_risk_budget"
-                ),
-
-                sizing.get(
-                    "equity_capital_budget"
-                ),
-            ),
-        )
-
-
-        conn.commit()
-
-
-    except sqlite3.IntegrityError:
-
-        conn.rollback()
-
-
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                "Duplicate signal_id"
-            ),
-        )
-
-
-    except Exception:
-
-        conn.rollback()
-
-        raise
-
-
-    finally:
-
-        conn.close()
-
-
-    # --------------------------------------------------------
-    # AUDIT EVENTS
-    # --------------------------------------------------------
-
-    record_event(
-        db_file=
-            DB_FILE,
-
-        signal_id=
-            signal_id,
-
-        event_type=
-            "SIGNAL_RECEIVED",
-
-        source=
-            "api",
-
-        message=(
-            "TradingView signal accepted"
-        ),
-
-        payload={
-            "strategy":
-                metadata[
-                    "strategy"
-                ],
-
-            "timeframe":
-                metadata[
-                    "timeframe"
-                ],
-
-            "signal_time":
-                metadata[
-                    "signal_time"
-                ],
-
-            "signal_age_seconds":
-                metadata[
-                    "signal_age_seconds"
-                ],
-
-            "symbol":
-                signal.symbol.upper(),
-
-            "action":
-                signal.action.upper(),
-
-            "entry":
-                signal.entry,
-
-            "target":
-                signal.target,
-
-            "stop":
-                signal.stop,
-
-            "test_mode":
-                WEBHOOK_TEST_MODE,
-        },
-
-        event_key=(
-            f"signal:"
-            f"{signal_id}:received"
-        ),
-    )
-
-
-    record_event(
-        db_file=
-            DB_FILE,
-
-        signal_id=
-            signal_id,
-
-        event_type=
-            "RISK_APPROVED",
-
-        source=
-            "api",
-
-        message=(
-            "Position sizing approved"
-        ),
-
-        payload={
-            "quantity":
-                sizing[
-                    "quantity"
-                ],
-
-            "sizing_mode":
-                sizing[
-                    "sizing_mode"
-                ],
-
-            "position_value":
-                sizing[
-                    "position_value"
-                ],
-
-            "planned_risk":
-                sizing[
-                    "planned_risk"
-                ],
-
-            "risk_budget":
-                sizing.get(
-                    "risk_budget"
-                ),
-
-            "capital_budget":
-                sizing.get(
-                    "capital_budget"
-                ),
-
-            "account_equity":
-                sizing.get(
-                    "account_equity"
+            "net_liquidation":
+                runtime.get(
+                    "net_liquidation"
                 ),
 
             "available_funds":
-                sizing.get(
+                runtime.get(
                     "available_funds"
+                ),
+
+            "daily_pnl":
+                runtime.get(
+                    "daily_pnl"
+                ),
+
+            "unrealized_pnl":
+                runtime.get(
+                    "unrealized_pnl"
+                ),
+
+            "realized_pnl":
+                runtime.get(
+                    "realized_pnl"
                 ),
         },
 
-        event_key=(
-            f"signal:"
-            f"{signal_id}:risk"
-        ),
-    )
 
+        "positions": {
+            "managed":
+                classification.get(
+                    "managed_position_count"
+                ),
 
-    record_event(
-        db_file=
-            DB_FILE,
+            "legacy":
+                classification.get(
+                    "legacy_position_count"
+                ),
 
-        signal_id=
-            signal_id,
+            "total":
+                classification.get(
+                    "broker_position_count"
+                ),
 
-        event_type=
-            "SIGNAL_QUEUED",
+            "max_managed":
+                MAX_MANAGED_POSITIONS,
 
-        source=
-            "api",
-
-        message=(
-            "Signal inserted into queue"
-        ),
-
-        payload={
-            "status":
-                "QUEUED",
+            "max_total":
+                MAX_TOTAL_BROKER_POSITIONS,
         },
 
-        event_key=(
-            f"signal:"
-            f"{signal_id}:queued"
-        ),
-    )
 
-
-    return {
-        "accepted":
-            True,
-
-        "signal_id":
-            signal_id,
-
-        "strategy":
-            metadata[
-                "strategy"
-            ],
-
-        "timeframe":
-            metadata[
-                "timeframe"
-            ],
-
-        "signal_time":
-            metadata[
-                "signal_time"
-            ],
-
-        "signal_age_seconds":
-            metadata[
-                "signal_age_seconds"
-            ],
-
-        "symbol":
-            signal.symbol.upper(),
-
-        "quantity":
-            sizing[
-                "quantity"
-            ],
-
-        "sizing_mode":
-            sizing[
-                "sizing_mode"
-            ],
-
-        "planned_risk":
-            sizing[
-                "planned_risk"
-            ],
-
-        "position_value":
-            sizing[
-                "position_value"
-            ],
-
-        "test_mode":
-            WEBHOOK_TEST_MODE,
-    }
-
-
-# ============================================================
-# CANCEL
-# ============================================================
-
-@app.post(
-    "/cancel/{signal_id}"
-)
-def cancel(
-    signal_id: str,
-
-    request:
-        CancelRequest,
-):
-    validate_secret(
-        request.secret
-    )
-
-
-    conn = db_connect()
-
-    cur = conn.cursor()
-
-
-    cur.execute(
-        """
-        SELECT *
-        FROM signals
-        WHERE signal_id = ?
-        """,
-        (
-            signal_id,
-        ),
-    )
-
-
-    row = cur.fetchone()
-
-
-    conn.close()
-
-
-    if row is None:
-
-        raise HTTPException(
-            status_code=404,
-            detail=(
-                "Signal not found"
-            ),
-        )
-
-
-    signal = dict(
-        row
-    )
-
-
-    if (
-        signal[
-            "parent_order_id"
-        ]
-        is None
-    ):
-
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                "Signal has no "
-                "IBKR parent order"
-            ),
-        )
-
-
-    current_status = (
-        signal[
-            "status"
-        ]
-    )
-
-
-    if (
-        current_status
-        == "CANCELLED"
-    ):
-
-        return {
-            "accepted":
-                True,
-
-            "signal_id":
-                signal_id,
-
-            "status":
-                "CANCELLED",
-        }
-
-
-    if current_status in {
-        "CANCEL_REQUESTED",
-        "CANCELLING",
-        "CANCEL_PENDING",
-    }:
-
-        return {
-            "accepted":
-                True,
-
-            "signal_id":
-                signal_id,
-
-            "status":
-                current_status,
-        }
-
-
-    allowed = {
-        "SUBMITTED",
-        "ACCEPTED_WAITING_MARKET",
-        "ERROR",
-        "UNKNOWN",
-        "CANCEL_UNKNOWN",
-    }
-
-
-    if (
-        current_status
-        not in allowed
-    ):
-
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                "Cannot cancel from "
-                + current_status
-            ),
-        )
-
-
-    try:
-        result = transition_signal(
-            db_file=
-                DB_FILE,
-
-            signal_id=
-                signal_id,
-
-            new_status=
-                "CANCEL_REQUESTED",
-
-            event_type=
-                "CANCEL_REQUESTED",
-
-            source=
-                "api",
-
-            message=(
-                "Cancellation requested "
-                "through API"
+        "trading_day":
+            safety.get(
+                "trading_day"
             ),
 
-            payload={
-                "parent_order_id":
-                    signal[
-                        "parent_order_id"
-                    ],
-            },
 
-            force=(
-                current_status
-                == "CANCEL_UNKNOWN"
-            ),
-        )
+        "safety": {
+            "blockers":
+                safety.get(
+                    "blockers",
+                    [],
+                ),
 
-
-    except InvalidStateTransition as exc:
-
-        raise HTTPException(
-            status_code=409,
-            detail=str(
-                exc
-            ),
-        )
+            "pending_cancel_count":
+                safety.get(
+                    "pending_cancel_count"
+                ),
+        },
 
 
-    return {
-        "accepted":
-            True,
+        "strategy": {
+            "phase":
+                strategy.get(
+                    "phase"
+                ),
 
-        "signal_id":
-            signal_id,
+            "session":
+                strategy.get(
+                    "session"
+                ),
 
-        "status":
-            result[
-                "new_status"
-            ],
+            "cycle":
+                strategy.get(
+                    "cycle"
+                ),
+
+            "directional":
+                strategy.get(
+                    "directional",
+                    0,
+                ),
+
+            "universe":
+                strategy.get(
+                    "universe",
+                    0,
+                ),
+
+            "eligible":
+                strategy.get(
+                    "eligible",
+                    0,
+                ),
+
+            "hot_pool":
+                strategy.get(
+                    "hot_pool",
+                    0,
+                ),
+
+            "hot_core":
+                strategy.get(
+                    "hot_core",
+                    0,
+                ),
+
+            "hot_rotate":
+                strategy.get(
+                    "hot_rotate",
+                    0,
+                ),
+
+            "analyzed":
+                strategy.get(
+                    "analyzed",
+                    0,
+                ),
+
+            "qualified":
+                strategy.get(
+                    "qualified",
+                    0,
+                ),
+
+            "bridge_dry_run":
+                strategy.get(
+                    "bridge_dry_run"
+                ),
+
+            "bridge_allow_post":
+                strategy.get(
+                    "bridge_allow_post"
+                ),
+
+            "updated_at":
+                strategy.get(
+                    "updated_at"
+                ),
+
+            "age_seconds":
+                strategy_age,
+
+            "fresh":
+                (
+                    strategy_age
+                    is not None
+                    and
+                    strategy_age <= 120
+                ),
+        },
+
+
+        "services": {
+            "active":
+                service_active_count,
+
+            "total":
+                len(
+                    services
+                ),
+
+            "all_active":
+                service_active_count
+                ==
+                len(
+                    services
+                ),
+
+            "items":
+                services,
+        },
+
+
+        "components": {
+            "total":
+                len(
+                    components
+                ),
+
+            "critical_failures":
+                critical_component_failures,
+
+            "all_critical_healthy":
+                critical_component_failures
+                ==
+                0,
+        },
     }

@@ -53,6 +53,24 @@ STATUS_INTERVAL_SECONDS = int(
     )
 )
 
+POSITION_PNL_TIMEOUT_SECONDS = float(
+    os.getenv(
+        "POSITION_PNL_TIMEOUT_SECONDS",
+        "3"
+    )
+)
+
+ACCOUNT_PNL_TIMEOUT_SECONDS = float(
+    os.getenv(
+        "ACCOUNT_PNL_TIMEOUT_SECONDS",
+        "3"
+    )
+)
+
+
+# ============================================================
+# TIME
+# ============================================================
 
 def now_iso():
     return datetime.now(
@@ -60,13 +78,19 @@ def now_iso():
     ).isoformat()
 
 
+# ============================================================
+# DATABASE
+# ============================================================
+
 def db_connect():
     conn = sqlite3.connect(
         DB_FILE,
         timeout=10
     )
 
-    conn.row_factory = sqlite3.Row
+    conn.row_factory = (
+        sqlite3.Row
+    )
 
     return conn
 
@@ -84,7 +108,8 @@ def column_exists(
 
     return column in {
         row[1]
-        for row in cur.fetchall()
+        for row
+        in cur.fetchall()
     }
 
 
@@ -167,6 +192,10 @@ def init_db():
     conn.close()
 
 
+# ============================================================
+# VALUES
+# ============================================================
+
 def safe_float(
     value
 ):
@@ -176,10 +205,11 @@ def safe_float(
         )
 
         #
-        # IBKR may use enormous sentinel-like
-        # values for unavailable P/L fields.
+        # Ignore IBKR sentinel-like values.
         #
-        if abs(value) > 1e100:
+        if abs(
+            value
+        ) > 1e100:
             return None
 
         return value
@@ -187,6 +217,26 @@ def safe_float(
     except Exception:
         return None
 
+
+def safe_order_price(
+    value
+):
+    value = safe_float(
+        value
+    )
+
+    if value is None:
+        return None
+
+    if value <= 0:
+        return None
+
+    return value
+
+
+# ============================================================
+# SNAPSHOT STORAGE
+# ============================================================
 
 def save_snapshot(
     *,
@@ -200,6 +250,7 @@ def save_snapshot(
     error
 ):
     conn = db_connect()
+
     cur = conn.cursor()
 
     cur.execute(
@@ -358,6 +409,97 @@ def save_snapshot(
     conn.close()
 
 
+def mark_snapshot_error(
+    error
+):
+    """
+    Hard collector failures must NOT replace a previously valid
+    broker snapshot with fake empty data.
+
+    We update only last_error.
+
+    The existing snapshot keeps its original updated_at timestamp,
+    therefore STATUS_MAX_AGE_SECONDS will naturally make it stale
+    and fail closed if the collector cannot recover.
+    """
+
+    conn = db_connect()
+
+    try:
+        row = (
+            conn.execute(
+                """
+                SELECT id
+                FROM runtime_status
+                WHERE id=1
+                """
+            )
+            .fetchone()
+        )
+
+        if row is None:
+            #
+            # No valid snapshot has ever existed.
+            #
+            conn.execute(
+                """
+                INSERT INTO runtime_status (
+                    id,
+                    updated_at,
+                    tws_connected,
+                    account,
+                    positions_json,
+                    open_orders_json,
+                    account_values_json,
+                    last_error
+                )
+
+                VALUES (
+                    1,
+                    ?,
+                    0,
+                    ?,
+                    '[]',
+                    '[]',
+                    '{}',
+                    ?
+                )
+                """,
+                (
+                    now_iso(),
+                    IB_ACCOUNT,
+                    str(
+                        error
+                    ),
+                )
+            )
+
+        else:
+            conn.execute(
+                """
+                UPDATE runtime_status
+
+                SET last_error = ?
+
+                WHERE id=1
+                """,
+                (
+                    str(
+                        error
+                    ),
+                )
+            )
+
+        conn.commit()
+
+    finally:
+        conn.close()
+
+
+# ============================================================
+# IBKR CLIENT
+# ============================================================
+
 class StatusApp(
     EWrapper,
     EClient
@@ -369,7 +511,9 @@ class StatusApp(
             self
         )
 
-        self.ready = threading.Event()
+        self.ready = (
+            threading.Event()
+        )
 
         self.positions_done = (
             threading.Event()
@@ -387,6 +531,16 @@ class StatusApp(
             threading.Event()
         )
 
+        self.position_pnl_done = (
+            threading.Event()
+        )
+
+        self.position_pnl_req_to_index = {}
+
+        self.position_pnl_pending = set()
+
+        self.position_pnl_errors = []
+
         self.accounts = []
 
         self.positions = []
@@ -403,6 +557,10 @@ class StatusApp(
 
         self.errors = []
 
+
+    # --------------------------------------------------------
+    # CONNECTION
+    # --------------------------------------------------------
 
     def nextValidId(
         self,
@@ -422,6 +580,10 @@ class StatusApp(
             if account.strip()
         ]
 
+
+    # --------------------------------------------------------
+    # POSITIONS
+    # --------------------------------------------------------
 
     def position(
         self,
@@ -444,13 +606,43 @@ class StatusApp(
             "symbol":
                 contract.symbol.upper(),
 
+            "con_id":
+                int(
+                    contract.conId
+                ),
+
+            "currency":
+                getattr(
+                    contract,
+                    "currency",
+                    None
+                ),
+
             "quantity":
                 qty,
 
             "avg_cost":
                 float(
                     avgCost
-                )
+                ),
+
+            "market_price":
+                None,
+
+            "market_value":
+                None,
+
+            "daily_pnl":
+                None,
+
+            "unrealized_pnl":
+                None,
+
+            "realized_pnl":
+                None,
+
+            "position_pnl_available":
+                False
         })
 
 
@@ -459,6 +651,10 @@ class StatusApp(
     ):
         self.positions_done.set()
 
+
+    # --------------------------------------------------------
+    # OPEN ORDERS
+    # --------------------------------------------------------
 
     def openOrder(
         self,
@@ -472,6 +668,61 @@ class StatusApp(
             != IB_ACCOUNT
         ):
             return
+
+        order_type = (
+            str(
+                order.orderType
+                or
+                ""
+            )
+            .upper()
+            .strip()
+        )
+
+        limit_price = (
+            safe_order_price(
+                getattr(
+                    order,
+                    "lmtPrice",
+                    None
+                )
+            )
+        )
+
+        stop_price = (
+            safe_order_price(
+                getattr(
+                    order,
+                    "auxPrice",
+                    None
+                )
+            )
+        )
+
+        display_price = None
+
+        if (
+            order_type
+            in {
+                "LMT",
+                "LOC",
+            }
+        ):
+            display_price = (
+                limit_price
+            )
+
+        elif (
+            order_type
+            in {
+                "STP",
+                "STOP",
+                "STP LMT",
+            }
+        ):
+            display_price = (
+                stop_price
+            )
 
         self.open_orders.append({
             "order_id":
@@ -509,6 +760,40 @@ class StatusApp(
                     order,
                     "orderRef",
                     ""
+                ),
+
+            "limit_price":
+                limit_price,
+
+            "stop_price":
+                stop_price,
+
+            "price":
+                display_price,
+
+            "tif":
+                getattr(
+                    order,
+                    "tif",
+                    None
+                ),
+
+            "outside_rth":
+                bool(
+                    getattr(
+                        order,
+                        "outsideRth",
+                        False
+                    )
+                ),
+
+            "transmit":
+                bool(
+                    getattr(
+                        order,
+                        "transmit",
+                        False
+                    )
                 )
         })
 
@@ -518,6 +803,10 @@ class StatusApp(
     ):
         self.orders_done.set()
 
+
+    # --------------------------------------------------------
+    # ACCOUNT SUMMARY
+    # --------------------------------------------------------
 
     def accountSummary(
         self,
@@ -541,6 +830,10 @@ class StatusApp(
     ):
         self.account_summary_done.set()
 
+
+    # --------------------------------------------------------
+    # ACCOUNT P/L
+    # --------------------------------------------------------
 
     def pnl(
         self,
@@ -570,6 +863,138 @@ class StatusApp(
         self.pnl_done.set()
 
 
+    # --------------------------------------------------------
+    # POSITION P/L
+    # --------------------------------------------------------
+
+    def pnlSingle(
+        self,
+        reqId,
+        pos,
+        dailyPnL,
+        unrealizedPnL,
+        realizedPnL,
+        value
+    ):
+        index = (
+            self.position_pnl_req_to_index.get(
+                reqId
+            )
+        )
+
+        if index is None:
+            return
+
+        if (
+            index < 0
+            or
+            index >= len(
+                self.positions
+            )
+        ):
+            return
+
+        item = (
+            self.positions[
+                index
+            ]
+        )
+
+        market_value = (
+            safe_float(
+                value
+            )
+        )
+
+        quantity = (
+            safe_float(
+                pos
+            )
+        )
+
+        if quantity is None:
+            quantity = (
+                safe_float(
+                    item.get(
+                        "quantity"
+                    )
+                )
+            )
+
+        market_price = None
+
+        if (
+            market_value is not None
+            and
+            quantity is not None
+            and
+            quantity != 0
+        ):
+            market_price = abs(
+                market_value
+                /
+                quantity
+            )
+
+        item[
+            "market_price"
+        ] = market_price
+
+        item[
+            "market_value"
+        ] = market_value
+
+        item[
+            "daily_pnl"
+        ] = (
+            safe_float(
+                dailyPnL
+            )
+        )
+
+        item[
+            "unrealized_pnl"
+        ] = (
+            safe_float(
+                unrealizedPnL
+            )
+        )
+
+        item[
+            "realized_pnl"
+        ] = (
+            safe_float(
+                realizedPnL
+            )
+        )
+
+        item[
+            "position_pnl_available"
+        ] = any([
+            market_price
+            is not None,
+
+            market_value
+            is not None,
+
+            item[
+                "unrealized_pnl"
+            ]
+            is not None
+        ])
+
+        self.position_pnl_pending.discard(
+            reqId
+        )
+
+        if not self.position_pnl_pending:
+            self.position_pnl_done.set()
+
+
+    # --------------------------------------------------------
+    # ERRORS
+    # --------------------------------------------------------
+
     def error(
         self,
         reqId,
@@ -586,14 +1011,39 @@ class StatusApp(
         }:
             return
 
+        if (
+            reqId
+            in self.position_pnl_req_to_index
+        ):
+            self.position_pnl_errors.append(
+                f"reqId={reqId} "
+                f"{errorCode}: "
+                f"{errorString}"
+            )
+
+            self.position_pnl_pending.discard(
+                reqId
+            )
+
+            if not self.position_pnl_pending:
+                self.position_pnl_done.set()
+
+            return
+
         self.errors.append(
             f"{errorCode}: "
             f"{errorString}"
         )
 
 
+# ============================================================
+# SNAPSHOT
+# ============================================================
+
 def collect_snapshot():
     app = StatusApp()
+
+    soft_warnings = []
 
     try:
         app.connect(
@@ -617,11 +1067,9 @@ def collect_snapshot():
                 "TWS connection timeout"
             )
 
-
         time.sleep(
             0.4
         )
-
 
         if (
             IB_ACCOUNT
@@ -647,7 +1095,90 @@ def collect_snapshot():
 
 
         # ----------------------------------------------------
-        # ORDERS
+        # PER-POSITION P/L
+        #
+        # Best effort only.
+        # It is useful for the dashboard but it is NOT allowed
+        # to destroy a valid broker/account snapshot.
+        # ----------------------------------------------------
+
+        if app.positions:
+            base_req_id = 8200
+
+            for index, item in enumerate(
+                app.positions
+            ):
+                req_id = (
+                    base_req_id
+                    +
+                    index
+                )
+
+                app.position_pnl_req_to_index[
+                    req_id
+                ] = index
+
+                app.position_pnl_pending.add(
+                    req_id
+                )
+
+                try:
+                    app.reqPnLSingle(
+                        req_id,
+                        IB_ACCOUNT,
+                        "",
+                        int(
+                            item[
+                                "con_id"
+                            ]
+                        )
+                    )
+
+                except Exception as exc:
+                    soft_warnings.append(
+                        (
+                            "Position P/L request "
+                            f"failed reqId={req_id}: "
+                            f"{exc}"
+                        )
+                    )
+
+                    app.position_pnl_pending.discard(
+                        req_id
+                    )
+
+            if app.position_pnl_pending:
+                completed = (
+                    app.position_pnl_done.wait(
+                        timeout=
+                            POSITION_PNL_TIMEOUT_SECONDS
+                    )
+                )
+
+                if not completed:
+                    soft_warnings.append(
+                        (
+                            "Position P/L timeout "
+                            f"pending="
+                            f"{len(app.position_pnl_pending)}"
+                        )
+                    )
+
+            for req_id in list(
+                app.position_pnl_req_to_index
+                .keys()
+            ):
+                try:
+                    app.cancelPnLSingle(
+                        req_id
+                    )
+
+                except Exception:
+                    pass
+
+
+        # ----------------------------------------------------
+        # OPEN ORDERS
         # ----------------------------------------------------
 
         app.reqAllOpenOrders()
@@ -662,6 +1193,9 @@ def collect_snapshot():
 
         # ----------------------------------------------------
         # ACCOUNT SUMMARY
+        #
+        # This is critical. NetLiquidation and AvailableFunds
+        # are part of the LIVE safety state.
         # ----------------------------------------------------
 
         account_req_id = 8001
@@ -689,51 +1223,242 @@ def collect_snapshot():
                 "Account summary timeout"
             )
 
-
         try:
             app.cancelAccountSummary(
                 account_req_id
             )
+
         except Exception:
             pass
 
 
+        net_liquidation = (
+            safe_float(
+                app.account_values.get(
+                    "NetLiquidation"
+                )
+            )
+        )
+
+        available_funds = (
+            safe_float(
+                app.account_values.get(
+                    "AvailableFunds"
+                )
+            )
+        )
+
+        if net_liquidation is None:
+            raise RuntimeError(
+                "NetLiquidation unavailable"
+            )
+
+        if available_funds is None:
+            raise RuntimeError(
+                "AvailableFunds unavailable"
+            )
+
+
         # ----------------------------------------------------
-        # P/L
+        # ACCOUNT P/L
+        #
+        # IMPORTANT:
+        #
+        # reqPnL is allowed to time out here.
+        #
+        # The worker performs its own fresh reqPnL immediately
+        # before any broker-side execution, so this collector
+        # must not claim that TWS is offline merely because the
+        # account P/L subscription was delayed.
         # ----------------------------------------------------
 
         pnl_req_id = 8101
 
-        app.reqPnL(
-            pnl_req_id,
-            IB_ACCOUNT,
-            ""
-        )
-
-        if not app.pnl_done.wait(
-            timeout=5
-        ):
-            raise RuntimeError(
-                "P/L timeout"
-            )
-
-
         try:
-            app.cancelPnL(
-                pnl_req_id
+            app.reqPnL(
+                pnl_req_id,
+                IB_ACCOUNT,
+                ""
             )
-        except Exception:
-            pass
 
+            pnl_received = (
+                app.pnl_done.wait(
+                    timeout=
+                        ACCOUNT_PNL_TIMEOUT_SECONDS
+                )
+            )
+
+            if not pnl_received:
+                soft_warnings.append(
+                    "Account P/L timeout"
+                )
+
+        except Exception as exc:
+            soft_warnings.append(
+                (
+                    "Account P/L request "
+                    f"failed: {exc}"
+                )
+            )
+
+        finally:
+            try:
+                app.cancelPnL(
+                    pnl_req_id
+                )
+
+            except Exception:
+                pass
+
+
+        # ----------------------------------------------------
+        # P/L FALLBACK
+        #
+        # If every position returned pnlSingle and account-level
+        # reqPnL did not answer, use the sum only as snapshot
+        # telemetry. The worker still does a fresh authoritative
+        # account reqPnL before execution.
+        # ----------------------------------------------------
+
+        position_pnl_rows = [
+            item
+
+            for item
+            in app.positions
+
+            if item.get(
+                "position_pnl_available"
+            )
+        ]
+
+        if (
+            app.daily_pnl is None
+            and
+            app.positions
+            and
+            len(
+                position_pnl_rows
+            )
+            ==
+            len(
+                app.positions
+            )
+        ):
+            daily_values = [
+                item.get(
+                    "daily_pnl"
+                )
+
+                for item
+                in position_pnl_rows
+            ]
+
+            if all(
+                value is not None
+                for value
+                in daily_values
+            ):
+                app.daily_pnl = sum(
+                    daily_values
+                )
+
+                soft_warnings.append(
+                    (
+                        "Account daily P/L "
+                        "derived from pnlSingle"
+                    )
+                )
+
+
+        if (
+            app.unrealized_pnl is None
+            and
+            position_pnl_rows
+        ):
+            values = [
+                item.get(
+                    "unrealized_pnl"
+                )
+
+                for item
+                in position_pnl_rows
+
+                if item.get(
+                    "unrealized_pnl"
+                )
+                is not None
+            ]
+
+            if (
+                len(values)
+                ==
+                len(
+                    position_pnl_rows
+                )
+            ):
+                app.unrealized_pnl = sum(
+                    values
+                )
+
+
+        if (
+            app.realized_pnl is None
+            and
+            position_pnl_rows
+        ):
+            values = [
+                item.get(
+                    "realized_pnl"
+                )
+
+                for item
+                in position_pnl_rows
+
+                if item.get(
+                    "realized_pnl"
+                )
+                is not None
+            ]
+
+            if (
+                len(values)
+                ==
+                len(
+                    position_pnl_rows
+                )
+            ):
+                app.realized_pnl = sum(
+                    values
+                )
+
+
+        # ----------------------------------------------------
+        # SAVE VALID BROKER SNAPSHOT
+        # ----------------------------------------------------
+
+        warning_parts = []
+
+        if app.errors:
+            warning_parts.extend(
+                app.errors
+            )
+
+        if app.position_pnl_errors:
+            warning_parts.extend(
+                app.position_pnl_errors
+            )
+
+        warning_parts.extend(
+            soft_warnings
+        )
 
         error_text = (
             "; ".join(
-                app.errors
+                warning_parts
             )
-            if app.errors
+            if warning_parts
             else None
         )
-
 
         save_snapshot(
             connected=True,
@@ -760,7 +1485,6 @@ def collect_snapshot():
                 error_text
         )
 
-
         print(
             f"STATUS | "
             f"positions="
@@ -772,21 +1496,36 @@ def collect_snapshot():
             f"available="
             f"{app.account_values.get('AvailableFunds')} | "
             f"daily_pnl="
-            f"{app.daily_pnl}"
+            f"{app.daily_pnl} | "
+            f"position_pnl="
+            f"{sum(1 for item in app.positions if item.get('position_pnl_available'))}"
+            f"/{len(app.positions)} | "
+            f"warnings="
+            f"{len(warning_parts)}"
         )
+
+        if warning_parts:
+            print(
+                "STATUS WARN | "
+                +
+                "; ".join(
+                    warning_parts
+                )
+            )
 
 
     except Exception as exc:
-
-        save_snapshot(
-            connected=False,
-            positions=[],
-            open_orders=[],
-            account_values={},
-            daily_pnl=None,
-            unrealized_pnl=None,
-            realized_pnl=None,
-            error=str(exc)
+        #
+        # Do NOT fabricate a disconnected empty account.
+        #
+        # Preserve the last real snapshot and let its age become
+        # stale. That is precisely what the safety controller is
+        # designed to detect.
+        #
+        mark_snapshot_error(
+            str(
+                exc
+            )
         )
 
         print(
@@ -798,9 +1537,14 @@ def collect_snapshot():
     finally:
         try:
             app.disconnect()
+
         except Exception:
             pass
 
+
+# ============================================================
+# MAIN
+# ============================================================
 
 def main():
     init_db()
@@ -819,6 +1563,15 @@ def main():
         f"{STATUS_INTERVAL_SECONDS}s"
     )
 
+    print(
+        f"positionPnLTimeout="
+        f"{POSITION_PNL_TIMEOUT_SECONDS}s"
+    )
+
+    print(
+        f"accountPnLTimeout="
+        f"{ACCOUNT_PNL_TIMEOUT_SECONDS}s"
+    )
 
     while True:
         collect_snapshot()

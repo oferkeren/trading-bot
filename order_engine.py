@@ -9,6 +9,13 @@ from ibapi.wrapper import EWrapper
 from ibapi.contract import Contract
 from ibapi.order import Order
 
+from signal_contract import (
+    normalize_action,
+    trade_direction,
+    validate_price_structure,
+    SignalContractError,
+)
+
 
 # ============================================================
 # CONFIG
@@ -16,26 +23,58 @@ from ibapi.order import Order
 
 load_dotenv()
 
-HOST = os.getenv("IB_HOST", "127.0.0.1")
-PORT = int(os.getenv("IB_PORT", "7496"))
-CLIENT_ID = int(os.getenv("IB_CLIENT_ID", "10"))
-ACCOUNT = os.getenv("IB_ACCOUNT")
+HOST = os.getenv(
+    "IB_HOST",
+    "127.0.0.1"
+)
 
-LIVE_TRADING = os.getenv(
-    "LIVE_TRADING",
-    "false"
-).lower() == "true"
+PORT = int(
+    os.getenv(
+        "IB_PORT",
+        "7496"
+    )
+)
+
+CLIENT_ID = int(
+    os.getenv(
+        "IB_CLIENT_ID",
+        "10"
+    )
+)
+
+ACCOUNT = os.getenv(
+    "IB_ACCOUNT"
+)
+
+
+LIVE_TRADING = (
+    os.getenv(
+        "LIVE_TRADING",
+        "false"
+    ).lower()
+    == "true"
+)
+
 
 MAX_POSITION_USD = float(
-    os.getenv("MAX_POSITION_USD", "500")
+    os.getenv(
+        "MAX_POSITION_USD",
+        "500"
+    )
 )
 
 MAX_TRADES_PER_DAY = int(
-    os.getenv("MAX_TRADES_PER_DAY", "5")
+    os.getenv(
+        "MAX_TRADES_PER_DAY",
+        "5"
+    )
 )
 
 MAX_OPEN_POSITIONS = int(
-    os.getenv("MAX_OPEN_POSITIONS", "3")
+    os.getenv(
+        "MAX_OPEN_POSITIONS",
+        "3"
+    )
 )
 
 
@@ -43,58 +82,111 @@ MAX_OPEN_POSITIONS = int(
 # IBKR APP
 # ============================================================
 
-class TradingApp(EWrapper, EClient):
+class TradingApp(
+    EWrapper,
+    EClient
+):
 
-    def __init__(self):
-        EClient.__init__(self, self)
+    def __init__(
+        self
+    ):
+        EClient.__init__(
+            self,
+            self
+        )
 
         self.next_order_id = None
 
         self.ready = threading.Event()
-        self.account_ok = threading.Event()
+
+        self.account_ok = (
+            threading.Event()
+        )
 
         self.accounts = []
+
         self.positions = {}
+
         self.open_orders = []
+
 
     # --------------------------------------------------------
     # Connection ready
     # --------------------------------------------------------
 
-    def nextValidId(self, orderId):
-        self.next_order_id = orderId
+    def nextValidId(
+        self,
+        orderId
+    ):
+        self.next_order_id = (
+            orderId
+        )
 
         print()
-        print("====================================")
-        print("CONNECTED TO TWS")
-        print("====================================")
-        print(f"Account       : {ACCOUNT}")
-        print(f"Next Order ID : {orderId}")
-        print("====================================")
+        print(
+            "===================================="
+        )
+        print(
+            "CONNECTED TO TWS"
+        )
+        print(
+            "===================================="
+        )
+        print(
+            f"Account       : "
+            f"{ACCOUNT}"
+        )
+        print(
+            f"Next Order ID : "
+            f"{orderId}"
+        )
+        print(
+            "===================================="
+        )
         print()
 
         self.ready.set()
+
 
     # --------------------------------------------------------
     # Accounts
     # --------------------------------------------------------
 
-    def managedAccounts(self, accountsList):
-
+    def managedAccounts(
+        self,
+        accountsList
+    ):
         self.accounts = [
             account.strip()
-            for account in accountsList.split(",")
+
+            for account
+            in accountsList.split(
+                ","
+            )
+
             if account.strip()
         ]
 
-        print("Available accounts:")
+
+        print(
+            "Available accounts:"
+        )
+
 
         for account in self.accounts:
-            print(f"  {account}")
+
+            print(
+                f"  {account}"
+            )
+
 
         print()
 
-        if ACCOUNT not in self.accounts:
+
+        if (
+            ACCOUNT
+            not in self.accounts
+        ):
 
             print(
                 f"ERROR: configured account "
@@ -102,12 +194,19 @@ class TradingApp(EWrapper, EClient):
             )
 
             self.disconnect()
+
             return
 
-        print(f"Account {ACCOUNT} verified.")
+
+        print(
+            f"Account {ACCOUNT} verified."
+        )
+
         print()
 
+
         self.account_ok.set()
+
 
     # --------------------------------------------------------
     # Positions
@@ -120,14 +219,20 @@ class TradingApp(EWrapper, EClient):
         position,
         avgCost
     ):
-
         if account != ACCOUNT:
             return
 
-        self.positions[contract.symbol] = {
-            "quantity": position,
-            "avg_cost": avgCost
+
+        self.positions[
+            contract.symbol
+        ] = {
+            "quantity":
+                position,
+
+            "avg_cost":
+                avgCost
         }
+
 
         print(
             f"POSITION | "
@@ -136,10 +241,18 @@ class TradingApp(EWrapper, EClient):
             f"avg={avgCost}"
         )
 
-    def positionEnd(self):
+
+    def positionEnd(
+        self
+    ):
         print()
-        print("Position download complete.")
+
+        print(
+            "Position download complete."
+        )
+
         print()
+
 
     # --------------------------------------------------------
     # Open orders
@@ -152,15 +265,26 @@ class TradingApp(EWrapper, EClient):
         order,
         orderState
     ):
-
         self.open_orders.append({
-            "order_id": orderId,
-            "symbol": contract.symbol,
-            "action": order.action,
-            "type": order.orderType,
-            "quantity": order.totalQuantity,
-            "status": orderState.status
+            "order_id":
+                orderId,
+
+            "symbol":
+                contract.symbol,
+
+            "action":
+                order.action,
+
+            "type":
+                order.orderType,
+
+            "quantity":
+                order.totalQuantity,
+
+            "status":
+                orderState.status
         })
+
 
         print(
             f"OPEN ORDER | "
@@ -172,10 +296,18 @@ class TradingApp(EWrapper, EClient):
             f"status={orderState.status}"
         )
 
-    def openOrderEnd(self):
+
+    def openOrderEnd(
+        self
+    ):
         print()
-        print("Open order download complete.")
+
+        print(
+            "Open order download complete."
+        )
+
         print()
+
 
     # --------------------------------------------------------
     # Order status
@@ -195,7 +327,6 @@ class TradingApp(EWrapper, EClient):
         whyHeld,
         mktCapPrice
     ):
-
         print(
             f"ORDER STATUS | "
             f"id={orderId} | "
@@ -205,6 +336,7 @@ class TradingApp(EWrapper, EClient):
             f"avgFill={avgFillPrice} | "
             f"parent={parentId}"
         )
+
 
     # --------------------------------------------------------
     # Executions
@@ -216,15 +348,17 @@ class TradingApp(EWrapper, EClient):
         contract,
         execution
     ):
-
         print()
+
         print(
             f"FILL | "
             f"{contract.symbol} | "
             f"shares={execution.shares} | "
             f"price={execution.price}"
         )
+
         print()
+
 
     # --------------------------------------------------------
     # Errors / messages
@@ -237,14 +371,13 @@ class TradingApp(EWrapper, EClient):
         errorString,
         advancedOrderRejectJson=""
     ):
-
-        # Normal IBKR connection status messages
         if errorCode in (
             2104,
             2106,
             2158
         ):
             return
+
 
         print(
             f"IB MESSAGE | "
@@ -258,14 +391,26 @@ class TradingApp(EWrapper, EClient):
 # CONTRACT
 # ============================================================
 
-def create_stock_contract(symbol):
-
+def create_stock_contract(
+    symbol
+):
     contract = Contract()
 
-    contract.symbol = symbol.upper()
-    contract.secType = "STK"
-    contract.exchange = "SMART"
-    contract.currency = "USD"
+    contract.symbol = (
+        symbol.upper()
+    )
+
+    contract.secType = (
+        "STK"
+    )
+
+    contract.exchange = (
+        "SMART"
+    )
+
+    contract.currency = (
+        "USD"
+    )
 
     return contract
 
@@ -275,16 +420,20 @@ def create_stock_contract(symbol):
 # ============================================================
 
 def create_base_order():
-
     order = Order()
 
-    order.account = ACCOUNT
+    order.account = (
+        ACCOUNT
+    )
+
 
     #
     # Compatibility with the ibapi version currently installed
     #
     order.eTradeOnly = False
+
     order.firmQuoteOnly = False
+
 
     return order
 
@@ -296,82 +445,189 @@ def create_base_order():
 def create_bracket_order(
     parent_id,
     quantity,
+    action,
     entry_price,
     target_price,
     stop_price,
     outside_rth=False
 ):
+    try:
+        structure = (
+            validate_price_structure(
+                action=
+                    action,
+
+                entry=
+                    entry_price,
+
+                stop=
+                    stop_price,
+
+                target=
+                    target_price
+            )
+        )
+
+    except SignalContractError as exc:
+
+        raise ValueError(
+            str(
+                exc
+            )
+        ) from exc
+
+
+    entry_action = (
+        structure[
+            "action"
+        ]
+    )
+
+    exit_action = (
+        "SELL"
+
+        if entry_action
+        == "BUY"
+
+        else "BUY"
+    )
+
 
     # --------------------------------------------------------
-    # Parent BUY
+    # Parent ENTRY
     # --------------------------------------------------------
 
     parent = create_base_order()
 
-    parent.orderId = parent_id
+    parent.orderId = (
+        parent_id
+    )
 
-    parent.action = "BUY"
-    parent.orderType = "LMT"
+    parent.action = (
+        entry_action
+    )
 
-    parent.totalQuantity = quantity
-    parent.lmtPrice = entry_price
+    parent.orderType = (
+        "LMT"
+    )
 
-    parent.tif = "DAY"
-    parent.outsideRth = outside_rth
+    parent.totalQuantity = (
+        quantity
+    )
 
-    #
-    # Do NOT transmit yet
-    #
-    parent.transmit = False
+    parent.lmtPrice = (
+        entry_price
+    )
+
+    parent.tif = (
+        "DAY"
+    )
+
+    parent.outsideRth = (
+        outside_rth
+    )
+
+    parent.transmit = (
+        False
+    )
+
 
     # --------------------------------------------------------
     # TAKE PROFIT
     # --------------------------------------------------------
 
-    take_profit = create_base_order()
+    take_profit = (
+        create_base_order()
+    )
 
-    take_profit.orderId = parent_id + 1
+    take_profit.orderId = (
+        parent_id
+        +
+        1
+    )
 
-    take_profit.action = "SELL"
-    take_profit.orderType = "LMT"
+    take_profit.action = (
+        exit_action
+    )
 
-    take_profit.totalQuantity = quantity
-    take_profit.lmtPrice = target_price
+    take_profit.orderType = (
+        "LMT"
+    )
 
-    take_profit.parentId = parent_id
+    take_profit.totalQuantity = (
+        quantity
+    )
 
-    take_profit.tif = "GTC"
+    take_profit.lmtPrice = (
+        target_price
+    )
 
-    #
-    # Exit orders stay regular-hours initially
-    #
-    take_profit.outsideRth = False
+    take_profit.parentId = (
+        parent_id
+    )
 
-    take_profit.transmit = False
+    take_profit.tif = (
+        "GTC"
+    )
+
+    take_profit.outsideRth = (
+        False
+    )
+
+    take_profit.transmit = (
+        False
+    )
+
 
     # --------------------------------------------------------
     # STOP LOSS
     # --------------------------------------------------------
 
-    stop_loss = create_base_order()
+    stop_loss = (
+        create_base_order()
+    )
 
-    stop_loss.orderId = parent_id + 2
+    stop_loss.orderId = (
+        parent_id
+        +
+        2
+    )
 
-    stop_loss.action = "SELL"
-    stop_loss.orderType = "STP"
+    stop_loss.action = (
+        exit_action
+    )
 
-    stop_loss.totalQuantity = quantity
-    stop_loss.auxPrice = stop_price
+    stop_loss.orderType = (
+        "STP"
+    )
 
-    stop_loss.parentId = parent_id
+    stop_loss.totalQuantity = (
+        quantity
+    )
 
-    stop_loss.tif = "GTC"
-    stop_loss.outsideRth = False
+    stop_loss.auxPrice = (
+        stop_price
+    )
+
+    stop_loss.parentId = (
+        parent_id
+    )
+
+    stop_loss.tif = (
+        "GTC"
+    )
+
+    stop_loss.outsideRth = (
+        False
+    )
 
     #
     # Last order transmits entire bracket
     #
-    stop_loss.transmit = True
+    stop_loss.transmit = (
+        True
+    )
+
 
     return [
         parent,
@@ -387,57 +643,86 @@ def create_bracket_order(
 def validate_trade(
     symbol,
     quantity,
+    action,
     entry,
     target,
     stop
 ):
-
     if not ACCOUNT:
+
         raise ValueError(
             "IB_ACCOUNT missing from .env"
         )
 
+
     if not symbol:
+
         raise ValueError(
             "Symbol is missing"
         )
 
+
     if quantity <= 0:
-        raise ValueError(
-            "Quantity must be greater than zero"
-        )
-
-    if entry <= 0:
-        raise ValueError(
-            "Entry price must be greater than zero"
-        )
-
-    if target <= entry:
-        raise ValueError(
-            "For a LONG trade, "
-            "target must be above entry"
-        )
-
-    if stop >= entry:
-        raise ValueError(
-            "For a LONG trade, "
-            "stop must be below entry"
-        )
-
-    if stop <= 0:
-        raise ValueError(
-            "Stop price must be greater than zero"
-        )
-
-    position_value = quantity * entry
-
-    if position_value > MAX_POSITION_USD:
 
         raise ValueError(
-            f"Position value ${position_value:.2f} "
-            f"exceeds MAX_POSITION_USD="
-            f"${MAX_POSITION_USD:.2f}"
+            (
+                "Quantity must be "
+                "greater than zero"
+            )
         )
+
+
+    try:
+        structure = (
+            validate_price_structure(
+                action=
+                    action,
+
+                entry=
+                    entry,
+
+                stop=
+                    stop,
+
+                target=
+                    target
+            )
+        )
+
+    except SignalContractError as exc:
+
+        raise ValueError(
+            str(
+                exc
+            )
+        ) from exc
+
+
+    position_value = (
+        quantity
+        *
+        entry
+    )
+
+
+    if (
+        position_value
+        >
+        MAX_POSITION_USD
+    ):
+
+        raise ValueError(
+            (
+                f"Position value "
+                f"${position_value:.2f} "
+                f"exceeds "
+                f"MAX_POSITION_USD="
+                f"${MAX_POSITION_USD:.2f}"
+            )
+        )
+
+
+    return structure
 
 
 # ============================================================
@@ -450,54 +735,101 @@ def main():
     # CLI validation
     # --------------------------------------------------------
 
-    if len(sys.argv) != 6:
+    if len(
+        sys.argv
+    ) != 7:
 
         print()
+
         print(
             "Usage:"
         )
 
         print(
             "python order_engine.py "
-            "SYMBOL QTY ENTRY TARGET STOP"
+            "ACTION SYMBOL QTY ENTRY TARGET STOP"
         )
 
         print()
 
+
         print(
-            "Example:"
+            "LONG example:"
         )
 
         print(
             "python order_engine.py "
-            "AAPL 1 100.00 110.00 95.00"
+            "BUY AAPL 1 100.00 110.00 95.00"
         )
 
         print()
 
-        sys.exit(1)
+
+        print(
+            "SHORT example:"
+        )
+
+        print(
+            "python order_engine.py "
+            "SELL AAPL 1 100.00 90.00 105.00"
+        )
+
+        print()
+
+        sys.exit(
+            1
+        )
+
 
     # --------------------------------------------------------
     # Parse input
     # --------------------------------------------------------
 
-    symbol = sys.argv[1].upper()
+    action = normalize_action(
+        sys.argv[
+            1
+        ]
+    )
+
+    direction = trade_direction(
+        action
+    )
+
+
+    symbol = (
+        sys.argv[
+            2
+        ].upper()
+    )
+
 
     quantity = int(
-        sys.argv[2]
+        sys.argv[
+            3
+        ]
     )
+
 
     entry = float(
-        sys.argv[3]
+        sys.argv[
+            4
+        ]
     )
+
 
     target = float(
-        sys.argv[4]
+        sys.argv[
+            5
+        ]
     )
 
+
     stop = float(
-        sys.argv[5]
+        sys.argv[
+            6
+        ]
     )
+
 
     # --------------------------------------------------------
     # LIVE switch
@@ -506,6 +838,7 @@ def main():
     if not LIVE_TRADING:
 
         print()
+
         print(
             "LIVE_TRADING=false"
         )
@@ -516,98 +849,161 @@ def main():
 
         print()
 
-        sys.exit(1)
+        sys.exit(
+            1
+        )
+
 
     # --------------------------------------------------------
     # Validate
     # --------------------------------------------------------
 
-    validate_trade(
+    structure = validate_trade(
         symbol,
         quantity,
+        action,
         entry,
         target,
         stop
     )
 
+
     position_value = (
-        quantity * entry
+        quantity
+        *
+        entry
     )
+
 
     risk_per_share = (
-        entry - stop
+        structure[
+            "risk_per_share"
+        ]
     )
+
+
+    reward_per_share = (
+        structure[
+            "reward_per_share"
+        ]
+    )
+
 
     total_risk = (
-        risk_per_share * quantity
+        risk_per_share
+        *
+        quantity
     )
 
+
     potential_profit = (
-        target - entry
-    ) * quantity
+        reward_per_share
+        *
+        quantity
+    )
+
 
     if total_risk > 0:
 
         reward_risk = (
             potential_profit
-            / total_risk
+            /
+            total_risk
         )
 
     else:
 
-        reward_risk = 0
+        reward_risk = (
+            0
+        )
+
 
     # --------------------------------------------------------
     # Show order
     # --------------------------------------------------------
 
     print()
-    print("========================================")
-    print("             LIVE ORDER")
-    print("========================================")
 
     print(
-        f"ACCOUNT        : {ACCOUNT}"
+        "========================================"
     )
 
     print(
-        f"SYMBOL         : {symbol}"
+        "             LIVE ORDER"
     )
 
     print(
-        f"QUANTITY       : {quantity}"
+        "========================================"
+    )
+
+
+    print(
+        f"ACCOUNT        : "
+        f"{ACCOUNT}"
     )
 
     print(
-        f"ENTRY          : ${entry:.4f}"
+        f"SYMBOL         : "
+        f"{symbol}"
     )
 
     print(
-        f"TARGET         : ${target:.4f}"
+        f"ACTION         : "
+        f"{action}"
     )
 
     print(
-        f"STOP           : ${stop:.4f}"
+        f"DIRECTION      : "
+        f"{direction}"
     )
 
     print(
-        f"POSITION VALUE : ${position_value:.2f}"
+        f"QUANTITY       : "
+        f"{quantity}"
     )
 
     print(
-        f"MAX LOSS       : ${total_risk:.2f}"
+        f"ENTRY          : "
+        f"${entry:.4f}"
     )
 
     print(
-        f"TARGET PROFIT  : ${potential_profit:.2f}"
+        f"TARGET         : "
+        f"${target:.4f}"
     )
 
     print(
-        f"REWARD/RISK    : {reward_risk:.2f}"
+        f"STOP           : "
+        f"${stop:.4f}"
     )
 
-    print("========================================")
+    print(
+        f"POSITION VALUE : "
+        f"${position_value:.2f}"
+    )
+
+    print(
+        f"MAX LOSS       : "
+        f"${total_risk:.2f}"
+    )
+
+    print(
+        f"TARGET PROFIT  : "
+        f"${potential_profit:.2f}"
+    )
+
+    print(
+        f"REWARD/RISK    : "
+        f"{reward_risk:.2f}"
+    )
+
+
+    print(
+        "========================================"
+    )
+
     print()
+
 
     # --------------------------------------------------------
     # Human confirmation
@@ -617,14 +1013,19 @@ def main():
         'Type "LIVE" to submit REAL orders: '
     )
 
+
     if confirmation != "LIVE":
 
         print()
+
         print(
             "Order cancelled locally."
         )
 
-        sys.exit(0)
+        sys.exit(
+            0
+        )
+
 
     # --------------------------------------------------------
     # Connect
@@ -632,18 +1033,28 @@ def main():
 
     app = TradingApp()
 
+
     app.connect(
         HOST,
         PORT,
-        clientId=CLIENT_ID
+        clientId=
+            CLIENT_ID
     )
 
-    api_thread = threading.Thread(
-        target=app.run,
-        daemon=True
+
+    api_thread = (
+        threading.Thread(
+            target=
+                app.run,
+
+            daemon=
+                True
+        )
     )
+
 
     api_thread.start()
+
 
     # --------------------------------------------------------
     # Wait for TWS
@@ -659,7 +1070,10 @@ def main():
 
         app.disconnect()
 
-        sys.exit(1)
+        sys.exit(
+            1
+        )
+
 
     if not app.account_ok.wait(
         timeout=5
@@ -671,71 +1085,105 @@ def main():
 
         app.disconnect()
 
-        sys.exit(1)
+        sys.exit(
+            1
+        )
+
 
     # --------------------------------------------------------
     # Download positions and orders
     # --------------------------------------------------------
 
     app.reqPositions()
+
     app.reqOpenOrders()
 
-    time.sleep(2)
+
+    time.sleep(
+        2
+    )
+
 
     # --------------------------------------------------------
     # Prevent duplicate position
     # --------------------------------------------------------
 
-    existing_position = app.positions.get(
-        symbol
+    existing_position = (
+        app.positions.get(
+            symbol
+        )
     )
+
 
     if existing_position:
 
-        existing_qty = existing_position[
-            "quantity"
-        ]
+        existing_qty = (
+            existing_position[
+                "quantity"
+            ]
+        )
+
 
         if existing_qty != 0:
 
             print()
+
             print(
                 f"BLOCKED: existing position "
-                f"in {symbol}: {existing_qty}"
+                f"in {symbol}: "
+                f"{existing_qty}"
             )
 
             app.disconnect()
 
-            sys.exit(1)
+            sys.exit(
+                1
+            )
+
 
     # --------------------------------------------------------
     # Prevent duplicate open orders
     # --------------------------------------------------------
 
     duplicate_orders = [
-
         order
 
-        for order in app.open_orders
+        for order
+        in app.open_orders
 
-        if order["symbol"] == symbol
-
+        if (
+            order[
+                "symbol"
+            ]
+            ==
+            symbol
+        )
     ]
+
 
     if duplicate_orders:
 
         print()
+
         print(
             f"BLOCKED: existing open "
             f"order found for {symbol}"
         )
 
+
         for order in duplicate_orders:
-            print(order)
+
+            print(
+                order
+            )
+
 
         app.disconnect()
 
-        sys.exit(1)
+        sys.exit(
+            1
+        )
+
 
     # --------------------------------------------------------
     # Create bracket
@@ -745,33 +1193,72 @@ def main():
         symbol
     )
 
+
     orders = create_bracket_order(
-        parent_id=app.next_order_id,
-        quantity=quantity,
-        entry_price=entry,
-        target_price=target,
-        stop_price=stop,
-        outside_rth=False
+        parent_id=
+            app.next_order_id,
+
+        quantity=
+            quantity,
+
+        action=
+            action,
+
+        entry_price=
+            entry,
+
+        target_price=
+            target,
+
+        stop_price=
+            stop,
+
+        outside_rth=
+            False
     )
+
 
     # --------------------------------------------------------
     # Send
     # --------------------------------------------------------
 
     print()
-    print("Submitting bracket order...")
+
+    print(
+        "Submitting bracket order..."
+    )
+
     print()
+
 
     for order in orders:
 
-        if order.orderType == "LMT":
-            price = order.lmtPrice
+        if (
+            order.orderType
+            == "LMT"
+        ):
 
-        elif order.orderType == "STP":
-            price = order.auxPrice
+            price = (
+                order.lmtPrice
+            )
+
+
+        elif (
+            order.orderType
+            == "STP"
+        ):
+
+            price = (
+                order.auxPrice
+            )
+
 
         else:
-            price = "-"
+
+            price = (
+                "-"
+            )
+
 
         print(
             f"SEND | "
@@ -783,15 +1270,21 @@ def main():
             f"parent={order.parentId}"
         )
 
+
         app.placeOrder(
             order.orderId,
             contract,
             order
         )
 
-        time.sleep(0.25)
+
+        time.sleep(
+            0.25
+        )
+
 
     print()
+
     print(
         "Bracket submitted to TWS."
     )
@@ -812,6 +1305,7 @@ def main():
 
     print()
 
+
     # --------------------------------------------------------
     # Monitor
     # --------------------------------------------------------
@@ -819,11 +1313,16 @@ def main():
     try:
 
         while True:
-            time.sleep(1)
+
+            time.sleep(
+                1
+            )
+
 
     except KeyboardInterrupt:
 
         print()
+
         print(
             "Disconnecting from TWS..."
         )
@@ -836,4 +1335,5 @@ def main():
 # ============================================================
 
 if __name__ == "__main__":
+
     main()
