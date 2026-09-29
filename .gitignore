@@ -68,3 +68,39 @@ report.txt
 # Misc sensitive local files
 secrets/
 credentials/
+
+# Local backups / snapshots
+*.working-*
+*.backup*
+research_snapshots/
+
+# Runtime state
+strategy_status.json
+
+# Python runtime
+__pycache__/
+*.pyc
+
+# Local backups / snapshots
+*.working-*
+*.backup*
+research_snapshots/
+
+# Runtime state
+strategy_status.json
+
+# Python runtime
+__pycache__/
+*.pyc
+
+# Local backups / snapshots
+*.working-*
+*.backup*
+research_snapshots/
+
+# Runtime state
+strategy_status.json
+
+# Python runtime
+__pycache__/
+*.pyc
