@@ -702,7 +702,7 @@ def _event_date(value: object) -> date:
 
 def _validate_target_event(event: object) -> dict[str, object]:
     required = (
-        "symbol", "catalyst_id", "session_date", "session", "decision_at", "fill_at",
+        "symbol", "catalyst_id", "episode_id", "session_date", "session", "decision_at", "fill_at",
         "entry", "stop", "spread", "fees", "feature_bucket", "horizon_minutes", "future_bars",
     )
     if not isinstance(event, Mapping) or any(field not in event for field in required):
@@ -713,7 +713,7 @@ def _validate_target_event(event: object) -> dict[str, object]:
     if (isinstance(catalyst_id, bool) or not isinstance(catalyst_id, (str, int))
             or catalyst_id == ""):
         raise CoverageError("EVENT_INVALID: catalyst_id must be a non-empty string or integer")
-    episode_id = event.get("episode_id", catalyst_id)
+    episode_id = event["episode_id"]
     if (isinstance(episode_id, bool) or not isinstance(episode_id, (str, int))
             or episode_id == ""):
         raise CoverageError("EVENT_INVALID: episode_id must be a non-empty string or integer")

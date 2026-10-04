@@ -596,6 +596,12 @@ class EstimateTargetsTests(unittest.TestCase):
         self.assertEqual(result["independent_episodes"], 1)
         self.assertTrue(all(value is None for value in result["target_probabilities"].values()))
 
+    def test_missing_episode_id_raises_instead_of_falling_back_to_catalyst_id(self) -> None:
+        event = target_event(0)
+        del event["episode_id"]
+        with self.assertRaisesRegex(CoverageError, "EVENT_INVALID"):
+            self.estimate([event])
+
     def test_wrong_bucket_and_events_on_or_after_as_of_are_excluded(self) -> None:
         wrong_bucket = target_event(0, bucket="regular|price:5-10|news_age:0-6h")
         same_day = target_event(366)
