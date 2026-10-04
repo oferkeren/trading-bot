@@ -87,7 +87,7 @@ def article(day: date, index: int) -> dict:
             "source": "benzinga", "symbols": [SYMBOL], "summary": "", "fetched_at": "2024-06-01T00:00:00Z"}
 
 
-def dataset(history_days: int, crash_from: int | None = None):
+def dataset(history_days: int, crash_from: int | None = None, *, independent_news: bool = False):
     days = weekdays(FIRST_DAY, history_days + 1)
     history, candidate = days[:-1], days[-1]
     bars, quotes, news = [], [], []
@@ -95,7 +95,8 @@ def dataset(history_days: int, crash_from: int | None = None):
         crash = crash_from is not None and index >= crash_from
         bars.extend(day_bars(day, crash=crash))
         quotes.extend(day_quotes(day, crash=crash))
-        news.append(article(day, index))
+        if not independent_news or index % 3 == 0:
+            news.append(article(day, index))
     as_of = open_at(candidate) + timedelta(minutes=61)
     bars.extend(day_bars(candidate, last_minute=60))
     quotes.extend(day_quotes(candidate, extra_minutes=(61,)))  # 61:02 is after as_of: must be ignored
@@ -112,7 +113,7 @@ def run_report(data: dict, **overrides) -> dict:
     arguments = dict(
         symbol=SYMBOL, company=COMPANY, as_of=data["as_of"], start=data["start"], end=data["end"],
         feed="iex", bars=data["bars"], news=data["news"], quotes=data["quotes"], costs=FEES,
-        now=datetime(2024, 6, 1, 12, tzinfo=timezone.utc), price_basis=VERIFIED_BASIS,
+        now=datetime(2025, 6, 1, 12, tzinfo=timezone.utc), price_basis=VERIFIED_BASIS,
     )
     arguments.update(overrides)
     return report(**arguments)
@@ -168,12 +169,21 @@ class RefusalTests(unittest.TestCase):
 
     def test_forty_nine_catalyst_days_cannot_emit_probabilities(self) -> None:
         result = run_report(self.small)
-        self.assert_no_trade(result, "INSUFFICIENT_CATALYST_DAYS")
+        self.assert_no_trade(result, "INSUFFICIENT_INDEPENDENT_EPISODES")
         self.assertEqual(result["study"]["catalyst_days"], 49)
+        self.assertEqual(result["study"]["independent_episodes"], 11)
         for key in TARGET_KEYS:
             self.assertEqual(result["target_probabilities"][key]["status"], "unavailable")
         self.assertEqual(result["study"]["holdout"]["status"], "unavailable")
         self.assertIsNone(result["selected_target"])
+
+    def test_one_rolling_news_episode_can_cover_multiple_catalyst_days(self) -> None:
+        result = run_report(dataset(3))
+        self.assertEqual(result["study"]["catalyst_days"], 3)
+        self.assertEqual(result["study"]["independent_episodes"], 1)
+        self.assert_no_trade(result, "INSUFFICIENT_INDEPENDENT_EPISODES")
+        for key in TARGET_KEYS:
+            self.assertEqual(result["target_probabilities"][key]["status"], "unavailable")
 
     def test_price_basis_mismatch_or_unverified_blocks_estimates(self) -> None:
         for basis, reason in (({"status": "MISMATCH", "detail": "split"}, "PRICE_BASIS_MISMATCH"),
@@ -195,9 +205,9 @@ class RefusalTests(unittest.TestCase):
 class EvidenceTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.data = dataset(90)
+        cls.data = dataset(192, independent_news=True)
         cls.result = run_report(cls.data)
-        cls.crash = dataset(90, crash_from=72)
+        cls.crash = dataset(192, crash_from=150, independent_news=True)
         cls.crash_result = run_report(cls.crash)
 
     def test_supported_history_is_research_eligible_not_order_approval(self) -> None:
@@ -217,6 +227,7 @@ class EvidenceTests(unittest.TestCase):
             self.assertEqual(entry["status"], "available")
             self.assertGreaterEqual(entry["sample_size"], 50)
             self.assertIsNotNone(entry["wilson_lower_bound"])
+        self.assertEqual(result["sample_size"], 50)
         self.assertEqual(result["selected_target"]["net_target"], 2.0)
         self.assertEqual(result["feed"], "iex")
         self.assertEqual(result["adjustment"]["bars"], "split")
@@ -233,9 +244,14 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(reference["status"], "available")
         self.assertLess(reference["stop"], reference["entry_signal_reference"])
         study = result["study"]
-        self.assertEqual(study["catalyst_days"], 90)
-        self.assertEqual([study["split"][name]["days"] for name in ("train", "validation", "holdout")],
-                         [54, 18, 18])
+        self.assertGreater(study["catalyst_days"], 50)
+        self.assertEqual(study["independent_episodes"], 64)
+        self.assertEqual(
+            [study["split"][name]["independent_episodes"] for name in ("train", "validation", "holdout")],
+            [38, 12, 14],
+        )
+        self.assertEqual(sum(study["split"][name]["days"] for name in ("train", "validation", "holdout")),
+                         study["catalyst_days"])
         self.assertLess(study["split"]["train"]["last"], study["split"]["validation"]["first"])
         self.assertLess(study["split"]["validation"]["last"], study["split"]["holdout"]["first"])
         holdout = study["holdout"]
@@ -390,7 +406,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(code, 0, err)
         result = json.loads(out)
         self.assertEqual(result["decision"], "NO_TRADE")
-        self.assertIn("INSUFFICIENT_CATALYST_DAYS", result["reasons"])
+        self.assertIn("INSUFFICIENT_INDEPENDENT_EPISODES", result["reasons"])
         self.assertFalse(result["order_approval"])
         self.assertEqual(result["adjustment"]["basis_check"]["status"], "VERIFIED")
         self.assertNotIn("order_id", out)

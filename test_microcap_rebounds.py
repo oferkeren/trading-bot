@@ -479,7 +479,7 @@ def outcome_bar(at: datetime, *, high=10.0, low=9.5, close=10.0):
     return {"t": iso(at), "o": 10.0, "h": high, "l": low, "c": close, "v": 100}
 
 
-def target_event(index: int, future_bars=None, *, bucket="regular|price:10-20|news_age:0-6h"):
+def target_event(index: int, future_bars=None, *, bucket="regular|price:10-20|news_age:0-6h", episode_id=None):
     day = datetime(2024, 1, 1, 14, 30, tzinfo=timezone.utc) + timedelta(days=index)
     fill_at = day + timedelta(seconds=30)
     bars = (
@@ -489,6 +489,7 @@ def target_event(index: int, future_bars=None, *, bucket="regular|price:10-20|ne
     return {
         "symbol": "ABCD",
         "catalyst_id": index,
+        "episode_id": index if episode_id is None else episode_id,
         "session_date": day.date(),
         "session": "regular",
         "decision_at": iso(day),
@@ -561,6 +562,26 @@ class EstimateTargetsTests(unittest.TestCase):
         self.assertGreater(result["target_statistics"]["0.50"]["net_mean_lower_bound"], 0)
         self.assertEqual(result["target_statistics"]["0.50"]["failure_rate"], 0.0)
 
+    def test_multiple_catalyst_days_in_one_episode_count_as_one_independent_sample(self) -> None:
+        events = [
+            target_event(0, episode_id="rolling-news"),
+            target_event(1, episode_id="rolling-news"),
+            *(target_event(index) for index in range(2, 51)),
+        ]
+        result = self.estimate(events)
+        self.assertEqual(result["catalyst_days"], 51)
+        self.assertEqual(result["independent_episodes"], 50)
+        self.assertEqual(result["sample_size"], 50)
+
+    def test_fifty_catalyst_days_from_one_episode_cannot_emit_probabilities(self) -> None:
+        events = [target_event(index, episode_id="one-rolling-episode") for index in range(50)]
+        result = self.estimate(events)
+        self.assertEqual(result["catalyst_days"], 50)
+        self.assertEqual(result["independent_episodes"], 1)
+        self.assertEqual(result["sample_size"], 1)
+        self.assertTrue(all(value is None for value in result["target_probabilities"].values()))
+        self.assertIn("INSUFFICIENT_SAMPLE", result["reasons"])
+
     def test_duplicate_catalyst_day_counts_once(self) -> None:
         event = target_event(0)
         duplicate_swing = dict(event, decision_at="2024-01-01T14:30:10Z")
@@ -568,10 +589,11 @@ class EstimateTargetsTests(unittest.TestCase):
         self.assertEqual(result["sample_size"], 49)
         self.assertIn("INSUFFICIENT_SAMPLE", result["reasons"])
 
-    def test_multiple_catalysts_on_one_session_date_are_one_independent_day(self) -> None:
-        events = [dict(target_event(0), catalyst_id=index) for index in range(50)]
+    def test_multiple_catalysts_in_one_episode_are_one_independent_sample(self) -> None:
+        events = [dict(target_event(0, episode_id="same-episode"), catalyst_id=index) for index in range(50)]
         result = self.estimate(events)
         self.assertEqual(result["sample_size"], 1)
+        self.assertEqual(result["independent_episodes"], 1)
         self.assertTrue(all(value is None for value in result["target_probabilities"].values()))
 
     def test_wrong_bucket_and_events_on_or_after_as_of_are_excluded(self) -> None:

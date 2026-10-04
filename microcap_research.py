@@ -9,7 +9,7 @@ Point-in-time rules:
 
 * ``start < end <= as_of <= now``: nothing after ``as_of`` is requested or used.
 * Parameters (cycle thresholds, horizon, train-objective target) are chosen from a
-  predeclared grid on the *train* catalyst days only; validation confirms them and
+  predeclared grid on the *train* catalyst episodes only; validation confirms them and
   the final chronological holdout is evaluated afterwards, never used for choice.
 * Spreads come only from observed historical bid/ask quotes. Alpaca quotes are raw
   (unadjusted) while bars are split-adjusted, so estimates require proof that raw
@@ -39,6 +39,7 @@ from microcap_rebounds import (
     _mean_lower_bound,
     _price_band,
     _session_of,
+    catalyst_episodes,
     confirmed_cycles,
     current_setup,
     eligible_news,
@@ -48,7 +49,7 @@ from microcap_rebounds import (
 )
 
 
-MODEL_VERSION = "microcap-rebound-research-v1"
+MODEL_VERSION = "microcap-rebound-research-v2"
 TARGETS = (0.50, 1.00, 1.50, 2.00)
 TARGET_KEYS = tuple(f"{target:.2f}" for target in TARGETS)
 PARAM_GRID: tuple[tuple[CycleParams, int], ...] = tuple(
@@ -57,8 +58,8 @@ PARAM_GRID: tuple[tuple[CycleParams, int], ...] = tuple(
     for separation in (3.0, 10.0)
     for horizon in (30, 60)
 )
-MIN_CATALYST_DAYS = 50
-MIN_SPLIT_EVENT_DAYS = 10
+MIN_CATALYST_EPISODES = 64
+MIN_SPLIT_EPISODES = 10
 TRAIN_FRACTION = 0.6
 VALIDATION_FRACTION = 0.2
 MAX_QUOTE_AGE_SECONDS = 10.0
@@ -136,28 +137,35 @@ def price_basis_check(
 def _catalyst_days(
     news: Sequence[Mapping[str, object]], symbol: str, company: str, start: datetime, as_of: datetime
 ) -> list[date]:
-    """Weekdays whose 04:00-20:00 NY span overlaps a primary article's 48h window."""
+    return sorted({
+        day
+        for episode in _catalyst_episodes(news, symbol, company, start, as_of)
+        for day in episode["days"]  # type: ignore[union-attr]
+    })
+
+
+def _catalyst_episodes(
+    news: Sequence[Mapping[str, object]], symbol: str, company: str, start: datetime, as_of: datetime
+) -> list[dict[str, object]]:
+    """Independent primary-news episodes and their associated catalyst session days."""
     first_day = start.astimezone(_MARKET_TZ).date()
     last_day = as_of.astimezone(_MARKET_TZ).date()
-    days: set[date] = set()
-    for item in news:
-        if not isinstance(item, Mapping):
-            continue
-        try:
-            created = parse_utc(item.get("created_at"))  # type: ignore[arg-type]
-            if created > as_of or not eligible_news([item], symbol, company, created):
-                continue
-        except CoverageError:
-            continue
-        day = created.astimezone(_MARKET_TZ).date()
-        while day <= (created + _NEWS_WINDOW).astimezone(_MARKET_TZ).date():
-            opens = datetime.combine(day, time(4), _MARKET_TZ).astimezone(timezone.utc)
-            closes = datetime.combine(day, time(20), _MARKET_TZ).astimezone(timezone.utc)
-            if (day.weekday() < 5 and first_day <= day < last_day
-                    and created < closes and created + _NEWS_WINDOW >= opens):
-                days.add(day)
-            day += timedelta(days=1)
-    return sorted(days)
+    result: list[dict[str, object]] = []
+    for episode in catalyst_episodes(news, symbol, company, as_of):
+        days: set[date] = set()
+        for item in episode["articles"]:  # type: ignore[union-attr]
+            created = parse_utc(item["created_at"])  # type: ignore[index,arg-type]
+            day = created.astimezone(_MARKET_TZ).date()
+            while day <= (created + _NEWS_WINDOW).astimezone(_MARKET_TZ).date():
+                opens = datetime.combine(day, time(4), _MARKET_TZ).astimezone(timezone.utc)
+                closes = datetime.combine(day, time(20), _MARKET_TZ).astimezone(timezone.utc)
+                if (day.weekday() < 5 and first_day <= day < last_day
+                        and created < closes and created + _NEWS_WINDOW >= opens):
+                    days.add(day)
+                day += timedelta(days=1)
+        if days:
+            result.append({**episode, "days": sorted(days)})
+    return result
 
 
 def plan_quote_windows(
@@ -279,7 +287,8 @@ def _metrics(
         results.append(cache[key])
     outcomes = [value for value, _ in results]
     return {
-        "event_days": len(outcomes),
+        "event_days": len({event["session_date"] for event in events}),
+        "independent_episodes": len(outcomes),
         "hit_rate": (sum(hit for _, hit in results) / len(results)) if target is not None else None,
         "mean_net": fmean(outcomes),
         "total_net": sum(outcomes),
@@ -296,78 +305,95 @@ def _config_label(params: CycleParams, horizon: int) -> dict[str, object]:
 def _study(
     bars: Sequence[Mapping[str, object]], news: Sequence[Mapping[str, object]],
     quotes: Sequence[Mapping[str, object]], symbol: str, company: str, as_of: datetime,
-    fees: float, days: list[date],
+    fees: float, episodes: list[dict[str, object]],
 ) -> tuple[dict[str, object], dict[str, object] | None, list[str]]:
     """Chronological train/validation/holdout study; returns (study, frozen choice, blocking reasons)."""
     blocking: list[str] = []
-    train_count = int(len(days) * TRAIN_FRACTION)
-    validation_count = int(len(days) * VALIDATION_FRACTION)
-    parts = {"train": days[:train_count], "validation": days[train_count:train_count + validation_count],
-             "holdout": days[train_count + validation_count:]}
-    split_of = {day: name for name, members in parts.items() for day in members}
+    train_count = int(len(episodes) * TRAIN_FRACTION)
+    validation_count = int(len(episodes) * VALIDATION_FRACTION)
+    parts = {
+        "train": episodes[:train_count],
+        "validation": episodes[train_count:train_count + validation_count],
+        "holdout": episodes[train_count + validation_count:],
+    }
+    split_of_episode = {
+        str(episode["episode_id"]): name
+        for name, members in parts.items()
+        for episode in members
+    }
     study: dict[str, object] = {
-        "catalyst_days": len(days),
-        "split": {name: {"days": len(members), "first": members[0].isoformat() if members else None,
-                         "last": members[-1].isoformat() if members else None}
-                  for name, members in parts.items()},
+        "catalyst_days": len({day for episode in episodes for day in episode["days"]}),  # type: ignore[union-attr]
+        "independent_episodes": len(episodes),
+        "split": {
+            name: {
+                "independent_episodes": len(members),
+                "days": len({day for episode in members for day in episode["days"]}),  # type: ignore[union-attr]
+                "first": next((day.isoformat() for episode in members for day in episode["days"]), None),
+                "last": next((day.isoformat() for episode in reversed(members)
+                              for day in reversed(episode["days"])), None),  # type: ignore[arg-type]
+            }
+            for name, members in parts.items()
+        },
         "grid_size": len(PARAM_GRID),
-        "min_event_days_per_split": MIN_SPLIT_EVENT_DAYS,
+        "min_independent_episodes_per_split": MIN_SPLIT_EPISODES,
+        "boundary_policy": "overlapping 48-hour primary-news windows are merged and assigned to one split",
     }
     by_config: list[dict[str, list[dict[str, object]]]] = []
     for params, horizon in PARAM_GRID:
         events = extract_events(bars, news, symbol, company, as_of, params=params, quotes=quotes,
                                 fees=fees, horizon_minutes=horizon,
                                 max_quote_age_seconds=MAX_QUOTE_AGE_SECONDS)
-        first_per_day: dict[date, dict[str, object]] = {}
+        first_per_episode: dict[str, dict[str, object]] = {}
         for event in sorted(events, key=lambda item: item["decision_at"]):  # type: ignore[arg-type,return-value]
-            first_per_day.setdefault(event["session_date"], event)  # type: ignore[arg-type]
+            first_per_episode.setdefault(str(event["episode_id"]), event)
         grouped: dict[str, list[dict[str, object]]] = {name: [] for name in parts}
         all_events: dict[str, list[dict[str, object]]] = {name: [] for name in parts}
-        for day, event in sorted(first_per_day.items()):
-            if day in split_of:
-                grouped[split_of[day]].append(event)
+        for episode_id, event in first_per_episode.items():
+            if episode_id in split_of_episode:
+                grouped[split_of_episode[episode_id]].append(event)
         for event in events:
-            if event["session_date"] in split_of:
-                all_events[split_of[event["session_date"]]].append(event)  # type: ignore[index]
+            episode_id = str(event["episode_id"])
+            if episode_id in split_of_episode:
+                all_events[split_of_episode[episode_id]].append(event)
         by_config.append({**grouped, **{f"all_{name}": items for name, items in all_events.items()}})
 
     cache: dict[tuple[int, float | None], tuple[float, bool]] = {}
     best: tuple[float, int, float] | None = None
     for index, grouped in enumerate(by_config):
-        if len(grouped["train"]) < MIN_SPLIT_EVENT_DAYS:
+        if len(grouped["train"]) < MIN_SPLIT_EPISODES:
             continue
         for target in TARGETS:
             score = _metrics(grouped["train"], target, cache)["net_mean_lower_bound"]
             if best is None or score > best[0]:  # type: ignore[operator]
                 best = (score, index, target)  # type: ignore[assignment]
     if best is None:
-        blocking.append("INSUFFICIENT_TRAIN_EVENTS")
+        blocking.append("INSUFFICIENT_TRAIN_EPISODES")
         for name in ("selection", "validation", "holdout"):
-            study[name] = _unavailable("INSUFFICIENT_TRAIN_EVENTS")
+            study[name] = _unavailable("INSUFFICIENT_TRAIN_EPISODES")
         return study, None, blocking
     _, index, train_target = best
     params, horizon = PARAM_GRID[index]
     chosen = by_config[index]
     study["selection"] = {
         "status": "available",
-        "objective": "max one-sided 95% lower bound of mean net per-share outcome on train days only",
+        "objective": "max one-sided 95% lower bound of mean net per-share outcome on train episodes only",
         "config": _config_label(params, horizon),
         "train_target": train_target,
         "train": _metrics(chosen["train"], train_target, cache),
     }
     if best[0] <= 0:
         blocking.append("TRAIN_NOT_POSITIVE")
-    if len(chosen["validation"]) < MIN_SPLIT_EVENT_DAYS:
-        blocking.append("INSUFFICIENT_VALIDATION_EVENTS")
-        study["validation"] = _unavailable("INSUFFICIENT_VALIDATION_EVENTS")
+    if len(chosen["validation"]) < MIN_SPLIT_EPISODES:
+        blocking.append("INSUFFICIENT_VALIDATION_EPISODES")
+        study["validation"] = _unavailable("INSUFFICIENT_VALIDATION_EPISODES")
     else:
         validation = _metrics(chosen["validation"], train_target, cache)
         study["validation"] = {"status": "available", **validation}
         if validation["mean_net"] <= 0:  # type: ignore[operator]
             blocking.append("VALIDATION_NOT_POSITIVE")
     holdout_events = chosen["holdout"]
-    if len(holdout_events) < MIN_SPLIT_EVENT_DAYS:
-        study["holdout"] = _unavailable("INSUFFICIENT_HOLDOUT_EVENTS")
+    if len(holdout_events) < MIN_SPLIT_EPISODES:
+        study["holdout"] = _unavailable("INSUFFICIENT_HOLDOUT_EPISODES")
     else:
         prior = chosen["train"] + chosen["validation"]
         study["holdout"] = {
@@ -381,7 +407,8 @@ def _study(
             "calibration": {
                 key: {"predicted_hit_rate_train_validation": _metrics(prior, target, cache)["hit_rate"],
                       "holdout_hit_rate": _metrics(holdout_events, target, cache)["hit_rate"],
-                      "holdout_event_days": len(holdout_events)}
+                      "holdout_event_days": len(holdout_events),
+                      "holdout_independent_episodes": len(holdout_events)}
                 for key, target in zip(TARGET_KEYS, TARGETS)
             },
         }
@@ -433,7 +460,7 @@ def report(
         "selected_target": None,
         "sample_size": 0,
         "uncertainty": None,
-        "study": {"catalyst_days": 0},
+        "study": {"catalyst_days": 0, "independent_episodes": 0},
     }
     bars_ok = bool(bars)
     try:
@@ -488,7 +515,11 @@ def report(
         }
         if not catalysts:
             blocking.append("NO_ELIGIBLE_CATALYST_AT_AS_OF")
-        result["study"] = {"catalyst_days": len(_catalyst_days(news, symbol, company, start_utc, decision))}
+        episodes = _catalyst_episodes(news, symbol, company, start_utc, decision)
+        result["study"] = {
+            "catalyst_days": len({day for episode in episodes for day in episode["days"]}),  # type: ignore[union-attr]
+            "independent_episodes": len(episodes),
+        }
 
     if bars_ok and session is not None:
         counts = {}
@@ -502,15 +533,16 @@ def report(
 
     frozen = None
     research_ready = bars_ok and bool(news) and bool(quote_list) and basis_status == "VERIFIED"
-    days = _catalyst_days(news, symbol, company, start_utc, decision) if news else []
-    if research_ready and len(days) < MIN_CATALYST_DAYS:
-        blocking.append("INSUFFICIENT_CATALYST_DAYS")
-    if not research_ready or len(days) < MIN_CATALYST_DAYS:
-        reason = "INSUFFICIENT_CATALYST_DAYS" if research_ready else "INPUT_COVERAGE_INSUFFICIENT"
+    episodes = _catalyst_episodes(news, symbol, company, start_utc, decision) if news else []
+    if research_ready and len(episodes) < MIN_CATALYST_EPISODES:
+        blocking.append("INSUFFICIENT_INDEPENDENT_EPISODES")
+    if not research_ready or len(episodes) < MIN_CATALYST_EPISODES:
+        reason = "INSUFFICIENT_INDEPENDENT_EPISODES" if research_ready else "INPUT_COVERAGE_INSUFFICIENT"
         result["study"].update({name: _unavailable(reason)  # type: ignore[union-attr]
                                 for name in ("selection", "validation", "holdout")})
     else:
-        study, frozen, study_blocking = _study(bars, news, quote_list, symbol, company, decision, fees, days)
+        study, frozen, study_blocking = _study(
+            bars, news, quote_list, symbol, company, decision, fees, episodes)
         result["study"] = study
         blocking.extend(study_blocking)
 
@@ -592,7 +624,7 @@ def _apply_estimate(
     result["sample_size"] = sample
     result["uncertainty"] = {
         "method": "95% Wilson lower bound on hit rate; one-sided 95% t lower bound on mean net",
-        "estimation_split": "train+validation event days only (holdout excluded)",
+        "estimation_split": "train+validation independent episodes only (holdout excluded)",
     }
     for key in TARGET_KEYS:
         probability = probabilities.get(key)
@@ -637,10 +669,10 @@ def _fetch_and_report(
         symbols, args.start, args.end, timeframe="1Day", feed=args.feed, adjustment="raw")
     news = client.fetch_news(symbols, _iso(start - _NEWS_WINDOW), args.end)  # type: ignore[attr-defined]
     live = decision.astimezone(_MARKET_TZ).date() >= now.astimezone(_MARKET_TZ).date()
-    enough_days = len(_catalyst_days(news, symbol, args.company, start, decision)) >= MIN_CATALYST_DAYS
+    enough_episodes = len(_catalyst_episodes(news, symbol, args.company, start, decision)) >= MIN_CATALYST_EPISODES
     try:
         windows = plan_quote_windows(minute, news, symbol, args.company, decision,
-                                     include_as_of=not live, include_history=enough_days)
+                                     include_as_of=not live, include_history=enough_episodes)
     except CoverageError:
         windows = plan_quote_windows([], news, symbol, args.company, decision,
                                      include_as_of=not live, include_history=False)

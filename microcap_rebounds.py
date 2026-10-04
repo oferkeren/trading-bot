@@ -220,6 +220,56 @@ def eligible_news(
     return [entry[1] for entry in kept]
 
 
+def catalyst_episodes(
+    news: Sequence[Mapping[str, object]], symbol: str, company: str, as_of: object
+) -> list[dict[str, object]]:
+    """Group primary-news articles into connected, overlapping 48-hour episodes."""
+    decision = _as_utc(as_of, "as_of")
+    articles: dict[str, tuple[datetime, Mapping[str, object]] | None] = {}
+    for item in news:
+        if not isinstance(item, Mapping):
+            continue
+        try:
+            created = parse_utc(item.get("created_at"))  # type: ignore[arg-type]
+        except CoverageError:
+            continue
+        if created > decision:
+            continue
+        eligible = eligible_news([item], symbol, company, created)
+        if eligible:
+            article_id = str(eligible[0]["id"])
+            previous = articles.get(article_id)
+            if previous is None and article_id not in articles:
+                articles[article_id] = (created, eligible[0])
+            elif previous is not None and (
+                previous[0] != created or previous[1].get("headline") != eligible[0].get("headline")
+            ):
+                articles[article_id] = None
+
+    episodes: list[dict[str, object]] = []
+    valid_articles = [
+        (article_id, value)
+        for article_id, value in articles.items()
+        if value is not None
+    ]
+    for article_id, (created, article) in sorted(valid_articles, key=lambda pair: pair[1][0]):
+        article_end = created + _NEWS_WINDOW
+        if episodes and created <= episodes[-1]["end"]:
+            episode = episodes[-1]
+            episode["end"] = max(episode["end"], article_end)  # type: ignore[arg-type]
+            episode["articles"].append(article)  # type: ignore[union-attr]
+            episode["article_ids"].add(article_id)  # type: ignore[union-attr]
+        else:
+            episodes.append({
+                "episode_id": f"{symbol.strip().upper()}:{created.isoformat()}",
+                "start": created,
+                "end": article_end,
+                "articles": [article],
+                "article_ids": {article_id},
+            })
+    return episodes
+
+
 # ---------------------------------------------------------------------------
 # Bars and cycles
 # ---------------------------------------------------------------------------
@@ -464,7 +514,8 @@ def extract_events(
 
     A decision is the confirmation of a cycle's closing low that is a valid
     ``current_setup`` at that instant. Each needs an eligible catalyst known at the
-    decision (the earliest eligible article is the catalyst ID), a fresh quote at
+    decision (the earliest eligible article is the catalyst ID, with its merged
+    overlapping-news episode ID), a fresh quote at
     or before the decision for spread, the first usable quote after the decision
     for a simulated ask fill, and supplied fees. Missing costs or fills yield no
     event. The integer-minute outcome window starts at the first full minute bar
@@ -488,6 +539,12 @@ def extract_events(
     max_age = timedelta(seconds=max_quote_age_seconds)
     symbol = symbol.strip().upper()
     known = _known_bars(bars, end, params)
+    episodes = catalyst_episodes(news, symbol, company, end)
+    episode_by_article = {
+        article_id: str(episode["episode_id"])
+        for episode in episodes
+        for article_id in episode["article_ids"]  # type: ignore[union-attr]
+    }
     events: list[dict[str, object]] = []
     seen: set[tuple[str, str, date]] = set()
     for segment in _segments(known, params):
@@ -532,6 +589,7 @@ def extract_events(
             events.append({
                 "symbol": symbol,
                 "catalyst_id": catalyst["id"],
+                "episode_id": episode_by_article[str(catalyst["id"])],
                 "session_date": session_date,
                 "session": session,
                 "decision_at": decision,
@@ -655,6 +713,10 @@ def _validate_target_event(event: object) -> dict[str, object]:
     if (isinstance(catalyst_id, bool) or not isinstance(catalyst_id, (str, int))
             or catalyst_id == ""):
         raise CoverageError("EVENT_INVALID: catalyst_id must be a non-empty string or integer")
+    episode_id = event.get("episode_id", catalyst_id)
+    if (isinstance(episode_id, bool) or not isinstance(episode_id, (str, int))
+            or episode_id == ""):
+        raise CoverageError("EVENT_INVALID: episode_id must be a non-empty string or integer")
     if session not in {name for name, _, _ in _SESSIONS}:
         raise CoverageError("EVENT_INVALID: session must be a known trading session")
     if not isinstance(event["feature_bucket"], str) or not event["feature_bucket"]:
@@ -683,6 +745,7 @@ def _validate_target_event(event: object) -> dict[str, object]:
     return {
         "symbol": symbol.strip().upper(),
         "catalyst_id": catalyst_id,
+        "episode_id": episode_id,
         "session_date": event_day,
         "session": session,
         "decision_at": decision_at,
@@ -706,7 +769,7 @@ def estimate_targets(
     *,
     feature_bucket: str,
 ) -> dict[str, object]:
-    """Estimate net target outcomes from >=50 independent, fully observed prior event days.
+    """Estimate net target outcomes from >=50 independent, fully observed prior episodes.
 
     Events must carry their own fill, stop, observed spread and fees, exact known-as-of
     feature bucket, and contiguous future 1-minute bars. A target price includes the
@@ -735,7 +798,11 @@ def estimate_targets(
         raise CoverageError("COSTS_INVALID: candidate fees must be non-negative and finite")
 
     candidate_day = decision_at.astimezone(_MARKET_TZ).date()
-    independent: dict[tuple[str, str, date], tuple[dict[str, object], list[tuple[datetime, float, float, float, float]]]] = {}
+    independent: dict[
+        tuple[str, str],
+        tuple[dict[str, object], list[tuple[datetime, float, float, float, float]]],
+    ] = {}
+    catalyst_days: set[date] = set()
     for raw_event in events:
         event = _validate_target_event(raw_event)
         future_bars = _target_bars(event["future_bars"], fill_at=event["fill_at"])  # type: ignore[arg-type]
@@ -753,28 +820,22 @@ def estimate_targets(
             continue
         if future_bars[-1][0] + _BAR > decision_at:
             continue
-        key = (
-            event["symbol"], str(event["catalyst_id"]), event["session_date"]  # type: ignore[arg-type]
-        )
+        event_day = event["session_date"]
+        if isinstance(event_day, date):
+            catalyst_days.add(event_day)
+        key = (event["symbol"], str(event["episode_id"]))  # type: ignore[arg-type]
         previous = independent.get(key)
         if previous is None or event["decision_at"] < previous[0]["decision_at"]:
             independent[key] = (event, future_bars)
 
-    independent_days: dict[
-        date, tuple[dict[str, object], list[tuple[datetime, float, float, float, float]]]
-    ] = {}
-    for item in sorted(
+    independent_events = sorted(
         independent.values(),
         key=lambda pair: (
             pair[0]["session_date"], pair[0]["decision_at"],
-            pair[0]["symbol"], str(pair[0]["catalyst_id"]),
+            pair[0]["symbol"], str(pair[0]["episode_id"]),
         ),
-    ):
-        event_day = item[0]["session_date"]
-        if isinstance(event_day, date):
-            independent_days.setdefault(event_day, item)
-
-    sample_size = len(independent_days)
+    )
+    sample_size = len(independent_events)
     probabilities: dict[str, float | None] = {key: None for key in _TARGET_KEYS}
     empty_metrics = {
         "wilson_lower_bound": None,
@@ -798,7 +859,7 @@ def estimate_targets(
             hit_count = 0
             net_outcomes: list[float] = []
             success_minutes: list[float] = []
-            for event, future_bars in independent_days.values():
+            for event, future_bars in independent_events:
                 event_entry = event["entry"]
                 event_stop = event["stop"]
                 event_spread = max(event["spread"], candidate_spread)
@@ -861,5 +922,7 @@ def estimate_targets(
         "target_statistics": statistics,
         "selected_target": selected_target,
         "sample_size": sample_size,
+        "independent_episodes": sample_size,
+        "catalyst_days": len(catalyst_days),
         "reasons": reasons,
     }
