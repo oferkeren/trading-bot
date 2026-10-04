@@ -763,3 +763,49 @@ Block and investigate
 Missing a trading opportunity is preferable to creating an uncontrolled broker order.
 
 
+
+37. Micro-cap Rebound Historical Research (research only)
+`microcap_research.py` produces a read-only JSON research report for one symbol. It has zero order side effects: it never connects to IBKR or any broker, never calls an order endpoint, and never reads or writes TradingMax state. Its `RESEARCH_ELIGIBLE` decision is not an order approval and there is no `BUY_ELIGIBLE` output in this phase; IBKR live data and paper execution are later, separate phases.
+
+Data source:
+Alpaca Market Data API only (`https://data.alpaca.markets`): `/v2/stocks/bars` (1Min, 1Hour, 1Day; split-adjusted, plus raw daily for a price-basis check), `/v2/stocks/quotes` (historical bid/ask) and `/v1beta1/news`.
+This is not the Alpaca paper trading endpoint (`paper-api.alpaca.markets`); nothing is sent to a trading API.
+
+Credentials (variable names only, never values):
+APCA_API_KEY_ID
+APCA_API_SECRET_KEY
+
+Configure them privately in your own shell session, never in the repository, `.env` files committed to git, command arguments, tickets, chat, or logs. If keys were ever pasted anywhere shared, rotate them in the Alpaca dashboard first and use only the new pair. Example, typing values at hidden prompts:
+read -rs APCA_API_KEY_ID && export APCA_API_KEY_ID
+read -rs APCA_API_SECRET_KEY && export APCA_API_SECRET_KEY
+
+The tool reads only these two variables, sends them only as Alpaca request headers, and never prints, logs or saves them. Unset them when finished:
+unset APCA_API_KEY_ID APCA_API_SECRET_KEY
+
+Exact invocation:
+cd /home/oferke/trading-bot
+venv/bin/python microcap_research.py --symbol ACME --company "Acme Corp" --as-of 2024-05-15T14:31:00Z --start 2023-01-03T00:00:00Z --end 2024-05-15T14:31:00Z --feed iex
+
+Arguments:
+--as-of, --start and --end must be RFC-3339 timestamps with a timezone (UTC `Z` recommended).
+History is [start, end) and end must not be after as-of; nothing after as-of is requested.
+--feed accepts only the free `iex` feed.
+--fees-per-share is a predeclared round-trip fee per share (default 0.02 USD). Set it higher for small share counts where per-order minimum commissions dominate.
+
+Exit codes:
+0 = JSON report on stdout (`NO_TRADE` or `RESEARCH_ELIGIBLE`)
+2 = invalid input (bad timestamps, range, feed, fees); no API call is made
+3 = credentials missing or Alpaca API/data error (including `QUOTE_COVERAGE_UNAVAILABLE` when historical quotes are not entitled)
+Errors are a single JSON line on stderr without credentials.
+
+Free-tier (Basic plan) limitations:
+IEX feed only: IEX bars miss trades on other venues, so missing minutes may simply mean no IEX trade. IEX quotes are IEX top-of-book, not the consolidated NBBO, so spreads/fills differ from IBKR.
+Historical calls are limited to 200/min; quote windows are requested around each candidate decision with a pause between calls.
+SIP data within the latest 15 minutes is unavailable; the tool does not use it.
+Alpaca news has no completeness guarantee. Missing articles are reported as `NEWS_COVERAGE_UNVERIFIED`, never as proof that no catalyst existed.
+Quotes are raw (unadjusted); bars are split-adjusted. Estimates require raw and split-adjusted daily bars to match over the window, otherwise `PRICE_BASIS_MISMATCH`/`PRICE_BASIS_UNVERIFIED`.
+
+How it decides:
+Fixed parameter grid (`MODEL_VERSION` in the report); catalyst days are split chronologically 60% train / 20% validation / 20% holdout. Parameters are chosen on train only, confirmed on validation, and the holdout is evaluated afterwards for metrics, baseline comparison (hold-to-horizon and no-trade), drawdown and calibration.
+Fewer than 50 independent catalyst days, missing quotes/news/bars, unverified price basis, a stale as-of quote, a live same-day as-of (`LIVE_IBKR_STATE_REQUIRED`), no setup, insufficient in-bucket samples, or a non-positive validation/holdout result all produce `NO_TRADE` with reasons. Unsupported target probabilities are reported as `unavailable` with a reason, never estimated.
+A same-day as-of needs IBKR live state, which is not part of this phase; delayed Alpaca data is never substituted for it.

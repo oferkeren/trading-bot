@@ -292,5 +292,123 @@ class AlpacaHistoryTests(unittest.TestCase):
                 self.client().fetch_bars(["ABCD"], START, END)
 
 
+
+def quote(timestamp: str, bid: float = 2.00, ask: float = 2.02) -> dict[str, object]:
+    return {
+        "ap": ask, "as": 3, "ax": "V", "bp": bid, "bs": 2, "bx": "V",
+        "c": ["R"], "t": timestamp, "z": "C",
+    }
+
+
+class AlpacaQuoteTests(unittest.TestCase):
+    def client(self) -> AlpacaHistory:
+        return AlpacaHistory("test-key", "test-secret")
+
+    def test_fetches_official_quotes_response_from_data_api(self) -> None:
+        official = {
+            "quotes": {"ABCD": [quote("2024-01-01T14:30:00.028160898Z")]},
+            "next_page_token": None,
+        }
+        with patch.object(microcap_history, "urlopen", return_value=FakeResponse(official)) as opener:
+            records = self.client().fetch_quotes(["ABCD"], START, END)
+        url = urlparse(opener.call_args.args[0].full_url)
+        self.assertEqual(url.netloc, "data.alpaca.markets")
+        self.assertEqual(url.path, "/v2/stocks/quotes")
+        query = parse_qs(url.query)
+        self.assertEqual(query["feed"], ["iex"])
+        self.assertNotIn("adjustment", query)
+        record = records[0]
+        self.assertEqual(record["symbol"], "ABCD")
+        self.assertEqual(record["bid"], 2.00)
+        self.assertEqual(record["ask"], 2.02)
+        self.assertEqual(record["request_feed"], "iex")
+        self.assertEqual(record["price_basis"], "raw")
+        self.assertEqual(parse_utc(record["fetched_at"]).tzinfo, timezone.utc)
+
+    def test_nanosecond_quote_time_rounds_up_so_it_is_never_known_early(self) -> None:
+        payload = {"quotes": {"ABCD": [
+            quote("2024-01-01T14:30:00.000000001Z"),
+            quote("2024-01-01T09:31:00.5-05:00"),
+            quote("2024-01-01T14:32:00Z"),
+        ]}, "next_page_token": None}
+        with patch.object(microcap_history, "urlopen", return_value=FakeResponse(payload)):
+            records = self.client().fetch_quotes(["ABCD"], START, END)
+        self.assertEqual(
+            [record["t"] for record in records],
+            ["2024-01-01T14:30:00.000001Z", "2024-01-01T14:31:00.500000Z", "2024-01-01T14:32:00Z"],
+        )
+
+    def test_quotes_follow_pagination_and_reject_unrequested_symbols(self) -> None:
+        responses = iter([
+            FakeResponse({"quotes": {"ABCD": [quote("2024-01-01T14:30:00Z")]}, "next_page_token": "p2"}),
+            FakeResponse({"quotes": {"ABCD": [quote("2024-01-01T14:30:01Z")]}, "next_page_token": None}),
+        ])
+        with patch.object(microcap_history, "urlopen", side_effect=lambda *a, **k: next(responses)) as opener:
+            records = self.client().fetch_quotes(["ABCD"], START, END)
+        self.assertEqual(len(records), 2)
+        self.assertEqual(parse_qs(urlparse(opener.call_args.args[0].full_url).query)["page_token"], ["p2"])
+        with patch.object(microcap_history, "urlopen",
+                          return_value=FakeResponse({"quotes": {"OTHER": [quote("2024-01-01T14:30:00Z")]}})):
+            with self.assertRaisesRegex(CoverageError, "RESPONSE_INVALID"):
+                self.client().fetch_quotes(["ABCD"], START, END)
+
+    def test_malformed_quotes_fail_closed(self) -> None:
+        for bad in ({"t": "2024-01-01T14:30:00Z", "ap": 2.0},
+                    quote("2024-01-01T14:30:00"),
+                    quote("2024-01-01T14:30:00Z", bid=float("nan")),
+                    quote("2024-01-01T14:30:00Z", ask=True),
+                    quote("2024-01-01T14:30:00Z", bid=-1),
+                    quote("2023-12-31T14:30:00Z")):
+            payload = json.loads(json.dumps({"quotes": {"ABCD": [bad]}}, allow_nan=True))
+            with self.subTest(bad=bad), patch.object(
+                microcap_history, "urlopen", return_value=FakeResponse(payload)
+            ):
+                with self.assertRaisesRegex(CoverageError, "QUOTE|TIMESTAMP"):
+                    self.client().fetch_quotes(["ABCD"], START, END)
+
+    def test_quote_entitlement_errors_are_explicit_quote_coverage_failures(self) -> None:
+        for status in (401, 403):
+            error = HTTPError("https://data.alpaca.markets/v2/stocks/quotes", status, "x", Message(), BytesIO(b""))
+            with self.subTest(status=status), patch.object(microcap_history, "urlopen", side_effect=error):
+                with self.assertRaises(CoverageError) as raised:
+                    self.client().fetch_quotes(["ABCD"], START, END)
+            self.assertIn("QUOTE_COVERAGE_UNAVAILABLE", str(raised.exception))
+            self.assertIn(str(status), str(raised.exception))
+            self.assertNotIn("test-secret", str(raised.exception))
+            self.assertNotIn("test-key", str(raised.exception))
+
+    def test_quotes_reject_non_iex_feed(self) -> None:
+        with self.assertRaisesRegex(CoverageError, "FEED"):
+            self.client().fetch_quotes(["ABCD"], START, END, feed="sip")
+
+
+class ExclusiveEndAndAdjustmentTests(unittest.TestCase):
+    def client(self) -> AlpacaHistory:
+        return AlpacaHistory("test-key", "test-secret")
+
+    def test_requests_exclude_the_documented_inclusive_end_instant(self) -> None:
+        cases = (
+            ("fetch_bars", {"bars": {}}),
+            ("fetch_news", {"news": []}),
+            ("fetch_quotes", {"quotes": {}}),
+        )
+        for method, payload in cases:
+            with self.subTest(method=method), patch.object(
+                microcap_history, "urlopen", return_value=FakeResponse(payload)
+            ) as opener:
+                getattr(self.client(), method)(["ABCD"], START, END)
+            query = parse_qs(urlparse(opener.call_args.args[0].full_url).query)
+            self.assertEqual(query["end"], ["2024-01-01T23:59:59.999999Z"])
+
+    def test_raw_adjustment_can_be_requested_for_price_basis_checks(self) -> None:
+        with patch.object(microcap_history, "urlopen",
+                          return_value=FakeResponse({"bars": {"ABCD": [bar("2024-01-01T14:30:00Z")]}})) as opener:
+            records = self.client().fetch_bars(["ABCD"], START, END, adjustment="raw")
+        self.assertEqual(parse_qs(urlparse(opener.call_args.args[0].full_url).query)["adjustment"], ["raw"])
+        self.assertEqual(records[0]["request_adjustment"], "raw")
+        with self.assertRaisesRegex(CoverageError, "ADJUSTMENT"):
+            self.client().fetch_bars(["ABCD"], START, END, adjustment="all")
+
+
 if __name__ == "__main__":
     unittest.main()

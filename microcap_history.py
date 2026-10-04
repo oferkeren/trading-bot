@@ -1,4 +1,4 @@
-"""Fail-closed access to Alpaca historical bars and news."""
+"""Fail-closed access to Alpaca historical bars, quotes, and news (Market Data API only)."""
 
 from __future__ import annotations
 
@@ -19,6 +19,10 @@ from zoneinfo import ZoneInfo
 
 _BARS_ENDPOINT = "https://data.alpaca.markets/v2/stocks/bars"
 _NEWS_ENDPOINT = "https://data.alpaca.markets/v1beta1/news"
+_QUOTES_ENDPOINT = "https://data.alpaca.markets/v2/stocks/quotes"
+_ADJUSTMENTS = ("split", "raw")
+_QUOTE_FIELDS = ("t", "bp", "ap")
+_RFC3339_FRACTION = re.compile(r"^(.*T\d{2}:\d{2}:\d{2})\.(\d+)(.*)$")
 _BAR_FIELDS = ("o", "h", "l", "c", "v", "t")
 _NEWS_FIELDS = ("id", "created_at", "headline", "source", "symbols", "summary")
 _MARKET_TZ = ZoneInfo("America/New_York")
@@ -38,6 +42,19 @@ class BarRecord(TypedDict):
     v: Real
     request_feed: str
     request_adjustment: str
+    fetched_at: str
+
+
+class QuoteRecord(TypedDict):
+    symbol: str
+    t: str
+    bid: float
+    ask: float
+    bid_size: Real
+    ask_size: Real
+    conditions: list[str]
+    request_feed: str
+    price_basis: str
     fetched_at: str
 
 
@@ -100,6 +117,28 @@ def _format_utc(value: datetime) -> str:
     return value.isoformat().replace("+00:00", "Z")
 
 
+def _query_end(end_utc: datetime) -> str:
+    """Alpaca's ``end`` is inclusive; request one microsecond earlier to keep [start, end)."""
+    return _format_utc(end_utc - timedelta(microseconds=1))
+
+
+def parse_quote_time(value: object) -> datetime:
+    """Parse an RFC-3339 quote time of any sub-second precision, rounding UP to microseconds.
+
+    Rounding up means a quote is never treated as known earlier than it was published.
+    """
+    if not isinstance(value, str):
+        raise CoverageError("TIMESTAMP_INVALID: quote timestamp must be a string")
+    match = _RFC3339_FRACTION.match(value)
+    if match is None:
+        return parse_utc(value)
+    head, digits, tail = match.groups()
+    micros = int(digits[:6].ljust(6, "0"))
+    round_up = any(digit != "0" for digit in digits[6:])
+    parsed = parse_utc(f"{head}.{micros:06d}{tail}")
+    return parsed + timedelta(microseconds=1) if round_up else parsed
+
+
 def _period(start: str, end: str) -> tuple[datetime, datetime]:
     start_utc = parse_utc(start)
     end_utc = parse_utc(end)
@@ -141,10 +180,16 @@ class AlpacaHistory:
         *,
         timeframe: str = "1Min",
         feed: str = "iex",
+        adjustment: str = "split",
     ) -> list[BarRecord]:
-        """Fetch validated bars with explicit feed, adjustment, and fetch-time provenance."""
+        """Fetch validated bars with explicit feed, adjustment, and fetch-time provenance.
+
+        ``adjustment="raw"`` exists only to verify the price basis of (always raw) quotes.
+        """
         if feed != "iex":
             raise CoverageError(f"FEED_UNSUPPORTED: only the iex feed is supported, not {feed!r}")
+        if adjustment not in _ADJUSTMENTS:
+            raise CoverageError(f"ADJUSTMENT_UNSUPPORTED: adjustment must be split or raw, not {adjustment!r}")
         if not timeframe:
             raise CoverageError("TIMEFRAME_INVALID: timeframe must not be empty")
         start_utc, end_utc = _period(start, end)
@@ -152,9 +197,9 @@ class AlpacaHistory:
         params: dict[str, str | int] = {
             "symbols": symbol_query,
             "start": _format_utc(start_utc),
-            "end": _format_utc(end_utc),
+            "end": _query_end(end_utc),
             "timeframe": timeframe,
-            "adjustment": "split",
+            "adjustment": adjustment,
             "feed": feed,
             "limit": 10000,
         }
@@ -163,9 +208,39 @@ class AlpacaHistory:
         records: list[BarRecord] = []
         for raw in raw_records:
             records.append(
-                self._validate_bar(raw, start_utc, end_utc, feed, fetched_at)
+                self._validate_bar(raw, start_utc, end_utc, feed, fetched_at, adjustment)
             )
         return records
+
+    def fetch_quotes(
+        self, symbols: Sequence[str], start: str, end: str, *, feed: str = "iex"
+    ) -> list[QuoteRecord]:
+        """Fetch historical bid/ask quotes from the Market Data API (never the trading API).
+
+        Alpaca quotes carry no adjustment parameter, so prices are raw (unadjusted);
+        callers must verify that split-adjusted bars share that basis. With the free
+        ``iex`` feed these are IEX top-of-book quotes, not the consolidated NBBO.
+        A bid or ask of 0 means no active side and is passed through for the caller
+        to reject. Missing entitlement fails with ``QUOTE_COVERAGE_UNAVAILABLE``.
+        """
+        if feed != "iex":
+            raise CoverageError(f"FEED_UNSUPPORTED: only the iex feed is supported, not {feed!r}")
+        start_utc, end_utc = _period(start, end)
+        params: dict[str, str | int] = {
+            "symbols": _symbols_query(symbols),
+            "start": _format_utc(start_utc),
+            "end": _query_end(end_utc),
+            "feed": feed,
+            "limit": 10000,
+        }
+        try:
+            raw_records = self._pages(_QUOTES_ENDPOINT, params, "quotes", symbols=symbols)
+        except CoverageError as error:
+            if re.search(r"status (401|403) ", str(error)):
+                raise CoverageError(f"QUOTE_COVERAGE_UNAVAILABLE: {error}") from None
+            raise
+        fetched_at = _format_utc(datetime.now(timezone.utc))
+        return [self._validate_quote(raw, start_utc, end_utc, feed, fetched_at) for raw in raw_records]
 
     def fetch_news(
         self, symbols: Sequence[str], start: str, end: str
@@ -176,7 +251,7 @@ class AlpacaHistory:
         params: dict[str, str | int] = {
             "symbols": symbol_query,
             "start": _format_utc(start_utc),
-            "end": _format_utc(end_utc),
+            "end": _query_end(end_utc),
             "limit": 50,
         }
         raw_records = self._pages(_NEWS_ENDPOINT, params, "news")
@@ -293,17 +368,17 @@ class AlpacaHistory:
             if not isinstance(payload, dict):
                 raise CoverageError(f"RESPONSE_INVALID: {urlsplit(endpoint).path} returned a non-object")
             page = payload.get(collection)
-            if collection == "bars":
+            if collection in ("bars", "quotes"):
                 if not isinstance(page, dict):
-                    raise CoverageError("RESPONSE_INVALID: bars must be a symbol-to-list object")
+                    raise CoverageError(f"RESPONSE_INVALID: {collection} must be a symbol-to-list object")
                 page_records: list[object] = []
                 for symbol, group in page.items():
                     if (not isinstance(symbol, str) or not symbol or symbols is None
                             or symbol not in symbols or not isinstance(group, list)):
-                        raise CoverageError("RESPONSE_INVALID: invalid bar symbol or group")
+                        raise CoverageError(f"RESPONSE_INVALID: invalid {collection} symbol or group")
                     for record in group:
                         if not isinstance(record, dict) or ("symbol" in record and record["symbol"] != symbol):
-                            raise CoverageError("RESPONSE_INVALID: invalid bar record or symbol")
+                            raise CoverageError(f"RESPONSE_INVALID: invalid {collection} record or symbol")
                         page_records.append({**record, "symbol": symbol})
             elif isinstance(page, list):
                 page_records = page
@@ -357,6 +432,7 @@ class AlpacaHistory:
         end: datetime,
         feed: str,
         fetched_at: str,
+        adjustment: str = "split",
     ) -> BarRecord:
         missing = [field for field in _BAR_FIELDS if field not in raw]
         if missing:
@@ -382,7 +458,46 @@ class AlpacaHistory:
             "c": values["c"],
             "v": values["v"],
             "request_feed": feed,
-            "request_adjustment": "split",
+            "request_adjustment": adjustment,
+            "fetched_at": fetched_at,
+        }
+
+    @staticmethod
+    def _validate_quote(
+        raw: Mapping[str, object], start: datetime, end: datetime, feed: str, fetched_at: str
+    ) -> QuoteRecord:
+        missing = [field for field in _QUOTE_FIELDS if field not in raw]
+        if missing:
+            raise CoverageError(f"QUOTE_INVALID: missing required fields {', '.join(missing)}")
+        timestamp = parse_quote_time(raw["t"])
+        if not start <= timestamp < end:
+            raise CoverageError("QUOTE_OUT_OF_RANGE: returned quote is outside the requested range")
+        prices: dict[str, float] = {}
+        for field in ("bp", "ap"):
+            value = raw[field]
+            if (isinstance(value, bool) or not isinstance(value, Real)
+                    or not math.isfinite(value) or value < 0):
+                raise CoverageError(f"QUOTE_INVALID: field {field!r} must be a finite non-negative number")
+            prices[field] = float(value)
+        sizes: dict[str, Real] = {}
+        for field in ("bs", "as"):
+            value = raw.get(field, 0)
+            if isinstance(value, bool) or not isinstance(value, Real) or not math.isfinite(value) or value < 0:
+                raise CoverageError(f"QUOTE_INVALID: field {field!r} must be a finite non-negative number")
+            sizes[field] = value
+        conditions = raw.get("c", [])
+        if not isinstance(conditions, list) or any(not isinstance(item, str) for item in conditions):
+            raise CoverageError("QUOTE_INVALID: field 'c' must be a list of strings")
+        return {
+            "symbol": raw["symbol"],  # type: ignore[typeddict-item]
+            "t": _format_utc(timestamp),
+            "bid": prices["bp"],
+            "ask": prices["ap"],
+            "bid_size": sizes["bs"],
+            "ask_size": sizes["as"],
+            "conditions": list(conditions),
+            "request_feed": feed,
+            "price_basis": "raw",
             "fetched_at": fetched_at,
         }
 
