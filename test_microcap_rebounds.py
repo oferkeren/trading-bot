@@ -354,6 +354,7 @@ class ExtractEventsTests(unittest.TestCase):
         self.assertEqual(event["decision_at"], T0 + timedelta(minutes=16))
         self.assertEqual(event["entry"], 10.02)
         self.assertEqual(event["signal_reference_price"], 10)
+        self.assertEqual(event["horizon_minutes"], 5)
         self.assertEqual(event["fill_at"], T0 + timedelta(minutes=16, seconds=30))
         self.assertEqual(event["stop"], 9)
         self.assertAlmostEqual(event["spread"], 0.02)
@@ -362,6 +363,26 @@ class ExtractEventsTests(unittest.TestCase):
         self.assertEqual(event["symbol"], "ABCD")
         self.assertEqual(event["feature_bucket"], "regular|price:10-20|news_age:0-6h")
         self.assertEqual([item["t"] for item in event["future_bars"]], [minute(index) for index in range(17, 22)])
+
+    def test_feature_bucket_uses_signal_price_not_later_executable_ask(self) -> None:
+        bars = bars_from([price + 9 for price in THREE_CYCLES])
+        event = self.extract(bars=bars, quotes=[
+            quote(T0 + timedelta(minutes=15, seconds=30), bid=18.99, ask=19.01),
+            quote(T0 + timedelta(minutes=16, seconds=30), bid=20.00, ask=20.02),
+        ])[0]
+        self.assertEqual(event["signal_reference_price"], 19)
+        self.assertEqual(event["entry"], 20.02)
+        self.assertEqual(event["feature_bucket"], "regular|price:10-20|news_age:0-6h")
+        signal_bucket_result = estimate_targets(
+            [event], 20.02, 18.0, costs(), "2024-01-05T00:00:00Z",
+            feature_bucket=event["feature_bucket"],
+        )
+        ask_bucket_result = estimate_targets(
+            [event], 20.02, 18.0, costs(), "2024-01-05T00:00:00Z",
+            feature_bucket="regular|price:20+|news_age:0-6h",
+        )
+        self.assertEqual(signal_bucket_result["sample_size"], 1)
+        self.assertEqual(ask_bucket_result["sample_size"], 0)
 
     def test_event_matches_current_setup_at_decision_time(self) -> None:
         event = self.extract()[0]
@@ -476,6 +497,7 @@ def target_event(index: int, future_bars=None, *, bucket="regular|price:10-20|ne
         "spread": 0.02,
         "fees": 0.005,
         "feature_bucket": bucket,
+        "horizon_minutes": len(bars),
         "future_bars": bars,
     }
 
@@ -592,6 +614,20 @@ class EstimateTargetsTests(unittest.TestCase):
         self.assertLess(stats["net_mean_lower_bound"], 0)
         self.assertIsNone(result["selected_target"])
         self.assertIn("NO_POSITIVE_TARGET", result["reasons"])
+
+    def test_truncated_final_bar_is_rejected_instead_of_counted_as_timeout(self) -> None:
+        events = [target_event(index) for index in range(50)]
+        events[-1]["future_bars"] = events[-1]["future_bars"][:-1]
+        events[-1]["horizon_minutes"] = 3
+        with self.assertRaisesRegex(CoverageError, "horizon"):
+            self.estimate(events)
+
+    def test_missing_interior_bar_is_rejected_instead_of_counted_as_timeout(self) -> None:
+        event = target_event(0)
+        event["future_bars"] = [event["future_bars"][0], event["future_bars"][2]]
+        event["horizon_minutes"] = 3
+        with self.assertRaisesRegex(CoverageError, "contiguous"):
+            self.estimate([event])
 
     def test_ambiguous_stop_and_target_bar_is_counted_as_stop(self) -> None:
         events = [

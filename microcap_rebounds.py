@@ -541,8 +541,11 @@ def extract_events(
                 "stop": setup["stop"],
                 "spread": spread,
                 "fees": fees,
+                "horizon_minutes": horizon_minutes,
                 "future_bars": [dict(b.raw) for b in outcome],
-                "feature_bucket": f"{session}|price:{_price_band(entry)}|news_age:{_age_band(age)}",
+                "feature_bucket": (
+                    f"{session}|price:{_price_band(setup['entry'])}|news_age:{_age_band(age)}"
+                ),
             })
     return events
 
@@ -642,7 +645,7 @@ def _event_date(value: object) -> date:
 def _validate_target_event(event: object) -> dict[str, object]:
     required = (
         "symbol", "catalyst_id", "session_date", "session", "decision_at", "fill_at",
-        "entry", "stop", "spread", "fees", "feature_bucket", "future_bars",
+        "entry", "stop", "spread", "fees", "feature_bucket", "horizon_minutes", "future_bars",
     )
     if not isinstance(event, Mapping) or any(field not in event for field in required):
         raise CoverageError("EVENT_INVALID: historical event is missing required fields")
@@ -656,6 +659,10 @@ def _validate_target_event(event: object) -> dict[str, object]:
         raise CoverageError("EVENT_INVALID: session must be a non-empty string")
     if not isinstance(event["feature_bucket"], str) or not event["feature_bucket"]:
         raise CoverageError("EVENT_INVALID: feature_bucket must be a non-empty string")
+    horizon_minutes = event["horizon_minutes"]
+    if (isinstance(horizon_minutes, bool) or not isinstance(horizon_minutes, int)
+            or horizon_minutes <= 0):
+        raise CoverageError("EVENT_INVALID: horizon_minutes must be a positive integer")
     event_day = _event_date(event["session_date"])
     decision_at = _as_utc(event["decision_at"], "event decision_at")
     fill_at = _as_utc(event["fill_at"], "event fill_at")
@@ -681,6 +688,7 @@ def _validate_target_event(event: object) -> dict[str, object]:
         "spread": float(spread),  # type: ignore[arg-type]
         "fees": float(fees),  # type: ignore[arg-type]
         "feature_bucket": event["feature_bucket"],
+        "horizon_minutes": horizon_minutes,
         "future_bars": event["future_bars"],
     }
 
@@ -724,10 +732,13 @@ def estimate_targets(
     independent: dict[tuple[str, str, date], tuple[dict[str, object], list[tuple[datetime, float, float, float]]]] = {}
     for raw_event in events:
         event = _validate_target_event(raw_event)
+        future_bars = _target_bars(event["future_bars"], fill_at=event["fill_at"])  # type: ignore[arg-type]
+        if len(future_bars) != event["horizon_minutes"]:
+            raise CoverageError(
+                "TARGET_BARS_HORIZON: future_bars must contain exactly horizon_minutes bars"
+            )
         if event["feature_bucket"] != feature_bucket or event["session_date"] >= candidate_day:
             continue
-        fill_at = event["fill_at"]
-        future_bars = _target_bars(event["future_bars"], fill_at=fill_at)  # type: ignore[arg-type]
         if future_bars[-1][0] + _BAR > decision_at:
             continue
         key = (
