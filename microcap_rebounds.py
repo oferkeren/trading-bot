@@ -31,6 +31,7 @@ import re
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from numbers import Real
+from statistics import fmean
 from typing import Mapping, Sequence
 from zoneinfo import ZoneInfo
 
@@ -544,3 +545,293 @@ def extract_events(
                 "feature_bucket": f"{session}|price:{_price_band(entry)}|news_age:{_age_band(age)}",
             })
     return events
+
+
+_NET_TARGETS = (0.50, 1.00, 1.50, 2.00)
+_TARGET_KEYS = tuple(f"{target:.2f}" for target in _NET_TARGETS)
+_MIN_TARGET_SAMPLE = 50
+_WILSON_Z_95 = 1.959963984540054
+_NORMAL_Z_95_ONE_SIDED = 1.6448536269514722
+
+
+def _target_bars(
+    bars: object, *, fill_at: datetime | None = None
+) -> list[tuple[datetime, float, float, float]]:
+    if not isinstance(bars, Sequence) or isinstance(bars, (str, bytes)) or not bars:
+        raise CoverageError("TARGET_BARS_INVALID: future_bars must be a non-empty sequence")
+    checked: list[tuple[datetime, float, float, float]] = []
+    for raw in bars:
+        if not isinstance(raw, Mapping):
+            raise CoverageError("TARGET_BARS_INVALID: every future bar must be a mapping")
+        stamp = _as_utc(raw.get("t"), "future bar t")
+        high, low, close = raw.get("h"), raw.get("l"), raw.get("c")
+        open_price = raw.get("o")
+        if not all(_finite(value) for value in (open_price, high, low, close)):
+            raise CoverageError("TARGET_BARS_INVALID: OHLC fields must be finite numbers")
+        o, h, l, c = (float(value) for value in (open_price, high, low, close))  # type: ignore[arg-type]
+        if min(o, h, l, c) <= 0 or l > min(o, c) or h < max(o, c):
+            raise CoverageError("TARGET_BARS_INVALID: OHLC values are inconsistent")
+        if checked and stamp - checked[-1][0] != _BAR:
+            raise CoverageError("TARGET_BARS_GAP: future_bars must be contiguous one-minute bars")
+        checked.append((stamp, h, l, c))
+    if fill_at is not None:
+        first_expected = fill_at.replace(second=0, microsecond=0) + _BAR
+        if checked[0][0] != first_expected:
+            raise CoverageError("TARGET_BARS_GAP: future_bars must start after the executable fill")
+    return checked
+
+
+def first_touch(
+    bars: Sequence[Mapping[str, object]], stop: object, target: object
+) -> str:
+    """Return the first OHLC stop/target touch; ambiguous bars conservatively stop."""
+    if not _finite(stop) or not _finite(target) or stop <= 0 or target <= stop:  # type: ignore[operator]
+        raise CoverageError("TARGET_LEVEL_INVALID: stop and target must be positive with target above stop")
+    for _, high, low, _ in _target_bars(bars):
+        if low <= float(stop):
+            return "STOP"
+        if high >= float(target):
+            return "TARGET"
+    return "TIMEOUT"
+
+
+def _wilson_lower_bound(successes: int, sample_size: int) -> float:
+    proportion = successes / sample_size
+    z_squared = _WILSON_Z_95 ** 2
+    denominator = 1 + z_squared / sample_size
+    center = proportion + z_squared / (2 * sample_size)
+    margin = _WILSON_Z_95 * math.sqrt(
+        proportion * (1 - proportion) / sample_size
+        + z_squared / (4 * sample_size**2)
+    )
+    return max(0.0, (center - margin) / denominator)
+
+
+def _mean_lower_bound(values: Sequence[float]) -> float:
+    count = len(values)
+    mean = fmean(values)
+    if count < 2:
+        return mean
+    variance = sum((value - mean) ** 2 for value in values) / (count - 1)
+    degrees = count - 1
+    z = _NORMAL_Z_95_ONE_SIDED
+    t_critical = (
+        z
+        + (z**3 + z) / (4 * degrees)
+        + (5 * z**5 + 16 * z**3 + 3 * z) / (96 * degrees**2)
+        + (3 * z**7 + 19 * z**5 + 17 * z**3 - 15 * z) / (384 * degrees**3)
+    )
+    return mean - t_critical * math.sqrt(variance / count)
+
+
+def _event_date(value: object) -> date:
+    if isinstance(value, datetime):
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise CoverageError("EVENT_INVALID: session_date must identify a valid date")
+        return value.astimezone(_MARKET_TZ).date()
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str):
+        try:
+            return date.fromisoformat(value)
+        except ValueError:
+            pass
+    raise CoverageError("EVENT_INVALID: session_date must be a date or ISO date")
+
+
+def _validate_target_event(event: object) -> dict[str, object]:
+    required = (
+        "symbol", "catalyst_id", "session_date", "session", "decision_at", "fill_at",
+        "entry", "stop", "spread", "fees", "feature_bucket", "future_bars",
+    )
+    if not isinstance(event, Mapping) or any(field not in event for field in required):
+        raise CoverageError("EVENT_INVALID: historical event is missing required fields")
+    symbol, catalyst_id, session = event["symbol"], event["catalyst_id"], event["session"]
+    if not isinstance(symbol, str) or not symbol.strip():
+        raise CoverageError("EVENT_INVALID: symbol must be a non-empty string")
+    if (isinstance(catalyst_id, bool) or not isinstance(catalyst_id, (str, int))
+            or catalyst_id == ""):
+        raise CoverageError("EVENT_INVALID: catalyst_id must be a non-empty string or integer")
+    if not isinstance(session, str) or not session:
+        raise CoverageError("EVENT_INVALID: session must be a non-empty string")
+    if not isinstance(event["feature_bucket"], str) or not event["feature_bucket"]:
+        raise CoverageError("EVENT_INVALID: feature_bucket must be a non-empty string")
+    event_day = _event_date(event["session_date"])
+    decision_at = _as_utc(event["decision_at"], "event decision_at")
+    fill_at = _as_utc(event["fill_at"], "event fill_at")
+    if decision_at > fill_at:
+        raise CoverageError("EVENT_INVALID: fill_at must not precede decision_at")
+    entry, stop = event["entry"], event["stop"]
+    spread, fees = event["spread"], event["fees"]
+    if not _finite(entry) or not _finite(stop) or entry <= stop or stop <= 0:  # type: ignore[operator]
+        raise CoverageError("EVENT_INVALID: entry and stop must be finite positive prices with entry above stop")
+    if not _finite(spread) or spread <= 0:  # type: ignore[operator]
+        raise CoverageError("EVENT_INVALID: event spread must be positive and finite")
+    if not _finite(fees) or fees < 0:  # type: ignore[operator]
+        raise CoverageError("EVENT_INVALID: event fees must be non-negative and finite")
+    return {
+        "symbol": symbol.strip().upper(),
+        "catalyst_id": catalyst_id,
+        "session_date": event_day,
+        "session": session,
+        "decision_at": decision_at,
+        "fill_at": fill_at,
+        "entry": float(entry),  # type: ignore[arg-type]
+        "stop": float(stop),  # type: ignore[arg-type]
+        "spread": float(spread),  # type: ignore[arg-type]
+        "fees": float(fees),  # type: ignore[arg-type]
+        "feature_bucket": event["feature_bucket"],
+        "future_bars": event["future_bars"],
+    }
+
+
+def estimate_targets(
+    events: Sequence[Mapping[str, object]],
+    entry: object,
+    stop: object,
+    costs: object,
+    as_of: object,
+    *,
+    feature_bucket: str,
+) -> dict[str, object]:
+    """Estimate net target outcomes from >=50 independent, fully observed prior event days.
+
+    Events must carry their own fill, stop, observed spread and fees, exact known-as-of
+    feature bucket, and contiguous future 1-minute bars. A target price includes the
+    historical exit spread and fees, so reaching it represents the requested net gain.
+    Timeout outcomes are liquidated at the final close less spread and fees. Candidate
+    selection requires both a 95% Wilson hit-rate lower bound >=.60 and a positive
+    one-sided 95% t lower bound on mean net outcome. Eligible targets are ranked by
+    that lower bound divided by mean downside plus candidate per-share risk; ties favor
+    the lower target. These frozen cutoffs are research-only and not trading advice.
+    """
+    if not isinstance(events, Sequence) or isinstance(events, (str, bytes)):
+        raise CoverageError("EVENTS_INVALID: events must be a sequence of historical event mappings")
+    decision_at = _as_utc(as_of, "as_of")
+    if not isinstance(feature_bucket, str) or not feature_bucket:
+        raise CoverageError("FEATURE_BUCKET_INVALID: feature_bucket must be a non-empty string")
+    if not _finite(entry) or not _finite(stop) or entry <= stop or stop <= 0:  # type: ignore[operator]
+        raise CoverageError("ENTRY_INVALID: entry and stop must be finite positive prices with entry above stop")
+    if not isinstance(costs, Mapping) or any(key not in costs for key in ("spread", "fees")):
+        raise CoverageError("COSTS_MISSING: candidate spread and fees are required")
+    candidate_spread, candidate_fees = costs["spread"], costs["fees"]
+    if not _finite(candidate_spread) or candidate_spread <= 0:  # type: ignore[operator]
+        raise CoverageError("COSTS_INVALID: candidate spread must be positive and finite")
+    if not _finite(candidate_fees) or candidate_fees < 0:  # type: ignore[operator]
+        raise CoverageError("COSTS_INVALID: candidate fees must be non-negative and finite")
+
+    candidate_day = decision_at.astimezone(_MARKET_TZ).date()
+    independent: dict[tuple[str, str, date], tuple[dict[str, object], list[tuple[datetime, float, float, float]]]] = {}
+    for raw_event in events:
+        event = _validate_target_event(raw_event)
+        if event["feature_bucket"] != feature_bucket or event["session_date"] >= candidate_day:
+            continue
+        fill_at = event["fill_at"]
+        future_bars = _target_bars(event["future_bars"], fill_at=fill_at)  # type: ignore[arg-type]
+        if future_bars[-1][0] + _BAR > decision_at:
+            continue
+        key = (
+            event["symbol"], str(event["catalyst_id"]), event["session_date"]  # type: ignore[arg-type]
+        )
+        previous = independent.get(key)
+        if previous is None or event["decision_at"] < previous[0]["decision_at"]:
+            independent[key] = (event, future_bars)
+
+    independent_days: dict[
+        date, tuple[dict[str, object], list[tuple[datetime, float, float, float]]]
+    ] = {}
+    for item in sorted(
+        independent.values(),
+        key=lambda pair: (
+            pair[0]["session_date"], pair[0]["decision_at"],
+            pair[0]["symbol"], str(pair[0]["catalyst_id"]),
+        ),
+    ):
+        event_day = item[0]["session_date"]
+        if isinstance(event_day, date):
+            independent_days.setdefault(event_day, item)
+
+    sample_size = len(independent_days)
+    probabilities: dict[str, float | None] = {key: None for key in _TARGET_KEYS}
+    empty_metrics = {
+        "wilson_lower_bound": None,
+        "net_mean_lower_bound": None,
+        "expected_time_to_target_minutes": None,
+        "failure_rate": None,
+    }
+    statistics: dict[str, dict[str, float | None]] = {
+        key: dict(empty_metrics) for key in _TARGET_KEYS
+    }
+    reasons: list[str] = []
+    if sample_size == 0:
+        reasons.append("NO_MATCHING_EVENTS")
+    if sample_size < _MIN_TARGET_SAMPLE:
+        reasons.append("INSUFFICIENT_SAMPLE")
+
+    selected_target: float | None = None
+    if sample_size >= _MIN_TARGET_SAMPLE:
+        evaluations: list[tuple[float, float, float]] = []
+        for target, target_key in zip(_NET_TARGETS, _TARGET_KEYS):
+            hit_count = 0
+            net_outcomes: list[float] = []
+            success_minutes: list[float] = []
+            for event, future_bars in independent_days.values():
+                event_entry = event["entry"]
+                event_stop = event["stop"]
+                event_spread = event["spread"]
+                event_fees = event["fees"]
+                target_price = event_entry + target + event_spread + event_fees  # type: ignore[operator]
+                touch = first_touch(event["future_bars"], event_stop, target_price)  # type: ignore[arg-type]
+                if touch == "TARGET":
+                    hit_count += 1
+                    touch_at = next(
+                        stamp + _BAR for stamp, high, low, _ in future_bars
+                        if low > event_stop and high >= target_price  # type: ignore[operator]
+                    )
+                    success_minutes.append(
+                        (touch_at - event["fill_at"]).total_seconds() / 60  # type: ignore[union-attr]
+                    )
+                    net_outcomes.append(target)
+                elif touch == "STOP":
+                    net_outcomes.append(event_stop - event_entry - event_spread - event_fees)  # type: ignore[operator]
+                else:
+                    final_close = future_bars[-1][3]
+                    net_outcomes.append(final_close - event_entry - event_spread - event_fees)  # type: ignore[operator]
+
+            probability = hit_count / sample_size
+            wilson_lower = _wilson_lower_bound(hit_count, sample_size)
+            net_lower = _mean_lower_bound(net_outcomes)
+            failure_rate = (sample_size - hit_count) / sample_size
+            expected_time = fmean(success_minutes) if success_minutes else None
+            probabilities[target_key] = probability
+            statistics[target_key] = {
+                "wilson_lower_bound": wilson_lower,
+                "net_mean_lower_bound": net_lower,
+                "expected_time_to_target_minutes": expected_time,
+                "failure_rate": failure_rate,
+            }
+            if wilson_lower >= 0.60 and net_lower > 0:
+                downside = fmean(max(0.0, -value) for value in net_outcomes)
+                risk_adjusted = net_lower / (
+                    downside + float(entry) - float(stop) + float(candidate_spread) + float(candidate_fees)  # type: ignore[arg-type]
+                )
+                evaluations.append((risk_adjusted, -target, target))
+
+        if evaluations:
+            selected_target = max(evaluations)[2]
+            reasons.append("TARGET_MEETS_FROZEN_THRESHOLDS")
+        elif any(
+            item["net_mean_lower_bound"] is not None and item["net_mean_lower_bound"] > 0
+            for item in statistics.values()
+        ):
+            reasons.append("NO_TARGET_MEETS_THRESHOLDS")
+        else:
+            reasons.append("NO_POSITIVE_TARGET")
+    return {
+        "decision": "RESEARCH_ELIGIBLE" if selected_target is not None else "NO_TRADE",
+        "target_probabilities": probabilities,
+        "target_statistics": statistics,
+        "selected_target": selected_target,
+        "sample_size": sample_size,
+        "reasons": reasons,
+    }

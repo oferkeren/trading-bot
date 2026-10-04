@@ -7,7 +7,9 @@ from microcap_rebounds import (
     confirmed_cycles,
     current_setup,
     eligible_news,
+    estimate_targets,
     extract_events,
+    first_touch,
 )
 
 
@@ -449,6 +451,199 @@ class ExtractEventsTests(unittest.TestCase):
         events = self.extract(news=news)
         self.assertEqual([event["catalyst_id"] for event in events], [2])
         self.assertEqual(events[0]["decision_at"], T0 + timedelta(minutes=22))
+
+
+def outcome_bar(at: datetime, *, high=10.0, low=9.5, close=10.0):
+    return {"t": iso(at), "o": 10.0, "h": high, "l": low, "c": close, "v": 100}
+
+
+def target_event(index: int, future_bars=None, *, bucket="regular|price:10-20|news_age:0-6h"):
+    day = datetime(2024, 1, 1, 14, 30, tzinfo=timezone.utc) + timedelta(days=index)
+    fill_at = day + timedelta(seconds=30)
+    bars = (
+        [outcome_bar(day + timedelta(minutes=1 + offset)) for offset in range(3)]
+        if future_bars is None else future_bars
+    )
+    return {
+        "symbol": "ABCD",
+        "catalyst_id": index,
+        "session_date": day.date(),
+        "session": "regular",
+        "decision_at": iso(day),
+        "fill_at": iso(fill_at),
+        "entry": 10.0,
+        "stop": 9.2,
+        "spread": 0.02,
+        "fees": 0.005,
+        "feature_bucket": bucket,
+        "future_bars": bars,
+    }
+
+
+def costs():
+    return {"spread": 0.02, "fees": 0.005}
+
+
+class FirstTouchTests(unittest.TestCase):
+    def test_stop_wins_when_stop_and_target_are_in_the_same_bar(self) -> None:
+        bars = [outcome_bar(T0, high=10.6, low=9.0)]
+        self.assertEqual(first_touch(bars, stop=9.5, target=10.5), "STOP")
+
+    def test_first_target_or_stop_touch_wins_in_time_order(self) -> None:
+        self.assertEqual(first_touch([outcome_bar(T0, high=10.6, low=9.8)], 9.5, 10.5), "TARGET")
+        self.assertEqual(first_touch([outcome_bar(T0, low=9.4)], 9.5, 10.5), "STOP")
+        self.assertEqual(first_touch([outcome_bar(T0, low=9.8)], 9.5, 10.5), "TIMEOUT")
+
+    def test_invalid_or_noncontiguous_bars_are_refused(self) -> None:
+        bars = [outcome_bar(T0), outcome_bar(T0 + timedelta(minutes=2))]
+        with self.assertRaises(CoverageError):
+            first_touch(bars, 9.5, 10.5)
+
+
+class EstimateTargetsTests(unittest.TestCase):
+    def estimate(self, events, *, as_of="2025-01-01T00:00:00Z", bucket="regular|price:10-20|news_age:0-6h",
+                 entry=10.0, stop=9.2, costs_arg=None):
+        return estimate_targets(
+            events, entry, stop, costs() if costs_arg is None else costs_arg, as_of,
+            feature_bucket=bucket,
+        )
+
+    def test_returns_all_four_target_slots_and_insufficient_sample_reason(self) -> None:
+        result = self.estimate([target_event(index) for index in range(49)])
+        self.assertEqual(
+            set(result["target_probabilities"]), {"0.50", "1.00", "1.50", "2.00"}
+        )
+        self.assertTrue(all(value is None for value in result["target_probabilities"].values()))
+        self.assertEqual(result["sample_size"], 49)
+        self.assertEqual(result["decision"], "NO_TRADE")
+        self.assertIn("INSUFFICIENT_SAMPLE", result["reasons"])
+
+    def test_fifty_independent_days_produce_probability_and_confidence_metrics(self) -> None:
+        target = 10 + 0.50 + 0.02 + 0.005
+        events = [
+            target_event(index, [outcome_bar(
+                datetime(2024, 1, 1, 14, 31, tzinfo=timezone.utc) + timedelta(days=index),
+                high=target,
+            )])
+            for index in range(50)
+        ]
+        result = self.estimate(events)
+        self.assertEqual(result["sample_size"], 50)
+        self.assertEqual(
+            set(result["target_probabilities"]), {"0.50", "1.00", "1.50", "2.00"}
+        )
+        self.assertEqual(result["decision"], "RESEARCH_ELIGIBLE")
+        self.assertEqual(result["target_probabilities"]["0.50"], 1.0)
+        self.assertGreaterEqual(result["target_statistics"]["0.50"]["wilson_lower_bound"], 0.60)
+        self.assertGreater(result["target_statistics"]["0.50"]["net_mean_lower_bound"], 0)
+        self.assertEqual(result["target_statistics"]["0.50"]["failure_rate"], 0.0)
+
+    def test_duplicate_catalyst_day_counts_once(self) -> None:
+        event = target_event(0)
+        duplicate_swing = dict(event, decision_at="2024-01-01T14:30:10Z")
+        result = self.estimate([event, duplicate_swing] + [target_event(i) for i in range(1, 49)])
+        self.assertEqual(result["sample_size"], 49)
+        self.assertIn("INSUFFICIENT_SAMPLE", result["reasons"])
+
+    def test_multiple_catalysts_on_one_session_date_are_one_independent_day(self) -> None:
+        events = [dict(target_event(0), catalyst_id=index) for index in range(50)]
+        result = self.estimate(events)
+        self.assertEqual(result["sample_size"], 1)
+        self.assertTrue(all(value is None for value in result["target_probabilities"].values()))
+
+    def test_wrong_bucket_and_events_on_or_after_as_of_are_excluded(self) -> None:
+        wrong_bucket = target_event(0, bucket="regular|price:5-10|news_age:0-6h")
+        same_day = target_event(1)
+        same_day["session_date"] = datetime(2025, 1, 1).date()
+        future = target_event(2)
+        future["session_date"] = datetime(2025, 1, 2).date()
+        result = self.estimate([wrong_bucket, same_day, future])
+        self.assertEqual(result["sample_size"], 0)
+        self.assertIn("NO_MATCHING_EVENTS", result["reasons"])
+
+    def test_target_hit_requires_gross_price_to_cover_spread_and_fees(self) -> None:
+        events = [
+            target_event(index, [
+                outcome_bar(
+                    datetime(2024, 1, 1, 14, 31, tzinfo=timezone.utc) + timedelta(days=index),
+                    high=10.50, close=10.50,
+                )
+            ])
+            for index in range(50)
+        ]
+        result = self.estimate(events)
+        self.assertEqual(result["target_probabilities"]["0.50"], 0.0)
+        self.assertIsNone(result["selected_target"])
+        self.assertIn("NO_TARGET_MEETS_THRESHOLDS", result["reasons"])
+
+    def test_timeout_is_a_failure_and_its_liquidation_value_enters_net_mean(self) -> None:
+        events = [
+            target_event(index, [
+                outcome_bar(
+                    datetime(2024, 1, 1, 14, 31, tzinfo=timezone.utc) + timedelta(days=index),
+                    low=9.25, close=9.3,
+                )
+            ])
+            for index in range(50)
+        ]
+        result = self.estimate(events)
+        stats = result["target_statistics"]["0.50"]
+        self.assertEqual(stats["failure_rate"], 1.0)
+        self.assertLess(stats["net_mean_lower_bound"], 0)
+        self.assertIsNone(result["selected_target"])
+        self.assertIn("NO_POSITIVE_TARGET", result["reasons"])
+
+    def test_ambiguous_stop_and_target_bar_is_counted_as_stop(self) -> None:
+        events = [
+            target_event(index, [
+                outcome_bar(
+                    datetime(2024, 1, 1, 14, 31, tzinfo=timezone.utc) + timedelta(days=index),
+                    high=10.525, low=9.0,
+                )
+            ])
+            for index in range(50)
+        ]
+        result = self.estimate(events)
+        self.assertEqual(result["target_probabilities"]["0.50"], 0.0)
+        self.assertEqual(result["target_statistics"]["0.50"]["failure_rate"], 1.0)
+
+    def test_selects_conservative_risk_adjusted_positive_target(self) -> None:
+        events = []
+        for index in range(50):
+            start = datetime(2024, 1, 1, 14, 31, tzinfo=timezone.utc) + timedelta(days=index)
+            level = 12.1 if index < 8 else 11.1 if index < 41 else 10.525
+            later_low = 9.0 if index >= 41 else 9.5
+            events.append(target_event(index, [
+                outcome_bar(start, high=level, low=9.5),
+                outcome_bar(start + timedelta(minutes=1), low=later_low),
+                outcome_bar(start + timedelta(minutes=2), low=later_low),
+            ]))
+        result = self.estimate(events)
+        self.assertEqual(result["selected_target"], 0.50)
+        self.assertEqual(result["decision"], "RESEARCH_ELIGIBLE")
+        self.assertGreaterEqual(result["target_statistics"]["1.00"]["wilson_lower_bound"], 0.60)
+        self.assertGreater(result["target_statistics"]["1.00"]["net_mean_lower_bound"], 0)
+        self.assertIn("wilson_lower_bound", result["target_statistics"]["0.50"])
+        self.assertIn("expected_time_to_target_minutes", result["target_statistics"]["0.50"])
+
+    def test_missing_event_fields_or_costs_are_refused(self) -> None:
+        incomplete = target_event(0)
+        del incomplete["fees"]
+        with self.assertRaises(CoverageError):
+            self.estimate([incomplete])
+        with self.assertRaises(CoverageError):
+            estimate_targets(
+                [target_event(index) for index in range(50)],
+                10.0, 9.2, None, "2025-01-01T00:00:00Z",
+                feature_bucket="regular|price:10-20|news_age:0-6h",
+            )
+
+    def test_non_sequence_events_are_refused(self) -> None:
+        with self.assertRaises(CoverageError):
+            estimate_targets(
+                None, 10.0, 9.2, costs(), "2025-01-01T00:00:00Z",
+                feature_bucket="regular|price:10-20|news_age:0-6h",
+            )
 
 
 if __name__ == "__main__":
