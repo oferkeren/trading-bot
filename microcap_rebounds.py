@@ -442,7 +442,9 @@ def extract_events(
     decision (the earliest eligible article is the catalyst ID), an as-of quote no
     older than ``max_quote_age_seconds`` with ``0 < bid < ask``, and supplied fees.
     Missing costs yield no event. The outcome window [decision, decision+horizon)
-    must fit inside the decision's session. At most one event per
+    must fit inside the decision's session and be covered by contiguous complete
+    one-minute bars starting at the decision; any missing outcome bar (e.g. an IEX
+    minute with no trades) skips the event. At most one event per
     ``(symbol, catalyst_id, session_date)``, the earliest. Bars complete after
     ``cutoff`` are never read; bad bars before it raise ``CoverageError``.
     """
@@ -482,6 +484,10 @@ def extract_events(
             spread = _as_of_spread(quotes, decision, max_age)
             if spread is None:
                 continue
+            outcome = [b for b in segment if decision <= b.t and b.t + _BAR <= decision + horizon]
+            expected = [decision + k * _BAR for k in range(horizon // _BAR)]
+            if not expected or [b.t for b in outcome] != expected:
+                continue
             seen.add(key)
             age = decision - parse_utc(catalyst["created_at"])  # type: ignore[arg-type]
             events.append({
@@ -494,9 +500,7 @@ def extract_events(
                 "stop": setup["stop"],
                 "spread": spread,
                 "fees": fees,
-                "future_bars": [
-                    dict(b.raw) for b in segment if decision <= b.t and b.t + _BAR <= decision + horizon
-                ],
+                "future_bars": [dict(b.raw) for b in outcome],
                 "feature_bucket": f"{session}|price:{_price_band(setup['entry'])}|news_age:{_age_band(age)}",
             })
     return events

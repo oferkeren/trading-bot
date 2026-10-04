@@ -351,6 +351,27 @@ class ExtractEventsTests(unittest.TestCase):
         bars[-1]["l"] = None
         self.assertEqual(len(self.extract(bars=bars, cutoff=minute(30))), 1)
 
+    def first_decision_only(self, bars):
+        # Only the decision at minute 16 has an as-of quote, isolating its outcome window.
+        return self.extract(bars=bars, quotes=[quote(T0 + timedelta(minutes=15, seconds=30))])
+
+    def test_complete_outcome_window_produces_event(self) -> None:
+        events = self.first_decision_only(bars_from(THREE_CYCLES))
+        self.assertEqual(len(events), 1)
+        self.assertEqual([item["t"] for item in events[0]["future_bars"]], [minute(index) for index in range(16, 21)])
+
+    def test_missing_interior_outcome_bar_skips_event(self) -> None:
+        bars = [bar for bar in bars_from(THREE_CYCLES) if bar["t"] != minute(18)]
+        self.assertEqual(self.first_decision_only(bars), [])
+
+    def test_missing_final_outcome_bar_skips_event(self) -> None:
+        bars = [bar for bar in bars_from(THREE_CYCLES) if bar["t"] != minute(20)]
+        self.assertEqual(self.first_decision_only(bars), [])
+
+    def test_missing_first_outcome_bar_skips_event(self) -> None:
+        bars = [bar for bar in bars_from(THREE_CYCLES) if bar["t"] != minute(16)]
+        self.assertEqual(self.first_decision_only(bars), [])
+
     def test_missing_quote_spread_or_fees_produce_no_event(self) -> None:
         self.assertEqual(self.extract(quotes=[]), [])
         self.assertEqual(self.extract(fees=None), [])
