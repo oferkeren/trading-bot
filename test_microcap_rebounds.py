@@ -165,6 +165,23 @@ class ConfirmedCyclesTests(unittest.TestCase):
         extended = confirmed_cycles(bars_from(TWO_CYCLES + [3, 20, 2, 25]), minute(16), params=PARAMS)
         self.assertEqual(base, extended)
 
+    def test_bars_after_first_incomplete_bar_do_not_change_earlier_decision(self) -> None:
+        bars = bars_from(TWO_CYCLES)
+        bars.extend([
+            {"t": minute(16), "o": None, "h": None, "l": None, "c": None, "v": None},
+            {"t": minute(15), "o": None, "h": None, "l": None, "c": None, "v": None},
+        ])
+        self.assertEqual(
+            confirmed_cycles(bars, minute(16), params=PARAMS),
+            confirmed_cycles(bars_from(TWO_CYCLES), minute(16), params=PARAMS),
+        )
+
+    def test_malformed_boundary_timestamp_fails_closed(self) -> None:
+        bars = bars_from(TWO_CYCLES)
+        bars.append({"t": "not-a-timestamp"})
+        with self.assertRaises(CoverageError):
+            confirmed_cycles(bars, minute(16), params=PARAMS)
+
     def test_amplitude_and_separation_are_explicit_and_respected(self) -> None:
         with self.assertRaises(TypeError):
             confirmed_cycles(bars_from(TWO_CYCLES), minute(16))  # type: ignore[call-arg]
@@ -314,8 +331,15 @@ class ExtractEventsTests(unittest.TestCase):
             "ABCD Therapeutics Inc.",
             minute(40) if cutoff is None else cutoff,
             params=PARAMS,
-            quotes=[quote(T0 + timedelta(minutes=15, seconds=30)), quote(T0 + timedelta(minutes=21, seconds=30))]
-            if quotes is None else quotes,
+            quotes=(
+                [
+                    quote(T0 + timedelta(minutes=15, seconds=30)),
+                    quote(T0 + timedelta(minutes=16, seconds=30), bid=10.00, ask=10.02),
+                    quote(T0 + timedelta(minutes=21, seconds=30)),
+                    quote(T0 + timedelta(minutes=22, seconds=30), bid=10.00, ask=10.02),
+                ]
+                if quotes is None else quotes
+            ),
             fees=fees,
             horizon_minutes=horizon,
             max_quote_age_seconds=60,
@@ -326,25 +350,36 @@ class ExtractEventsTests(unittest.TestCase):
         self.assertEqual(len(events), 1)
         event = events[0]
         self.assertEqual(event["decision_at"], T0 + timedelta(minutes=16))
-        self.assertEqual(event["entry"], 10)
+        self.assertEqual(event["entry"], 10.02)
+        self.assertEqual(event["signal_reference_price"], 10)
+        self.assertEqual(event["fill_at"], T0 + timedelta(minutes=16, seconds=30))
         self.assertEqual(event["stop"], 9)
         self.assertAlmostEqual(event["spread"], 0.02)
         self.assertEqual(event["fees"], 0.005)
         self.assertEqual(event["catalyst_id"], 1)
         self.assertEqual(event["symbol"], "ABCD")
         self.assertEqual(event["feature_bucket"], "regular|price:10-20|news_age:0-6h")
-        self.assertEqual([item["t"] for item in event["future_bars"]], [minute(index) for index in range(16, 21)])
+        self.assertEqual([item["t"] for item in event["future_bars"]], [minute(index) for index in range(17, 22)])
 
     def test_event_matches_current_setup_at_decision_time(self) -> None:
         event = self.extract()[0]
         setup, _ = current_setup(
             bars_from(THREE_CYCLES), event["spread"], event["fees"], event["decision_at"], params=PARAMS
         )
-        self.assertEqual((setup["entry"], setup["stop"]), (event["entry"], event["stop"]))
+        self.assertEqual(setup["entry"], event["signal_reference_price"])
+        self.assertEqual(setup["stop"], event["stop"])
+        self.assertGreater(event["entry"], setup["entry"])
 
     def test_outcome_window_must_finish_strictly_before_cutoff(self) -> None:
         self.assertEqual(self.extract(cutoff=minute(21)), [])
-        self.assertEqual(len(self.extract(cutoff=iso(T0 + timedelta(minutes=21, seconds=1)))), 1)
+        self.assertEqual(self.extract(cutoff=minute(22)), [])
+        self.assertEqual(len(self.extract(cutoff=iso(T0 + timedelta(minutes=22, seconds=1)))), 1)
+
+    def test_horizon_must_be_a_positive_integer_number_of_minutes(self) -> None:
+        for horizon in (5.5, 0.5, 5.0):
+            with self.subTest(horizon=horizon), self.assertRaisesRegex(CoverageError, "horizon_minutes"):
+                self.extract(horizon=horizon)
+        self.assertEqual(len(self.extract(horizon=5)), 1)
 
     def test_bars_after_cutoff_are_ignored(self) -> None:
         bars = bars_from(THREE_CYCLES)
@@ -352,13 +387,19 @@ class ExtractEventsTests(unittest.TestCase):
         self.assertEqual(len(self.extract(bars=bars, cutoff=minute(30))), 1)
 
     def first_decision_only(self, bars):
-        # Only the decision at minute 16 has an as-of quote, isolating its outcome window.
-        return self.extract(bars=bars, quotes=[quote(T0 + timedelta(minutes=15, seconds=30))])
+        # Quotes around the first decision isolate its fill and outcome window.
+        return self.extract(
+            bars=bars,
+            quotes=[
+                quote(T0 + timedelta(minutes=15, seconds=30)),
+                quote(T0 + timedelta(minutes=16, seconds=30), bid=10.00, ask=10.02),
+            ],
+        )
 
     def test_complete_outcome_window_produces_event(self) -> None:
         events = self.first_decision_only(bars_from(THREE_CYCLES))
         self.assertEqual(len(events), 1)
-        self.assertEqual([item["t"] for item in events[0]["future_bars"]], [minute(index) for index in range(16, 21)])
+        self.assertEqual([item["t"] for item in events[0]["future_bars"]], [minute(index) for index in range(17, 22)])
 
     def test_missing_interior_outcome_bar_skips_event(self) -> None:
         bars = [bar for bar in bars_from(THREE_CYCLES) if bar["t"] != minute(18)]
@@ -381,6 +422,22 @@ class ExtractEventsTests(unittest.TestCase):
         self.assertEqual(self.extract(quotes=future_only), [])
         crossed = [quote(T0 + timedelta(minutes=15, seconds=30), bid=10.02, ask=10.01)]
         self.assertEqual(self.extract(quotes=crossed), [])
+
+    def test_missing_late_or_unprofitable_fill_quote_produces_no_event(self) -> None:
+        before = quote(T0 + timedelta(minutes=15, seconds=30))
+        self.assertEqual(self.extract(quotes=[before]), [])
+        self.assertEqual(
+            self.extract(quotes=[before, quote(T0 + timedelta(minutes=17, seconds=1))]), []
+        )
+        self.assertEqual(
+            self.extract(
+                quotes=[
+                    before,
+                    quote(T0 + timedelta(minutes=16, seconds=30), bid=8.98, ask=8.99),
+                ]
+            ),
+            [],
+        )
 
     def test_no_event_without_as_of_catalyst(self) -> None:
         self.assertEqual(self.extract(news=[article(created_at="2024-01-03T15:23:00Z")]), [])

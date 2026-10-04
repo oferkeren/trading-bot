@@ -11,13 +11,16 @@ Assumptions (documented, fail-closed):
 * Sessions are New York premarket [04:00, 09:30), regular [09:30, 16:00) and
   after-hours [16:00, 20:00), by bar start. Cycles never span sessions, and a gap
   of more than ``max_gap_minutes`` between bars starts a new detection segment.
-* Bar timestamps must parse and strictly increase across the whole input
-  (structural integrity). Values are validated for every bar known at ``as_of``;
+* Bar timestamps must parse and strictly increase through the first incomplete
+  bar at ``as_of``. Its timestamp determines the cutoff boundary, but later
+  records are ignored. Values are validated only for complete historical bars;
   invalid values, unadjusted bars, out-of-session bars, or a bar-to-bar/intra-bar
   price ratio above ``max_jump_ratio`` (split-like) raise ``CoverageError``.
 * ``min_amplitude`` is in price units (dollars per share) and, with
   ``min_separation_minutes``, must be chosen on training data before evaluation.
-* Entry is the close of the bar that confirms the third trough; the stop is that
+* The confirming bar's close is a signal reference, not a fill. Historical event
+  entries use the first valid post-decision ask quote; outcomes start with the
+  first full minute bar strictly after that quote. The stop is the confirmed
   trough's low. Spread and fees are never invented: they must be observed/supplied.
 """
 
@@ -221,15 +224,15 @@ def eligible_news(
 # ---------------------------------------------------------------------------
 
 def _known_bars(bars: Sequence[Mapping[str, object]], as_of: datetime, params: CycleParams) -> list[_Bar]:
-    stamps: list[datetime] = []
+    known: list[_Bar] = []
+    previous: datetime | None = None
     for raw in bars:
         if not isinstance(raw, Mapping) or not isinstance(raw.get("t"), str):
             raise CoverageError("BAR_INVALID: every bar needs a string timestamp 't'")
-        stamps.append(parse_utc(raw["t"]))  # type: ignore[arg-type]
-    if any(later <= earlier for earlier, later in zip(stamps, stamps[1:])):
-        raise CoverageError("BAR_UNORDERED: bar timestamps must strictly increase")
-    known: list[_Bar] = []
-    for raw, stamp in zip(bars, stamps):
+        stamp = parse_utc(raw["t"])  # type: ignore[arg-type]
+        if previous is not None and stamp <= previous:
+            raise CoverageError("BAR_UNORDERED: historical bar timestamps must strictly increase")
+        previous = stamp
         if stamp + _BAR > as_of:
             break
         values = {}
@@ -422,6 +425,27 @@ def _as_of_spread(
     return float(ask) - float(bid)  # type: ignore[arg-type]
 
 
+def _first_post_decision_ask(
+    quotes: Sequence[Mapping[str, object]],
+    decision: datetime,
+    cutoff: datetime,
+    max_age: timedelta,
+) -> tuple[datetime, float] | None:
+    first: tuple[datetime, float] | None = None
+    for item in quotes:
+        stamp = _as_utc(item.get("t"), "quote t") if isinstance(item, Mapping) else None
+        if stamp is None:
+            raise CoverageError("QUOTE_INVALID: quotes must be mappings")
+        if stamp <= decision or stamp > cutoff or stamp - decision > max_age:
+            continue
+        bid, ask = item.get("bid"), item.get("ask")
+        if not _finite(bid) or not _finite(ask) or bid <= 0 or ask <= bid:  # type: ignore[operator]
+            continue
+        if first is None or stamp < first[0]:
+            first = (stamp, float(ask))  # type: ignore[arg-type]
+    return first
+
+
 def extract_events(
     bars: Sequence[Mapping[str, object]],
     news: Sequence[Mapping[str, object]],
@@ -432,30 +456,34 @@ def extract_events(
     params: CycleParams,
     quotes: Sequence[Mapping[str, object]],
     fees: object,
-    horizon_minutes: float,
+    horizon_minutes: int,
     max_quote_age_seconds: float,
 ) -> list[dict[str, object]]:
     """Label historical setup decisions whose outcome window ends strictly before ``cutoff``.
 
     A decision is the confirmation of a cycle's closing low that is a valid
     ``current_setup`` at that instant. Each needs an eligible catalyst known at the
-    decision (the earliest eligible article is the catalyst ID), an as-of quote no
-    older than ``max_quote_age_seconds`` with ``0 < bid < ask``, and supplied fees.
-    Missing costs yield no event. The outcome window [decision, decision+horizon)
-    must fit inside the decision's session and be covered by contiguous complete
-    one-minute bars starting at the decision; any missing outcome bar (e.g. an IEX
-    minute with no trades) skips the event. At most one event per
-    ``(symbol, catalyst_id, session_date)``, the earliest. Bars complete after
-    ``cutoff`` are never read; bad bars before it raise ``CoverageError``.
+    decision (the earliest eligible article is the catalyst ID), a fresh quote at
+    or before the decision for spread, the first usable quote after the decision
+    for a simulated ask fill, and supplied fees. Missing costs or fills yield no
+    event. The integer-minute outcome window starts at the first full minute bar
+    strictly after the fill quote and must be covered by contiguous complete
+    one-minute bars; any missing outcome bar (e.g. an IEX minute with no trades)
+    skips the event. The stop must be below the simulated fill. At most one event
+    per ``(symbol, catalyst_id, session_date)``, the earliest. Through the first
+    incomplete bar at ``cutoff``, timestamps must be valid and ordered; that bar's
+    OHLCV and later records are ignored. Invalid historical-prefix data raises
+    ``CoverageError``.
     """
     end = _as_utc(cutoff, "cutoff")
-    if not _finite(horizon_minutes) or horizon_minutes <= 0:  # type: ignore[operator]
-        raise CoverageError("PARAMS_INVALID: horizon_minutes must be positive")
+    if (isinstance(horizon_minutes, bool) or not isinstance(horizon_minutes, int)
+            or horizon_minutes <= 0):
+        raise CoverageError("PARAMS_INVALID: horizon_minutes must be a positive integer")
     if not _finite(max_quote_age_seconds) or max_quote_age_seconds < 0:  # type: ignore[operator]
         raise CoverageError("PARAMS_INVALID: max_quote_age_seconds must be non-negative")
     if not _finite(fees) or fees < 0:  # type: ignore[operator]
         return []
-    horizon = timedelta(minutes=horizon_minutes)
+    horizon_bars = horizon_minutes
     max_age = timedelta(seconds=max_quote_age_seconds)
     symbol = symbol.strip().upper()
     known = _known_bars(bars, end, params)
@@ -469,8 +497,6 @@ def extract_events(
         )
         for cycle in _segment_cycles(segment, params):
             decision = cycle.confirmed_at
-            if decision + horizon >= end or decision + horizon > session_end:
-                continue
             setup, _ = _setup_from_segment([b for b in segment if b.t + _BAR <= decision], params)
             if setup is None:
                 continue
@@ -484,8 +510,20 @@ def extract_events(
             spread = _as_of_spread(quotes, decision, max_age)
             if spread is None:
                 continue
-            outcome = [b for b in segment if decision <= b.t and b.t + _BAR <= decision + horizon]
-            expected = [decision + k * _BAR for k in range(horizon // _BAR)]
+            fill = _first_post_decision_ask(quotes, decision, end, max_age)
+            if fill is None:
+                continue
+            fill_at, entry = fill
+            if entry <= setup["stop"]:
+                continue
+            first_outcome_at = fill_at.replace(second=0, microsecond=0) + _BAR
+            horizon_seconds = horizon_bars * 60
+            if (horizon_seconds >= (end - first_outcome_at).total_seconds()
+                    or horizon_seconds > (session_end - first_outcome_at).total_seconds()):
+                continue
+            outcome_end = first_outcome_at + horizon_bars * _BAR
+            expected = [first_outcome_at + k * _BAR for k in range(horizon_bars)]
+            outcome = [b for b in segment if b.t > fill_at and b.t + _BAR <= outcome_end]
             if not expected or [b.t for b in outcome] != expected:
                 continue
             seen.add(key)
@@ -496,11 +534,13 @@ def extract_events(
                 "session_date": session_date,
                 "session": session,
                 "decision_at": decision,
-                "entry": setup["entry"],
+                "entry": entry,
+                "fill_at": fill_at,
+                "signal_reference_price": setup["entry"],
                 "stop": setup["stop"],
                 "spread": spread,
                 "fees": fees,
                 "future_bars": [dict(b.raw) for b in outcome],
-                "feature_bucket": f"{session}|price:{_price_band(setup['entry'])}|news_age:{_age_band(age)}",
+                "feature_bucket": f"{session}|price:{_price_band(entry)}|news_age:{_age_band(age)}",
             })
     return events
