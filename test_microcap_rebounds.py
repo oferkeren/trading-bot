@@ -1,8 +1,9 @@
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from microcap_history import CoverageError
 from microcap_rebounds import (
+    _mean_lower_bound,
     CycleParams,
     confirmed_cycles,
     current_setup,
@@ -575,13 +576,48 @@ class EstimateTargetsTests(unittest.TestCase):
 
     def test_wrong_bucket_and_events_on_or_after_as_of_are_excluded(self) -> None:
         wrong_bucket = target_event(0, bucket="regular|price:5-10|news_age:0-6h")
-        same_day = target_event(1)
-        same_day["session_date"] = datetime(2025, 1, 1).date()
-        future = target_event(2)
-        future["session_date"] = datetime(2025, 1, 2).date()
+        same_day = target_event(366)
+        future = target_event(367)
         result = self.estimate([wrong_bucket, same_day, future])
         self.assertEqual(result["sample_size"], 0)
         self.assertIn("NO_MATCHING_EVENTS", result["reasons"])
+
+    def test_declared_day_and_session_must_match_all_event_times(self) -> None:
+        original = target_event(0)
+        invalid = (
+            {"session_date": date(2024, 1, 2)},
+            {"session": "premarket"},
+            {"decision_at": "2024-01-02T14:30:00Z"},
+            {"decision_at": original["fill_at"]},
+            {"fill_at": "2024-01-02T14:30:30Z"},
+            {"fill_at": original["decision_at"]},
+            {"future_bars": [outcome_bar(datetime(2024, 1, 2, 14, 31, tzinfo=timezone.utc))]},
+        )
+        for change in invalid:
+            with self.subTest(change=change), self.assertRaises(CoverageError):
+                self.estimate([dict(original, **change)])
+
+    def test_forged_distinct_dates_cannot_turn_one_outcome_into_fifty_samples(self) -> None:
+        outcome = target_event(0)
+        forged = [
+            dict(outcome, session_date=date(2024, 1, 1) + timedelta(days=index),
+                 catalyst_id=index)
+            for index in range(50)
+        ]
+        with self.assertRaisesRegex(CoverageError, "session_date"):
+            self.estimate(forged)
+
+    def test_future_bar_must_complete_within_declared_session(self) -> None:
+        event = target_event(0)
+        event["decision_at"] = "2024-01-01T20:58:00Z"
+        event["fill_at"] = "2024-01-01T20:58:30Z"
+        event["future_bars"] = [
+            outcome_bar(datetime(2024, 1, 1, 20, 59, tzinfo=timezone.utc)),
+            outcome_bar(datetime(2024, 1, 1, 21, 0, tzinfo=timezone.utc)),
+        ]
+        event["horizon_minutes"] = 2
+        with self.assertRaises(CoverageError):
+            self.estimate([event])
 
     def test_target_hit_requires_gross_price_to_cover_spread_and_fees(self) -> None:
         events = [
@@ -597,6 +633,55 @@ class EstimateTargetsTests(unittest.TestCase):
         self.assertEqual(result["target_probabilities"]["0.50"], 0.0)
         self.assertIsNone(result["selected_target"])
         self.assertIn("NO_TARGET_MEETS_THRESHOLDS", result["reasons"])
+
+    def test_candidate_costs_change_hit_probability_and_eligibility(self) -> None:
+        events = [
+            target_event(index, [outcome_bar(
+                datetime(2024, 1, 1, 14, 31, tzinfo=timezone.utc) + timedelta(days=index),
+                high=10.55, close=10.5,
+            )])
+            for index in range(50)
+        ]
+        cheap = self.estimate(events)
+        self.assertEqual(cheap["target_probabilities"]["0.50"], 1.0)
+        self.assertEqual(cheap["decision"], "RESEARCH_ELIGIBLE")
+        for candidate in ({"spread": 0.06, "fees": 0.005},
+                          {"spread": 0.02, "fees": 0.04}):
+            with self.subTest(candidate=candidate):
+                expensive = self.estimate(events, costs_arg=candidate)
+                self.assertEqual(expensive["target_probabilities"]["0.50"], 0.0)
+                self.assertEqual(expensive["decision"], "NO_TRADE")
+
+    def test_candidate_costs_at_least_target_block_eligibility(self) -> None:
+        events = [
+            target_event(index, [outcome_bar(
+                datetime(2024, 1, 1, 14, 31, tzinfo=timezone.utc) + timedelta(days=index),
+                high=11.1, close=11.0,
+            )])
+            for index in range(50)
+        ]
+        result = self.estimate(events, costs_arg={"spread": 0.5, "fees": 0.5})
+        self.assertEqual(result["target_probabilities"]["0.50"], 0.0)
+        self.assertEqual(result["target_probabilities"]["1.00"], 0.0)
+        self.assertIsNone(result["selected_target"])
+
+    def test_historical_costs_are_retained_when_candidate_costs_are_lower(self) -> None:
+        events = [
+            dict(target_event(index, [outcome_bar(
+                datetime(2024, 1, 1, 14, 31, tzinfo=timezone.utc) + timedelta(days=index),
+                high=10.55,
+            )]), spread=0.06, fees=0.01)
+            for index in range(50)
+        ]
+        result = self.estimate(events)
+        self.assertEqual(result["target_probabilities"]["0.50"], 0.0)
+
+    def test_candidate_exit_costs_reduce_timeout_net_mean_without_repricing_ask_entry(self) -> None:
+        events = [target_event(index) for index in range(50)]
+        result = self.estimate(events, costs_arg={"spread": 0.06, "fees": 0.04})
+        self.assertAlmostEqual(
+            result["target_statistics"]["0.50"]["net_mean_lower_bound"], -0.10
+        )
 
     def test_timeout_is_a_failure_and_its_liquidation_value_enters_net_mean(self) -> None:
         events = [
@@ -642,6 +727,20 @@ class EstimateTargetsTests(unittest.TestCase):
         result = self.estimate(events)
         self.assertEqual(result["target_probabilities"]["0.50"], 0.0)
         self.assertEqual(result["target_statistics"]["0.50"]["failure_rate"], 1.0)
+
+    def test_gap_through_stop_uses_open_in_loser_distribution(self) -> None:
+        events = []
+        for index in range(50):
+            start = datetime(2024, 1, 1, 14, 31, tzinfo=timezone.utc) + timedelta(days=index)
+            if index < 40:
+                bar = outcome_bar(start, high=10.55, low=9.5)
+            else:
+                bar = {"t": iso(start), "o": 8.9, "h": 10.55, "l": 8.8, "c": 9.0, "v": 100}
+            events.append(target_event(index, [bar]))
+        result = self.estimate(events)
+        self.assertEqual(result["target_probabilities"]["0.50"], 0.8)
+        self.assertAlmostEqual(result["target_statistics"]["0.50"]["net_mean_lower_bound"],
+                               _mean_lower_bound([0.50] * 40 + [-1.125] * 10))
 
     def test_selects_conservative_risk_adjusted_positive_target(self) -> None:
         events = []

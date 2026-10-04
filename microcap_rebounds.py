@@ -559,10 +559,10 @@ _NORMAL_Z_95_ONE_SIDED = 1.6448536269514722
 
 def _target_bars(
     bars: object, *, fill_at: datetime | None = None
-) -> list[tuple[datetime, float, float, float]]:
+) -> list[tuple[datetime, float, float, float, float]]:
     if not isinstance(bars, Sequence) or isinstance(bars, (str, bytes)) or not bars:
         raise CoverageError("TARGET_BARS_INVALID: future_bars must be a non-empty sequence")
-    checked: list[tuple[datetime, float, float, float]] = []
+    checked: list[tuple[datetime, float, float, float, float]] = []
     for raw in bars:
         if not isinstance(raw, Mapping):
             raise CoverageError("TARGET_BARS_INVALID: every future bar must be a mapping")
@@ -576,7 +576,7 @@ def _target_bars(
             raise CoverageError("TARGET_BARS_INVALID: OHLC values are inconsistent")
         if checked and stamp - checked[-1][0] != _BAR:
             raise CoverageError("TARGET_BARS_GAP: future_bars must be contiguous one-minute bars")
-        checked.append((stamp, h, l, c))
+        checked.append((stamp, o, h, l, c))
     if fill_at is not None:
         first_expected = fill_at.replace(second=0, microsecond=0) + _BAR
         if checked[0][0] != first_expected:
@@ -590,7 +590,7 @@ def first_touch(
     """Return the first OHLC stop/target touch; ambiguous bars conservatively stop."""
     if not _finite(stop) or not _finite(target) or stop <= 0 or target <= stop:  # type: ignore[operator]
         raise CoverageError("TARGET_LEVEL_INVALID: stop and target must be positive with target above stop")
-    for _, high, low, _ in _target_bars(bars):
+    for _, _, high, low, _ in _target_bars(bars):
         if low <= float(stop):
             return "STOP"
         if high >= float(target):
@@ -655,8 +655,8 @@ def _validate_target_event(event: object) -> dict[str, object]:
     if (isinstance(catalyst_id, bool) or not isinstance(catalyst_id, (str, int))
             or catalyst_id == ""):
         raise CoverageError("EVENT_INVALID: catalyst_id must be a non-empty string or integer")
-    if not isinstance(session, str) or not session:
-        raise CoverageError("EVENT_INVALID: session must be a non-empty string")
+    if session not in {name for name, _, _ in _SESSIONS}:
+        raise CoverageError("EVENT_INVALID: session must be a known trading session")
     if not isinstance(event["feature_bucket"], str) or not event["feature_bucket"]:
         raise CoverageError("EVENT_INVALID: feature_bucket must be a non-empty string")
     horizon_minutes = event["horizon_minutes"]
@@ -666,8 +666,12 @@ def _validate_target_event(event: object) -> dict[str, object]:
     event_day = _event_date(event["session_date"])
     decision_at = _as_utc(event["decision_at"], "event decision_at")
     fill_at = _as_utc(event["fill_at"], "event fill_at")
-    if decision_at > fill_at:
-        raise CoverageError("EVENT_INVALID: fill_at must not precede decision_at")
+    if decision_at >= fill_at:
+        raise CoverageError("EVENT_INVALID: fill_at must be strictly after decision_at")
+    if ((event_day, session) not in (
+            _session_of(decision_at), _session_of(decision_at, end_inclusive=True))
+            or _session_of(fill_at) != (event_day, session)):
+        raise CoverageError("EVENT_INVALID: session_date/session must match decision_at and fill_at")
     entry, stop = event["entry"], event["stop"]
     spread, fees = event["spread"], event["fees"]
     if not _finite(entry) or not _finite(stop) or entry <= stop or stop <= 0:  # type: ignore[operator]
@@ -706,8 +710,10 @@ def estimate_targets(
 
     Events must carry their own fill, stop, observed spread and fees, exact known-as-of
     feature bucket, and contiguous future 1-minute bars. A target price includes the
-    historical exit spread and fees, so reaching it represents the requested net gain.
-    Timeout outcomes are liquidated at the final close less spread and fees. Candidate
+    greater of historical and candidate exit spread and fees, so reaching it represents
+    the requested net gain without charging spread twice on the ask entry. Timeout
+    outcomes are liquidated at the final close less those exit costs. Targets whose
+    candidate costs equal or exceed the requested gain are ineligible. Candidate
     selection requires both a 95% Wilson hit-rate lower bound >=.60 and a positive
     one-sided 95% t lower bound on mean net outcome. Eligible targets are ranked by
     that lower bound divided by mean downside plus candidate per-share risk; ties favor
@@ -729,7 +735,7 @@ def estimate_targets(
         raise CoverageError("COSTS_INVALID: candidate fees must be non-negative and finite")
 
     candidate_day = decision_at.astimezone(_MARKET_TZ).date()
-    independent: dict[tuple[str, str, date], tuple[dict[str, object], list[tuple[datetime, float, float, float]]]] = {}
+    independent: dict[tuple[str, str, date], tuple[dict[str, object], list[tuple[datetime, float, float, float, float]]]] = {}
     for raw_event in events:
         event = _validate_target_event(raw_event)
         future_bars = _target_bars(event["future_bars"], fill_at=event["fill_at"])  # type: ignore[arg-type]
@@ -737,6 +743,12 @@ def estimate_targets(
             raise CoverageError(
                 "TARGET_BARS_HORIZON: future_bars must contain exactly horizon_minutes bars"
             )
+        if any(
+            _session_of(stamp) != (event["session_date"], event["session"])
+            or _session_of(stamp + _BAR, end_inclusive=True) != (event["session_date"], event["session"])
+            for stamp, _, _, _, _ in future_bars
+        ):
+            raise CoverageError("EVENT_INVALID: future_bars must complete within session_date/session")
         if event["feature_bucket"] != feature_bucket or event["session_date"] >= candidate_day:
             continue
         if future_bars[-1][0] + _BAR > decision_at:
@@ -749,7 +761,7 @@ def estimate_targets(
             independent[key] = (event, future_bars)
 
     independent_days: dict[
-        date, tuple[dict[str, object], list[tuple[datetime, float, float, float]]]
+        date, tuple[dict[str, object], list[tuple[datetime, float, float, float, float]]]
     ] = {}
     for item in sorted(
         independent.values(),
@@ -789,14 +801,14 @@ def estimate_targets(
             for event, future_bars in independent_days.values():
                 event_entry = event["entry"]
                 event_stop = event["stop"]
-                event_spread = event["spread"]
-                event_fees = event["fees"]
+                event_spread = max(event["spread"], candidate_spread)
+                event_fees = max(event["fees"], candidate_fees)
                 target_price = event_entry + target + event_spread + event_fees  # type: ignore[operator]
                 touch = first_touch(event["future_bars"], event_stop, target_price)  # type: ignore[arg-type]
                 if touch == "TARGET":
                     hit_count += 1
                     touch_at = next(
-                        stamp + _BAR for stamp, high, low, _ in future_bars
+                        stamp + _BAR for stamp, _, high, low, _ in future_bars
                         if low > event_stop and high >= target_price  # type: ignore[operator]
                     )
                     success_minutes.append(
@@ -804,9 +816,13 @@ def estimate_targets(
                     )
                     net_outcomes.append(target)
                 elif touch == "STOP":
-                    net_outcomes.append(event_stop - event_entry - event_spread - event_fees)  # type: ignore[operator]
+                    stop_open = next(
+                        open_price for _, open_price, _, low, _ in future_bars
+                        if low <= event_stop  # type: ignore[operator]
+                    )
+                    net_outcomes.append(min(event_stop, stop_open) - event_entry - event_spread - event_fees)  # type: ignore[operator]
                 else:
-                    final_close = future_bars[-1][3]
+                    final_close = future_bars[-1][4]
                     net_outcomes.append(final_close - event_entry - event_spread - event_fees)  # type: ignore[operator]
 
             probability = hit_count / sample_size
@@ -821,7 +837,8 @@ def estimate_targets(
                 "expected_time_to_target_minutes": expected_time,
                 "failure_rate": failure_rate,
             }
-            if wilson_lower >= 0.60 and net_lower > 0:
+            if (float(candidate_spread) + float(candidate_fees) < target
+                    and wilson_lower >= 0.60 and net_lower > 0):
                 downside = fmean(max(0.0, -value) for value in net_outcomes)
                 risk_adjusted = net_lower / (
                     downside + float(entry) - float(stop) + float(candidate_spread) + float(candidate_fees)  # type: ignore[arg-type]
