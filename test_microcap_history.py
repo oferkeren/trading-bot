@@ -19,11 +19,13 @@ END = "2024-01-02T00:00:00Z"
 def bar(timestamp: str) -> dict[str, object]:
     return {
         "t": timestamp,
-        "o": 1,
-        "h": 2,
-        "l": 0.5,
-        "c": 1.5,
-        "v": 100,
+        "o": 178.26,
+        "h": 178.26,
+        "l": 178.21,
+        "c": 178.21,
+        "v": 1118,
+        "vw": 178.235733,
+        "n": 65,
     }
 
 
@@ -56,17 +58,42 @@ class AlpacaHistoryTests(unittest.TestCase):
     def client(self) -> AlpacaHistory:
         return AlpacaHistory("test-key", "test-secret")
 
+    def test_accepts_official_stock_bars_response(self) -> None:
+        official = {
+            "bars": {
+                "AAPL": [{
+                    "t": "2022-01-03T09:00:00Z",
+                    "o": 178.26,
+                    "h": 178.26,
+                    "l": 178.21,
+                    "c": 178.21,
+                    "v": 1118,
+                    "vw": 178.235733,
+                    "n": 65,
+                }]
+            },
+            "next_page_token": None,
+        }
+        with patch.object(microcap_history, "urlopen", return_value=FakeResponse(official)):
+            records = self.client().fetch_bars(
+                ["AAPL"], "2022-01-03T00:00:00Z", "2022-01-04T00:00:00Z"
+            )
+        self.assertEqual(records[0]["symbol"], "AAPL")
+        self.assertEqual(records[0]["t"], "2022-01-03T09:00:00Z")
+        self.assertEqual(records[0]["v"], 1118)
+
     def test_follows_next_page_token_even_when_first_page_is_short(self) -> None:
         responses = iter(
             [
-                FakeResponse({"bars": [bar("2024-01-01T14:30:00Z")], "next_page_token": "next"}),
-                FakeResponse({"bars": [bar("2024-01-01T14:31:00Z")]}),
+                FakeResponse({"bars": {"ABCD": [bar("2024-01-01T14:30:00Z")]}, "next_page_token": "next"}),
+                FakeResponse({"bars": {"ABCD": [bar("2024-01-01T14:31:00Z")]}}),
             ]
         )
         with patch.object(microcap_history, "urlopen", side_effect=lambda *args, **kwargs: next(responses)) as opener:
             records = self.client().fetch_bars(["ABCD"], START, END)
 
         self.assertEqual(len(records), 2)
+        self.assertEqual([record["symbol"] for record in records], ["ABCD", "ABCD"])
         self.assertEqual(opener.call_count, 2)
         first_query = parse_qs(urlparse(opener.call_args_list[0].args[0].full_url).query)
         self.assertEqual(first_query["feed"], ["iex"])
@@ -79,13 +106,14 @@ class AlpacaHistoryTests(unittest.TestCase):
         with patch.object(
             microcap_history,
             "urlopen",
-            return_value=FakeResponse({"bars": [bar("2024-01-01T14:30:00Z")]}),
+            return_value=FakeResponse({"bars": {"ABCD": [bar("2024-01-01T14:30:00Z")]}}),
         ) as opener:
             records = self.client().fetch_bars(["ABCD"], START, END)
 
         record = records[0]
         self.assertEqual(record["request_feed"], "iex")
         self.assertEqual(record["request_adjustment"], "split")
+        self.assertEqual(record["symbol"], "ABCD")
         self.assertEqual(parse_utc(record["fetched_at"]).tzinfo, timezone.utc)
         request = opener.call_args.args[0]
         self.assertEqual(request.get_header("Apca-api-key-id"), "test-key")
@@ -102,6 +130,28 @@ class AlpacaHistoryTests(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(CoverageError, "CREDENTIALS"):
                     AlpacaHistory.from_environment()
+
+    def test_multi_symbol_bars_are_flattened_across_pages(self) -> None:
+        responses = iter([
+            FakeResponse({"bars": {
+                "AAPL": [bar("2024-01-01T14:30:00Z")],
+                "MSFT": [bar("2024-01-01T14:31:00Z")],
+            }, "next_page_token": "more"}),
+            FakeResponse({"bars": {"MSFT": [bar("2024-01-01T14:32:00Z")]}}),
+        ])
+        with patch.object(microcap_history, "urlopen", side_effect=lambda *a, **kw: next(responses)):
+            records = self.client().fetch_bars(["AAPL", "MSFT"], START, END)
+        self.assertEqual([record["symbol"] for record in records], ["AAPL", "MSFT", "MSFT"])
+
+    def test_bar_payload_rejects_unrequested_symbols_and_malformed_groups(self) -> None:
+        for groups in ({"OTHER": [bar("2024-01-01T14:30:00Z")]},
+                       {"ABCD": {"t": "2024-01-01T14:30:00Z"}},
+                       {"ABCD": [None]}, {"": []}):
+            with self.subTest(groups=groups), patch.object(
+                microcap_history, "urlopen", return_value=FakeResponse({"bars": groups})
+            ):
+                with self.assertRaisesRegex(CoverageError, "RESPONSE_INVALID"):
+                    self.client().fetch_bars(["ABCD"], START, END)
 
     def test_http_errors_report_status_endpoint_and_retry_after_without_credentials(self) -> None:
         for status, retry_after in ((401, None), (403, None), (429, "17")):
@@ -174,8 +224,8 @@ class AlpacaHistoryTests(unittest.TestCase):
     def test_sparse_bars_remain_observations_not_a_claim_of_session_coverage(self) -> None:
         report = AlpacaHistory.require_coverage(
             bars=[
-                {"t": "2024-01-01T14:30:00Z"},
-                {"t": "2024-01-01T20:59:00Z"},
+                {"symbol": "ABCD", "t": "2024-01-01T14:30:00Z"},
+                {"symbol": "ABCD", "t": "2024-01-01T20:59:00Z"},
             ],
             news=[article()],
             start=START,
@@ -185,18 +235,58 @@ class AlpacaHistoryTests(unittest.TestCase):
         self.assertEqual(len(report.bar_timestamps), 2)
         self.assertEqual(report.news_article_count, 1)
 
+    def test_coverage_reports_internal_minute_gaps_and_unobserved_weekday_sessions(self) -> None:
+        report = AlpacaHistory.require_coverage(
+            bars=[
+                {"symbol": "ABCD", "t": "2024-01-02T14:30:00Z"},
+                {"symbol": "ABCD", "t": "2024-01-02T14:32:00Z"},
+                {"symbol": "EFGH", "t": "2024-01-03T14:30:00Z"},
+            ],
+            news=[{**article(), "created_at": "2024-01-02T12:00:00Z"}],
+            start="2024-01-02T00:00:00Z",
+            end="2024-01-05T00:00:00Z",
+            symbols=["ABCD", "EFGH"],
+            timeframe="1Min",
+        )
+        self.assertEqual(
+            [(gap.symbol, gap.day.isoformat(), gap.timeframe, gap.timestamps)
+             for gap in report.missing_minutes],
+            [("ABCD", "2024-01-02", "1Min", (parse_utc("2024-01-02T14:31:00Z"),))],
+        )
+        self.assertEqual(
+            {(gap.symbol, gap.day.isoformat(), gap.timeframe) for gap in report.unobserved_sessions},
+            {("EFGH", "2024-01-02", "1Min"), ("ABCD", "2024-01-03", "1Min"),
+             ("ABCD", "2024-01-04", "1Min"), ("EFGH", "2024-01-04", "1Min")},
+        )
+
+    def test_five_minute_gaps_do_not_cross_days_or_count_weekends(self) -> None:
+        report = AlpacaHistory.require_coverage(
+            bars=[
+                {"symbol": "ABCD", "t": "2024-01-05T14:30:00Z"},
+                {"symbol": "ABCD", "t": "2024-01-05T14:40:00Z"},
+                {"symbol": "ABCD", "t": "2024-01-08T14:30:00Z"},
+            ],
+            news=[{**article(), "created_at": "2024-01-05T12:00:00Z"}],
+            start="2024-01-05T00:00:00Z",
+            end="2024-01-09T00:00:00Z",
+            timeframe="5Min",
+        )
+        self.assertEqual(report.missing_minutes[0].timestamps,
+                         (parse_utc("2024-01-05T14:35:00Z"),))
+        self.assertEqual(report.unobserved_sessions, ())
+
     def test_rejects_malformed_bar_records(self) -> None:
         malformed = {"t": "2024-01-01T14:30:00Z"}
         with patch.object(
             microcap_history,
             "urlopen",
-            return_value=FakeResponse({"bars": [malformed]}),
+            return_value=FakeResponse({"bars": {"ABCD": [malformed]}}),
         ):
             with self.assertRaisesRegex(CoverageError, "BAR"):
                 self.client().fetch_bars(["ABCD"], START, END)
 
     def test_repeated_page_token_fails_closed(self) -> None:
-        payload = {"bars": [bar("2024-01-01T14:30:00Z")], "next_page_token": "again"}
+        payload = {"bars": {"ABCD": [bar("2024-01-01T14:30:00Z")]}, "next_page_token": "again"}
         with patch.object(microcap_history, "urlopen", return_value=FakeResponse(payload)):
             with self.assertRaisesRegex(CoverageError, "PAGINATION"):
                 self.client().fetch_bars(["ABCD"], START, END)

@@ -5,20 +5,23 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from email.message import Message
 from numbers import Real
 from typing import Mapping, Sequence, TypedDict
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, urlopen
+from zoneinfo import ZoneInfo
 
 
 _BARS_ENDPOINT = "https://data.alpaca.markets/v2/stocks/bars"
 _NEWS_ENDPOINT = "https://data.alpaca.markets/v1beta1/news"
 _BAR_FIELDS = ("o", "h", "l", "c", "v", "t")
 _NEWS_FIELDS = ("id", "created_at", "headline", "source", "symbols", "summary")
+_MARKET_TZ = ZoneInfo("America/New_York")
 
 
 class CoverageError(RuntimeError):
@@ -26,6 +29,7 @@ class CoverageError(RuntimeError):
 
 
 class BarRecord(TypedDict):
+    symbol: str
     t: str
     o: Real
     h: Real
@@ -50,11 +54,32 @@ class NewsRecord(TypedDict):
 
 
 @dataclass(frozen=True)
+class MissingMinutes:
+    """Unobserved timestamp slots strictly between observed bars on one NY day."""
+
+    symbol: str
+    day: date
+    timeframe: str
+    timestamps: tuple[datetime, ...]
+
+
+@dataclass(frozen=True)
+class UnobservedSession:
+    """Weekday with no observed bars; holidays and zero-trade IEX days are possible."""
+
+    symbol: str
+    day: date
+    timeframe: str
+
+
+@dataclass(frozen=True)
 class CoverageReport:
-    """Observed records only; this does not claim contiguous session coverage."""
+    """Observations and candidate gaps, not proof of contiguous exchange coverage."""
 
     bar_timestamps: tuple[datetime, ...]
     news_article_count: int
+    missing_minutes: tuple[MissingMinutes, ...] = ()
+    unobserved_sessions: tuple[UnobservedSession, ...] = ()
 
 
 def parse_utc(value: str) -> datetime:
@@ -133,7 +158,7 @@ class AlpacaHistory:
             "feed": feed,
             "limit": 10000,
         }
-        raw_records = self._pages(_BARS_ENDPOINT, params, "bars")
+        raw_records = self._pages(_BARS_ENDPOINT, params, "bars", symbols=symbols)
         fetched_at = _format_utc(datetime.now(timezone.utc))
         records: list[BarRecord] = []
         for raw in raw_records:
@@ -172,9 +197,22 @@ class AlpacaHistory:
         news: Sequence[Mapping[str, object]],
         start: str,
         end: str,
+        *,
+        symbols: Sequence[str] | None = None,
+        timeframe: str = "1Min",
     ) -> CoverageReport:
-        """Require observations in-range; never infer full session coverage from sparse bars."""
+        """Report candidate gaps, never equating absent IEX trades with missing data.
+
+        Minute slots are counted only between observed bars on the same NY day.
+        Unobserved sessions are weekdays whose regular hours intersect the range,
+        not confirmed exchange sessions (holidays are not excluded).
+        """
         start_utc, end_utc = _period(start, end)
+        if not timeframe:
+            raise CoverageError("TIMEFRAME_INVALID: timeframe must not be empty")
+        requested = set(symbols) if symbols is not None else None
+        if symbols is not None:
+            _symbols_query(symbols)
         if not bars:
             raise CoverageError("BAR_COVERAGE_UNVERIFIED: no historical bars were returned")
         if not news:
@@ -183,6 +221,7 @@ class AlpacaHistory:
                 "historical coverage or the absence of a catalyst"
             )
         bar_timestamps: list[datetime] = []
+        by_symbol_day: dict[tuple[str, date], set[datetime]] = {}
         for bar_record in bars:
             timestamp_value = bar_record.get("t")
             if not isinstance(timestamp_value, str):
@@ -190,6 +229,10 @@ class AlpacaHistory:
             timestamp = parse_utc(timestamp_value)
             if not start_utc <= timestamp < end_utc:
                 raise CoverageError("BAR_OUT_OF_RANGE: returned bar is outside the requested range")
+            symbol = bar_record.get("symbol")
+            if not isinstance(symbol, str) or not symbol or (requested is not None and symbol not in requested):
+                raise CoverageError("BAR_INVALID: symbol must be one of the requested symbols")
+            by_symbol_day.setdefault((symbol, timestamp.astimezone(_MARKET_TZ).date()), set()).add(timestamp)
             bar_timestamps.append(timestamp)
         for article_record in news:
             timestamp_value = article_record.get("created_at")
@@ -198,10 +241,38 @@ class AlpacaHistory:
             timestamp = parse_utc(timestamp_value)
             if not start_utc <= timestamp < end_utc:
                 raise CoverageError("NEWS_OUT_OF_RANGE: returned article is outside the requested range")
-        return CoverageReport(tuple(bar_timestamps), len(news))
+        step_match = re.fullmatch(r"([1-9]\d*)Min", timeframe)
+        missing_minutes: list[MissingMinutes] = []
+        if step_match:
+            step = timedelta(minutes=int(step_match.group(1)))
+            for (symbol, day), stamps in sorted(by_symbol_day.items()):
+                gaps: list[datetime] = []
+                ordered = sorted(stamps)
+                for previous, following in zip(ordered, ordered[1:]):
+                    slot = previous + step
+                    while slot < following:
+                        gaps.append(slot)
+                        slot += step
+                if gaps:
+                    missing_minutes.append(MissingMinutes(symbol, day, timeframe, tuple(gaps)))
+
+        unobserved_sessions: list[UnobservedSession] = []
+        last_day = end_utc.astimezone(_MARKET_TZ).date()
+        for symbol in sorted(requested if requested is not None else {key[0] for key in by_symbol_day}):
+            day = start_utc.astimezone(_MARKET_TZ).date()
+            while day <= last_day:
+                session_open = datetime.combine(day, time(9, 30), _MARKET_TZ).astimezone(timezone.utc)
+                session_close = datetime.combine(day, time(16), _MARKET_TZ).astimezone(timezone.utc)
+                if (day.weekday() < 5 and start_utc < session_close and end_utc > session_open
+                        and (symbol, day) not in by_symbol_day):
+                    unobserved_sessions.append(UnobservedSession(symbol, day, timeframe))
+                day += timedelta(days=1)
+        return CoverageReport(tuple(bar_timestamps), len(news), tuple(missing_minutes),
+                              tuple(unobserved_sessions))
 
     def _pages(
-        self, endpoint: str, params: Mapping[str, str | int], collection: str
+        self, endpoint: str, params: Mapping[str, str | int], collection: str,
+        *, symbols: Sequence[str] | None = None,
     ) -> list[Mapping[str, object]]:
         records: list[Mapping[str, object]] = []
         next_token: str | None = None
@@ -222,11 +293,25 @@ class AlpacaHistory:
             if not isinstance(payload, dict):
                 raise CoverageError(f"RESPONSE_INVALID: {urlsplit(endpoint).path} returned a non-object")
             page = payload.get(collection)
-            if not isinstance(page, list):
+            if collection == "bars":
+                if not isinstance(page, dict):
+                    raise CoverageError("RESPONSE_INVALID: bars must be a symbol-to-list object")
+                page_records: list[object] = []
+                for symbol, group in page.items():
+                    if (not isinstance(symbol, str) or not symbol or symbols is None
+                            or symbol not in symbols or not isinstance(group, list)):
+                        raise CoverageError("RESPONSE_INVALID: invalid bar symbol or group")
+                    for record in group:
+                        if not isinstance(record, dict) or ("symbol" in record and record["symbol"] != symbol):
+                            raise CoverageError("RESPONSE_INVALID: invalid bar record or symbol")
+                        page_records.append({**record, "symbol": symbol})
+            elif isinstance(page, list):
+                page_records = page
+            else:
                 raise CoverageError(
                     f"RESPONSE_INVALID: {urlsplit(endpoint).path} omitted the {collection!r} list"
                 )
-            for record in page:
+            for record in page_records:
                 if not isinstance(record, dict):
                     raise CoverageError(
                         f"RESPONSE_INVALID: {urlsplit(endpoint).path} returned a non-object record"
@@ -289,6 +374,7 @@ class AlpacaHistory:
                 raise CoverageError(f"BAR_INVALID: field {field!r} must be a finite number")
             values[field] = value
         return {
+            "symbol": raw["symbol"],
             "t": _format_utc(timestamp),
             "o": values["o"],
             "h": values["h"],
