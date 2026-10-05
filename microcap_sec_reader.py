@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import http.client
 import json
 import os
+import time
 import urllib.error
 import urllib.request
 
@@ -13,6 +15,7 @@ from microcap_history import CoverageError
 _BASE = "https://data.sec.gov"
 _TIMEOUT_SECONDS = 10.0
 _MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+_READ_CHUNK_BYTES = 64 * 1024
 
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -32,7 +35,12 @@ def _reject_non_json_constant(value: str) -> None:
 
 
 class SecReader:
-    """Fetch one complete, validated pair of SEC documents for a CIK."""
+    """Fetch one complete, validated pair of SEC documents for a CIK.
+
+    Each response has a finite byte cap. The socket timeout applies per blocking
+    operation; the elapsed-time check between chunks is best-effort, not a hard
+    total deadline when a single open/read blocks or a peer trickles bytes.
+    """
 
     def __init__(self, user_agent: str):
         if not isinstance(user_agent, str) or not user_agent.strip():
@@ -71,11 +79,29 @@ class SecReader:
             },
             method="GET",
         )
+        deadline = time.monotonic() + _TIMEOUT_SECONDS
         try:
             with urlopen(request, timeout=_TIMEOUT_SECONDS) as response:
                 if response.geturl() != url or getattr(response, "status", 200) != 200:
                     raise CoverageError("SEC_ACCESS_UNAVAILABLE")
-                body = response.read(_MAX_RESPONSE_BYTES + 1)
+                chunks = []
+                total = 0
+                while total <= _MAX_RESPONSE_BYTES:
+                    if time.monotonic() >= deadline:
+                        raise CoverageError("SEC_ACCESS_UNAVAILABLE")
+                    try:
+                        chunk = response.read(min(_READ_CHUNK_BYTES, _MAX_RESPONSE_BYTES + 1 - total))
+                    except http.client.HTTPException:
+                        raise CoverageError("SEC_RESPONSE_INVALID") from None
+                    if not isinstance(chunk, bytes):
+                        raise CoverageError("SEC_RESPONSE_INVALID")
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > _MAX_RESPONSE_BYTES:
+                        raise CoverageError("SEC_RESPONSE_INVALID")
+                    chunks.append(chunk)
+                body = b"".join(chunks)
         except urllib.error.HTTPError as error:
             if error.code == 429:
                 raise CoverageError("SEC_RATE_LIMITED") from None

@@ -1,8 +1,10 @@
 """Tests for bounded, research-only SEC submissions and company facts access."""
 
+import http.client
 import io
 import json
 import socket
+import time
 import unittest
 from unittest.mock import patch
 from urllib.error import HTTPError, URLError
@@ -119,17 +121,57 @@ class SecReaderTests(unittest.TestCase):
                     self.assert_code("SEC_RESPONSE_INVALID", lambda: self.reader().fetch("123"))
                 self.assertEqual(open_request.call_count, 1)
 
+    def test_http_read_failures_are_invalid_not_partial_success_or_raw_exceptions(self):
+        class BrokenRead(Response):
+            def __init__(self, url, failure):
+                super().__init__(url)
+                self.failure = failure
+
+            def read(self, size=-1):
+                raise self.failure
+
+        for failure in (
+            http.client.HTTPException("broken framing"),
+            http.client.IncompleteRead(b'{"accepted":true}', 1),
+        ):
+            with self.subTest(failure=type(failure).__name__):
+                with patch("microcap_sec_reader.urlopen", return_value=BrokenRead(SUBMISSIONS, failure)) as open_request:
+                    self.assert_code("SEC_RESPONSE_INVALID", lambda: self.reader().fetch("123"))
+                self.assertEqual(open_request.call_count, 1)
+
     def test_oversized_body_is_rejected_with_bounded_read(self):
         class Oversized(Response):
+            def __init__(self, url):
+                super().__init__(url)
+                self.read_sizes = []
+
             def read(self, size=-1):
-                self.read_size = size
+                self.read_sizes.append(size)
                 return b"x" * size
 
         response = Oversized(SUBMISSIONS)
         with patch("microcap_sec_reader.urlopen", return_value=response):
             self.assert_code("SEC_RESPONSE_INVALID", lambda: self.reader().fetch("123"))
-        self.assertGreater(response.read_size, 0)
-        self.assertLessEqual(response.read_size, 2 * 1024 * 1024 + 1)
+        self.assertGreater(len(response.read_sizes), 1)
+        self.assertLessEqual(max(response.read_sizes), 64 * 1024)
+        self.assertEqual(sum(response.read_sizes), 2 * 1024 * 1024 + 1)
+
+    def test_elapsed_budget_is_checked_between_bounded_reads(self):
+        """This best-effort check cannot interrupt one blocking socket read."""
+        class SlowChunks(Response):
+            def __init__(self, url):
+                super().__init__(url)
+                self.read_calls = 0
+
+            def read(self, size=-1):
+                self.read_calls += 1
+                return b"{" if self.read_calls == 1 else b"}"
+
+        response = SlowChunks(SUBMISSIONS)
+        with patch("microcap_sec_reader.urlopen", return_value=response):
+            with patch.object(time, "monotonic", side_effect=[100.0, 100.0, 111.0]):
+                self.assert_code("SEC_ACCESS_UNAVAILABLE", lambda: self.reader().fetch("123"))
+        self.assertEqual(response.read_calls, 1)
 
     def test_invalid_second_document_never_returns_partial_pair(self):
         with patch("microcap_sec_reader.urlopen", side_effect=[
