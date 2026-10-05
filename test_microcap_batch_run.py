@@ -146,5 +146,130 @@ class RunSampleTests(unittest.TestCase):
         self.assertIsNone(load_sample_result(self.dir, sample(), "a" * 64))
 
 
+import io
+import os
+from unittest import mock
+
+import microcap_batch_run as batch_run
+import microcap_readiness
+from microcap_batch_schema import validate_batch_report
+
+
+def batch_manifest():
+    second = dict(sample(), issuer_id="0000000002", symbol="ABCD", move_pct=40.0)
+    body = {"schema_version": 1, "kind": "microcap_batch_manifest",
+            "created_at": "2026-10-05T10:00:00Z", "as_of": "2025-05-28",
+            "rule": dict(DEFAULT_RULE),
+            "trading_days": [{"date": "2025-05-28", "request_id": "req1"}],
+            "candidates": [], "samples": [sample(), second], "bias": list(BIAS)}
+    body["sha256"] = manifest_hash(body)
+    return body
+
+
+class Clock:
+    def __init__(self):
+        self.now, self.sleeps = 0.0, []
+
+    def __call__(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.sleeps.append(round(seconds, 3))
+        self.now += seconds
+
+
+class RunBatchTests(unittest.TestCase):
+    def setUp(self):
+        shutil.rmtree(SCRATCH, ignore_errors=True)
+        self.out = SCRATCH / "batch-out"
+        self.out.mkdir(parents=True, mode=0o700)
+
+    def tearDown(self):
+        shutil.rmtree(SCRATCH, ignore_errors=True)
+
+    def run_batch(self, runner, clock, resume=False, manifest=None):
+        return batch_run.run_batch(manifest or batch_manifest(), self.out, runner=runner,
+                                   resume=resume, now_fn=lambda: NOW, clock=clock,
+                                   sleep=clock.sleep)
+
+    def test_batch_report_aggregates_and_paces(self):
+        clock = Clock()
+        report = self.run_batch(FakeRunner(), clock)
+        validate_batch_report(report)
+        self.assertEqual(clock.sleeps, [25.0])
+        self.assertEqual(report["batch"]["sample_count"], 2)
+        self.assertEqual(report["coverage"]["ibkr_minute"], {"observed": 1, "total": 2})
+        self.assertEqual(report["samples"][1]["stage_errors"],
+                         ["sec:INVALID", "source:INVALID"])
+        self.assertIn("SAMPLE_INCOMPLETE", report["blockers"])
+        saved = json.loads((self.out / "batch-report.json").read_text())
+        self.assertEqual(saved, report)
+
+    def test_resume_skips_completed_samples_without_pacing(self):
+        self.run_batch(FakeRunner(), Clock())
+        runner, clock = FakeRunner(), Clock()
+        report = self.run_batch(runner, clock, resume=True)
+        self.assertEqual(runner.calls, [])
+        self.assertEqual(clock.sleeps, [])
+        validate_batch_report(report)
+
+    def test_tampered_manifest_is_refused(self):
+        manifest = batch_manifest()
+        manifest["samples"][0]["move_pct"] = 99.0
+        with self.assertRaises(batch_run.CoverageError):
+            self.run_batch(FakeRunner(), Clock(), manifest=manifest)
+        self.assertFalse((self.out / "batch-report.json").exists())
+
+
+# Distinct fake values: the leak check scans reports for every configured credential.
+ENV = {"IB_PROBE_CLIENT_ID": "177", "MASSIVE_API_KEY": "k-secret",
+       "APCA_API_KEY_ID": "fake-apca-id", "APCA_API_SECRET_KEY": "fake-apca-secret",
+       "SEC_USER_AGENT": "Test Agent test@example.com"}
+
+
+class RunCliTests(unittest.TestCase):
+    def setUp(self):
+        shutil.rmtree(SCRATCH, ignore_errors=True)
+        self.base = SCRATCH / "cli"
+        self.base.mkdir(parents=True, mode=0o700)
+
+    def tearDown(self):
+        shutil.rmtree(SCRATCH, ignore_errors=True)
+
+    def main(self, argv, env, *, repo_roots=()):
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch.object(batch_run, "run_stage", FakeRunner()), \
+                mock.patch.object(batch_run, "_sleep", lambda s: None), \
+                mock.patch.object(microcap_readiness, "_repository_roots", lambda: repo_roots), \
+                mock.patch.object(batch_run, "_repository_roots", lambda: repo_roots), \
+                mock.patch("sys.stdout", out), mock.patch("sys.stderr", err):
+            code = batch_run.main(argv)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_cli_runs_and_reports_progress(self):
+        manifest = self.base / "batch-manifest.json"
+        manifest.write_text(json.dumps(batch_manifest()))
+        out_dir = self.base / "runs"
+        out_dir.mkdir()
+        code, out, err = self.main(["--manifest", str(manifest), "--out-dir",
+                                    str(out_dir)], ENV)
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out)["samples"], 2)
+        self.assertEqual(len(err.strip().splitlines()), 2)
+        self.assertNotIn("k-secret", out + err)
+
+    def test_cli_environment_and_paths(self):
+        manifest = self.base / "m.json"
+        manifest.write_text(json.dumps(batch_manifest()))
+        args = ["--manifest", str(manifest), "--out-dir", str(self.base)]
+        missing = dict(ENV, APCA_API_SECRET_KEY="")
+        self.assertEqual(self.main(args, missing)[0], 2)
+        code, _, err = self.main(["--manifest", str(manifest), "--out-dir",
+                                  str(Path(__file__).resolve().parent)], ENV,
+                                 repo_roots=(Path(__file__).resolve().parent,))
+        self.assertEqual((code, json.loads(err)), (2, {"error": "INPUT_INVALID"}))
+
+
 if __name__ == "__main__":
     unittest.main()

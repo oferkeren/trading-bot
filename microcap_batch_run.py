@@ -2,19 +2,24 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import subprocess
 import sys
+import time
 from collections.abc import Callable, Mapping
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from microcap_batch_schema import (
-    REQUIRED_BLOCKERS, STAGE_STATUSES, STAGES, validate_blockers, validate_row,
+    BIAS, REQUIRED_BLOCKERS, STAGE_STATUSES, STAGES, coverage_from_rows,
+    validate_batch_report, validate_blockers, validate_manifest, validate_row,
 )
 from microcap_history import CoverageError
-from microcap_readiness import _load, _save, _validate_sec, project_readiness
+from microcap_readiness import (
+    _external, _load, _repository_roots, _save, _validate_sec, project_readiness,
+)
 
 
 _REPOSITORY = Path(__file__).resolve().parent
@@ -232,3 +237,105 @@ def load_sample_result(directory: Path, sample: Mapping, manifest_sha256: str) -
     except CoverageError:
         return None
     return value
+
+
+_REQUIRED_ENV = ("IB_PROBE_CLIENT_ID", "MASSIVE_API_KEY", "APCA_API_KEY_ID",
+                 "APCA_API_SECRET_KEY", "SEC_USER_AGENT")
+SAMPLE_SPACING = 25.0
+_sleep = time.sleep
+
+
+def _progress(index: int, total: int, row: Mapping, resumed: bool) -> None:
+    print(json.dumps({"sample": index, "of": total, "symbol": row["symbol"],
+                      "date": row["date"], "stage_errors": row["stage_errors"],
+                      "resumed": resumed}, separators=(",", ":")),
+          file=sys.stderr, flush=True)
+
+
+def run_batch(manifest: Mapping, out_dir: Path, *, runner: StageRunner, resume: bool,
+              now_fn: Callable[[], datetime], clock: Callable[[], float] = time.monotonic,
+              sleep: Callable[[float], None] = time.sleep,
+              spacing: float = SAMPLE_SPACING, progress: bool = False) -> dict:
+    validate_manifest(manifest)
+    samples = manifest["samples"]
+    rows, blockers, last_start = [], set(), None
+    for index, sample in enumerate(samples, start=1):
+        directory = out_dir / f"{sample['date']}-{sample['issuer_id']}"
+        result = (load_sample_result(directory, sample, manifest["sha256"])
+                  if resume else None)
+        resumed = result is not None
+        if result is None:
+            if last_start is not None and clock() - last_start < spacing:
+                sleep(spacing - (clock() - last_start))
+            last_start = clock()
+            result = run_sample(sample, directory, runner=runner,
+                                manifest_sha256=manifest["sha256"], now=now_fn())
+        rows.append(result["row"])
+        blockers |= set(result["blockers"])
+        if progress:
+            _progress(index, len(samples), result["row"], resumed)
+    report = {
+        "kind": "microcap_batch_report", "schema_version": 1,
+        "generated_at": now_fn().astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "decision": "NO_TRADE", "order_approval": False, "model_calibrated": False,
+        "target_probabilities": "unavailable",
+        "batch": {"as_of": manifest["as_of"], "manifest_sha256": manifest["sha256"],
+                  "sample_count": len(rows), "rule": manifest["rule"], "bias": list(BIAS)},
+        "coverage": coverage_from_rows(rows), "samples": rows,
+        "blockers": sorted(blockers),
+    }
+    validate_batch_report(report)
+    _save(out_dir / "batch-report.json", report)
+    return report
+
+
+def _external_dir(value: str) -> Path:
+    path = Path(value)
+    if not path.is_absolute():
+        raise CoverageError("INPUT_INVALID")
+    try:
+        resolved = path.resolve(strict=True)
+    except (OSError, RuntimeError):
+        raise CoverageError("INPUT_INVALID") from None
+    if (not resolved.is_dir()
+            or any(resolved.is_relative_to(root) for root in _repository_roots())):
+        raise CoverageError("INPUT_INVALID")
+    return resolved
+
+
+class _Parser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        raise CoverageError("INPUT_INVALID")
+
+
+def _fail(code: str) -> int:
+    print(json.dumps({"error": code}), file=sys.stderr)
+    return 2
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = _Parser(description="Run the micro-cap coverage pilot over a batch manifest; "
+                                 "always NO_TRADE")
+    parser.add_argument("--manifest", required=True, help="absolute external batch manifest")
+    parser.add_argument("--out-dir", required=True, help="absolute external output directory")
+    parser.add_argument("--resume", action="store_true",
+                        help="reuse valid sample-result.json files")
+    try:
+        args = parser.parse_args(argv)
+        if any(not os.environ.get(name, "").strip() for name in _REQUIRED_ENV):
+            return _fail("ENVIRONMENT_INCOMPLETE")
+        manifest = _load(_external(Path(args.manifest), existing=True))
+        out_dir = _external_dir(args.out_dir)
+        report = run_batch(manifest, out_dir, runner=run_stage, resume=args.resume,
+                           now_fn=lambda: datetime.now(timezone.utc), sleep=_sleep,
+                           progress=True)
+    except CoverageError:
+        return _fail("INPUT_INVALID")
+    print(json.dumps({"batch_report": str(out_dir / "batch-report.json"),
+                      "coverage": report["coverage"], "samples": len(report["samples"])},
+                     sort_keys=True, separators=(",", ":")))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
