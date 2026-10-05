@@ -18,7 +18,6 @@ _AFTER_HOURS_FILED_CUTOFF = time(17, 30)
 # Issuer-level integrity failures that make every observed count unsafe.
 _COUNT_SUPPRESSING_BLOCKERS = frozenset({
     "ACCEPTANCE_TIME_INVALID",
-    "ACCESSION_CIK_MISMATCH",
     "AMENDMENT_PRESENT",
     "FACT_ROWS_INVALID",
     "REPORT_DATE_INVALID",
@@ -101,9 +100,9 @@ def _timestamp_text(value: datetime) -> str:
 def _filing_class(value: object) -> str:
     if not isinstance(value, str):
         return "other"
-    if value in ("10-K/A", "10-Q/A", "8-K/A"):
+    if value in ("10-K/A", "10-Q/A", "8-K/A", "20-F/A"):
         return "amendment"
-    if value == "10-K":
+    if value in ("10-K", "20-F"):
         return "annual"
     if value == "10-Q":
         return "quarterly"
@@ -235,9 +234,6 @@ def observe_shares(
         if not isinstance(accession, str) or not _ACCESSION_PATTERN.fullmatch(accession):
             invalid_fact_rows = True
             blockers.add("FACT_ROWS_INVALID")
-            continue
-        if _cik(accession[:10]) != requested_cik:
-            blockers.add("ACCESSION_CIK_MISMATCH")
             continue
         facts_by_accession.setdefault(accession, []).append(row)
 

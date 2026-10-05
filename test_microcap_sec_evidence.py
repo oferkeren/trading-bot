@@ -354,20 +354,37 @@ class ObserveSharesTests(unittest.TestCase):
         self.assertEqual(result["observations"], [])
         self.assertNotIn("ISSUER INC", repr(result))
 
-    def test_accession_cik_must_match_requested_cik_before_count_is_accepted(self):
-        mismatched_accession = "0000000999-25-000001"
-        submissions, facts = documents(accession=mismatched_accession)
-        facts["facts"]["dei"]["EntityCommonStockSharesOutstanding"]["units"]["shares"][0][
-            "accn"
-        ] = mismatched_accession
+    def test_filing_agent_accession_prefix_is_accepted_when_issuer_cik_matches(self):
+        # EDGAR accession prefixes identify the submitter (often a filing agent),
+        # not the issuer; issuer identity comes from both document roots.
+        agent_accession = "0001213900-25-000001"
+        submissions, facts = documents(accession=agent_accession)
 
         result = observe(submissions, facts)
 
-        self.assertIn("ACCESSION_CIK_MISMATCH", result["blockers"])
-        self.assertFalse(any(
-            isinstance(item["shares_count"], int) and item["shares_count"] > 0
-            for item in result["observations"]
-        ))
+        self.assertNotIn("ACCESSION_CIK_MISMATCH", result["blockers"])
+        self.assertEqual(result["observations"][0]["accession"], agent_accession)
+        self.assertEqual(result["observations"][0]["shares_count"], 100_000_000)
+
+    def test_foreign_private_issuer_annual_report_yields_annual_count(self):
+        submissions, facts = documents(
+form="20-F", report_date="2024-12-31")
+
+        result = observe(submissions, facts)
+
+        self.assertEqual(result["observations"][0]["filing_class"], "annual")
+        self.assertEqual(result["observations"][0]["shares_count"], 100_000_000)
+        self.assertNotIn("FILING_FORM_UNSUPPORTED", result["blockers"])
+        self.assertEqual(result["status"], "MARKET_CAP_UNVERIFIED")
+
+    def test_foreign_private_issuer_annual_amendment_is_flagged(self):
+        submissions, facts = documents(
+form="20-F/A", report_date="2024-12-31")
+
+        result = observe(submissions, facts)
+
+        self.assertIn("AMENDMENT_PRESENT", result["blockers"])
+        self.assertIsNone(result["observations"][0]["shares_count"])
 
     def test_malformed_companyfacts_rows_block_positive_counts(self):
         valid_row = {

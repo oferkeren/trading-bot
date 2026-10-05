@@ -515,10 +515,6 @@ def _validate_sec(
         if (not isinstance(accession, str)
                 or not re.fullmatch(r"[0-9]{10}-[0-9]{2}-[0-9]{6}", accession)):
             raise _invalid()
-        accession_cik = accession[:10]
-        if ((gate_cik is not None and accession_cik != gate_cik)
-                or (sample_cik is not None and accession_cik != sample_cik)):
-            raise _invalid()
         accepted_at = _utc_timestamp(observation.get("accepted_at"))
         _utc_timestamp(observation.get("fetched_at"))
         if decision_at is not None and accepted_at > decision:

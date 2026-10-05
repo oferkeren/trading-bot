@@ -296,6 +296,15 @@ class ProjectReadinessTests(unittest.TestCase):
                     self.assertRaises(CoverageError):
                 project_readiness(report, now=NOW)
 
+    def test_sec_observation_accession_may_carry_filing_agent_prefix(self):
+        # EDGAR accession prefixes identify the submitter, not the issuer.
+        sec = sec_report()
+        sec["market_cap_gate"]["observations"][0]["accession"] = "0001213900-26-050019"
+
+        result = project_readiness(source_report("0000000001"), sec, now=NOW)
+
+        self.assertEqual(result["sources"]["sec"]["status"], "OBSERVED")
+
     def test_sec_status_distinguishes_missing_and_unavailable_evidence(self):
         report = source_report()
         missing = project_readiness(report, now=NOW)
