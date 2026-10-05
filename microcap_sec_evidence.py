@@ -41,6 +41,8 @@ def _cik(value: object) -> str | None:
 def _timestamp(value: object, *, sec_local: bool = False) -> datetime | None:
     if not isinstance(value, str) or not value:
         return None
+    if _DATE_PATTERN.fullmatch(value):
+        return None
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
@@ -252,7 +254,8 @@ def observe_shares(
         # whether they restate or supersede the original fact is unverified.
         unsupported_form = filing_class in ("amendment", "other")
         if filing_class == "amendment":
-            blockers.add("AMENDMENT_PRESENT")
+            if accepted is not None and accepted <= decision:
+                blockers.add("AMENDMENT_PRESENT")
         elif filing_class == "other":
             blockers.add("FILING_FORM_UNSUPPORTED")
         if over_cap:

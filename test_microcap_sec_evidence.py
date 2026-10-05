@@ -234,6 +234,28 @@ class ObserveSharesTests(unittest.TestCase):
             [item["shares_count"] for item in result["observations"]], [100_000_000]
         )
 
+    def test_future_joined_amendment_does_not_block_earlier_historical_count(self):
+        submissions, facts = documents()
+        recent = submissions["filings"]["recent"]
+        recent["accessionNumber"].insert(0, "0000000123-25-000002")
+        recent["acceptanceDateTime"].insert(0, "2025-05-16T09:00:00-04:00")
+        recent["reportDate"].insert(0, "2025-03-31")
+        recent["form"].insert(0, "10-Q/A")
+        facts["facts"]["dei"]["EntityCommonStockSharesOutstanding"]["units"][
+            "shares"
+        ].append({
+            "accn": "0000000123-25-000002", "end": "2025-03-31",
+            "val": 120_000_000, "filed": "2025-05-16",
+        })
+
+        result = observe(submissions, facts)
+
+        self.assertIn("FUTURE_ACCEPTANCE", result["blockers"])
+        self.assertNotIn("AMENDMENT_PRESENT", result["blockers"])
+        self.assertEqual(
+            [item["shares_count"] for item in result["observations"]], [100_000_000]
+        )
+
     def test_later_acceptance_is_not_made_available_by_an_old_report_date(self):
         submissions, facts = documents(
             accepted="2025-05-15T16:30:01-04:00",
@@ -244,6 +266,17 @@ class ObserveSharesTests(unittest.TestCase):
 
         self.assertIn("FUTURE_ACCEPTANCE", result["blockers"])
         self.assertEqual(result["observations"], [])
+
+    def test_date_only_or_missing_acceptance_time_is_invalid(self):
+        for accepted in ("2025-05-15", None):
+            with self.subTest(accepted=accepted):
+                submissions, facts = documents()
+                submissions["filings"]["recent"]["acceptanceDateTime"] = [accepted]
+
+                result = observe(submissions, facts)
+
+                self.assertIn("ACCEPTANCE_TIME_INVALID", result["blockers"])
+                self.assertEqual(result["observations"], [])
 
     def test_naive_sec_acceptance_uses_eastern_daylight_time(self):
         submissions, facts = documents(
