@@ -157,10 +157,40 @@ class SecReaderTests(unittest.TestCase):
 
         response = Oversized(SUBMISSIONS)
         with patch("microcap_sec_reader.urlopen", return_value=response):
-            self.assert_code("SEC_RESPONSE_INVALID", lambda: self.reader().fetch("123"))
+            self.assert_code("SEC_RESPONSE_TOO_LARGE", lambda: self.reader().fetch("123"))
         self.assertGreater(len(response.read_sizes), 1)
         self.assertLessEqual(max(response.read_sizes), 64 * 1024)
         self.assertEqual(sum(response.read_sizes), 2 * 1024 * 1024 + 1)
+
+    def test_companyfacts_response_just_above_two_mib_is_accepted(self):
+        large_facts = b'{"padding":"' + (b"a" * (2 * 1024 * 1024)) + b'"}'
+        self.assertGreater(len(large_facts), 2 * 1024 * 1024)
+
+        with patch("microcap_sec_reader.urlopen", side_effect=[
+            Response(SUBMISSIONS, b'{"kind":"submissions"}'),
+            Response(FACTS, large_facts),
+        ]):
+            _, facts = self.reader().fetch("123")
+
+        self.assertEqual(facts["padding"], "a" * (2 * 1024 * 1024))
+
+    def test_companyfacts_response_above_sixteen_mib_has_distinct_error(self):
+        class Oversized(Response):
+            def __init__(self, url):
+                super().__init__(url)
+                self.read_sizes = []
+
+            def read(self, size=-1):
+                self.read_sizes.append(size)
+                return b"x" * size
+
+        response = Oversized(FACTS)
+        with patch("microcap_sec_reader.urlopen", side_effect=[
+            Response(SUBMISSIONS),
+            response,
+        ]):
+            self.assert_code("SEC_RESPONSE_TOO_LARGE", lambda: self.reader().fetch("123"))
+        self.assertEqual(sum(response.read_sizes), 16 * 1024 * 1024 + 1)
 
     def test_elapsed_budget_is_checked_between_bounded_reads(self):
         """This best-effort check cannot interrupt one blocking socket read."""

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping
-from datetime import date, datetime, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 
@@ -12,6 +12,7 @@ _ACCESSION_PATTERN = re.compile(r"[0-9]{10}-[0-9]{2}-[0-9]{6}\Z")
 _DATE_PATTERN = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}\Z")
 _SEC_EASTERN = ZoneInfo("America/New_York")
 _MAX_OBSERVATIONS = 2
+_AFTER_HOURS_FILED_CUTOFF = time(17, 30)
 
 
 # Issuer-level integrity failures that make every observed count unsafe.
@@ -73,6 +74,24 @@ def _date(value: object) -> date | None:
         return date.fromisoformat(value)
     except ValueError:
         return None
+
+
+def _next_business_day(value: date) -> date:
+    candidate = value + timedelta(days=1)
+    while candidate.weekday() >= 5:
+        candidate += timedelta(days=1)
+    return candidate
+
+
+def _accepted_filed_dates(value: datetime) -> set[date]:
+    eastern = value.astimezone(_SEC_EASTERN)
+    accepted_date = eastern.date()
+    allowed = {accepted_date}
+    if eastern.time() >= _AFTER_HOURS_FILED_CUTOFF:
+        # EDGAR rolls after-hours filing dates to the next business day; this
+        # deliberately skips only weekends, not exchange/federal holidays.
+        allowed.add(_next_business_day(accepted_date))
+    return allowed
 
 
 def _timestamp_text(value: datetime) -> str:
@@ -270,7 +289,7 @@ def observe_shares(
 
         dated_rows: list[Mapping] = []
         invalid_required_dates = False
-        accepted_eastern_date = accepted.astimezone(_SEC_EASTERN).date()
+        accepted_filed_dates = _accepted_filed_dates(accepted)
         for row in matching_rows:
             fact_end = _date(row.get("end"))
             if fact_end == report_date:
@@ -282,7 +301,7 @@ def observe_shares(
             if filed_date is None:
                 blockers.add("FILED_DATE_INVALID")
                 invalid_required_dates = True
-            elif filed_date != accepted_eastern_date:
+            elif filed_date not in accepted_filed_dates:
                 blockers.add("FILED_DATE_MISMATCH")
                 invalid_required_dates = True
         if not dated_rows:

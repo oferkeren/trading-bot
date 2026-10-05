@@ -532,6 +532,62 @@ class ObserveSharesTests(unittest.TestCase):
         self.assertIn("FILED_DATE_MISMATCH", result["blockers"])
         self.assertEqual(result["observations"][0]["accepted_at"], DECISION_AT)
 
+    def test_after_hours_thursday_acceptance_allows_friday_filed_date(self):
+        submissions, facts = documents(
+            accepted="2025-05-15T18:08:00-04:00",
+            fact_rows=[{
+                "accn": ACCESSION, "end": "2025-03-31", "val": 100_000_000,
+                "filed": "2025-05-16",
+            }],
+        )
+
+        result = observe(submissions, facts, decision_at="2025-05-15T22:08:00Z")
+
+        self.assertNotIn("FILED_DATE_MISMATCH", result["blockers"])
+        self.assertEqual(result["observations"][0]["shares_count"], 100_000_000)
+
+    def test_after_hours_friday_acceptance_allows_monday_filed_date(self):
+        submissions, facts = documents(
+            accepted="2025-05-16T18:00:00-04:00",
+            fact_rows=[{
+                "accn": ACCESSION, "end": "2025-03-31", "val": 100_000_000,
+                "filed": "2025-05-19",
+            }],
+        )
+
+        result = observe(submissions, facts, decision_at="2025-05-16T22:00:00Z")
+
+        self.assertNotIn("FILED_DATE_MISMATCH", result["blockers"])
+        self.assertEqual(result["observations"][0]["shares_count"], 100_000_000)
+
+    def test_before_after_hours_cutoff_rejects_next_day_filed_date(self):
+        submissions, facts = documents(
+            accepted="2025-05-15T17:29:00-04:00",
+            fact_rows=[{
+                "accn": ACCESSION, "end": "2025-03-31", "val": 100_000_000,
+                "filed": "2025-05-16",
+            }],
+        )
+
+        result = observe(submissions, facts, decision_at="2025-05-15T21:29:00Z")
+
+        self.assertIn("FILED_DATE_MISMATCH", result["blockers"])
+        self.assertIsNone(result["observations"][0]["shares_count"])
+
+    def test_after_hours_acceptance_rejects_filed_date_two_business_days_later(self):
+        submissions, facts = documents(
+            accepted="2025-05-15T18:08:00-04:00",
+            fact_rows=[{
+                "accn": ACCESSION, "end": "2025-03-31", "val": 100_000_000,
+                "filed": "2025-05-19",
+            }],
+        )
+
+        result = observe(submissions, facts, decision_at="2025-05-15T22:08:00Z")
+
+        self.assertIn("FILED_DATE_MISMATCH", result["blockers"])
+        self.assertIsNone(result["observations"][0]["shares_count"])
+
     def test_observations_are_capped_at_two_accessions(self):
         accessions = [
             "0000000123-25-000001",

@@ -107,7 +107,9 @@ class SecProbeTests(unittest.TestCase):
 
     def test_provider_failures_use_sanitized_stderr_and_never_save(self):
         from microcap_history import CoverageError
-        for error_code in ("SEC_ACCESS_UNAVAILABLE", "SEC_RATE_LIMITED"):
+        for error_code in (
+            "SEC_ACCESS_UNAVAILABLE", "SEC_RATE_LIMITED", "SEC_RESPONSE_TOO_LARGE",
+        ):
             with self.subTest(error_code=error_code):
                 with patch.dict(os.environ, {"SEC_USER_AGENT": "Private contact@example.org"}):
                     with patch("microcap_sec_probe.SecReader.fetch",
@@ -118,6 +120,36 @@ class SecProbeTests(unittest.TestCase):
                 self.assertEqual(json.loads(stderr)["error"], error_code)
                 self.assertNotIn("Private contact@example.org", stderr)
                 self.assertFalse((self.directory / "report.json").exists())
+
+    def test_offline_companyfacts_just_above_two_mib_is_accepted(self):
+        large_facts = {"padding": "a" * (2 * 1024 * 1024)}
+        self.facts.write_text(json.dumps(large_facts), encoding="utf-8")
+
+        with patch("microcap_sec_probe.SecReader", side_effect=AssertionError("network")):
+            code, stdout, stderr = self.run_cli(
+                "--submissions", str(self.submissions), "--companyfacts", str(self.facts))
+
+        self.assertEqual((code, stderr), (0, ""))
+        self.assertEqual(json.loads(stdout)["market_cap_gate"]["status"],
+                         "MARKET_CAP_UNVERIFIED")
+
+    def test_offline_companyfacts_above_sixteen_mib_is_input_error(self):
+        self.facts.write_bytes(b'{"padding":"' + (b"a" * (16 * 1024 * 1024)) + b'"}')
+
+        code, stdout, stderr = self.run_cli(
+            "--submissions", str(self.submissions), "--companyfacts", str(self.facts))
+
+        self.assertEqual((code, stdout), (2, ""))
+        self.assertEqual(json.loads(stderr), {"error": "INPUT_INVALID"})
+
+    def test_offline_submissions_above_two_mib_is_input_error(self):
+        self.submissions.write_bytes(b'{"padding":"' + (b"a" * (2 * 1024 * 1024)) + b'"}')
+
+        code, stdout, stderr = self.run_cli(
+            "--submissions", str(self.submissions), "--companyfacts", str(self.facts))
+
+        self.assertEqual((code, stdout), (2, ""))
+        self.assertEqual(json.loads(stderr), {"error": "INPUT_INVALID"})
 
     def test_fetch_uses_two_fixed_endpoints_once_and_no_retry(self):
         urls = []

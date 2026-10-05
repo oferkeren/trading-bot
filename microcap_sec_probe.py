@@ -19,9 +19,11 @@ from microcap_sec_reader import SecReader
 _REPOSITORY = Path(__file__).resolve().parent
 _CIK = re.compile(r"[0-9]{1,10}\Z")
 _UTC = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\Z")
-_MAX_SAVED_BYTES = 2 * 1024 * 1024
+_MAX_SAVED_SUBMISSIONS_BYTES = 2 * 1024 * 1024
+_MAX_SAVED_COMPANYFACTS_BYTES = 16 * 1024 * 1024
 _PROVIDER_ERRORS = frozenset({
     "SEC_ACCESS_UNAVAILABLE", "SEC_RATE_LIMITED", "SEC_RESPONSE_INVALID",
+    "SEC_RESPONSE_TOO_LARGE",
 })
 
 
@@ -84,11 +86,11 @@ def _reject_constant(value: str) -> None:
     raise ValueError("invalid JSON constant")
 
 
-def _load(path: Path) -> dict:
+def _load(path: Path, *, max_bytes: int) -> dict:
     try:
         with path.open("rb") as source:
-            payload = source.read(_MAX_SAVED_BYTES + 1)
-        if len(payload) > _MAX_SAVED_BYTES:
+            payload = source.read(max_bytes + 1)
+        if len(payload) > max_bytes:
             raise CoverageError("INPUT_INVALID")
         document = json.loads(payload, parse_constant=_reject_constant)
     except (OSError, ValueError, UnicodeDecodeError, RecursionError):
@@ -139,8 +141,8 @@ def main(argv: list[str] | None = None) -> int:
         args = _parser().parse_args(argv)
         cik, submissions_path, facts_path, output = _validate(args)
         if not args.fetch:
-            submissions = _load(submissions_path)
-            facts = _load(facts_path)
+            submissions = _load(submissions_path, max_bytes=_MAX_SAVED_SUBMISSIONS_BYTES)
+            facts = _load(facts_path, max_bytes=_MAX_SAVED_COMPANYFACTS_BYTES)
     except (CoverageError, OSError, ValueError, TypeError):
         return _error(2, "INPUT_INVALID")
 
