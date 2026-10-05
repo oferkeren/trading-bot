@@ -896,7 +896,7 @@ Publish the research-only readiness snapshot from external evidence, never from 
 
 Configure the signal server with `MICROCAP_READINESS_PATH=/external/readiness.json` using an absolute path outside the repository. The server treats snapshots older than seven days as `STALE`; missing, invalid, forged, or unreadable snapshots render as `UNAVAILABLE`.
 
-The dashboard panel appears above Hot Pool as **Micro-cap Research · NO TRADE**. It is read-only, always displays `NO TRADE`, and makes no provider, broker, SEC, or research-data calls from the browser.
+`/dashboard` is the focused micro-cap dashboard. The top bar holds the PAPER/LIVE badge, the NO TRADE research badge, the IBKR connection dot (grey when the broker snapshot is missing or older than 60 s) and the kill switch. Sidebar tabs: Research (schema 2 batch coverage KPIs and the sample table, or the schema 1 single-sample view), Positions, Orders, and Health (runtime components, safety blockers, PAPER/LIVE switch with double confirmation for LIVE). The selected tab is kept in the URL hash (`#research`, `#positions`, `#orders`, `#health`). The previous full dashboard remains at `/dashboard-legacy`. Scripts are served by the authenticated `/microcap-research-panel.js` and `/dashboard-app.js` routes. Removed sections keep their backend routes.
 
 ## Micro-cap Batch Coverage Pilot
 
