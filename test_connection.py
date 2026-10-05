@@ -18,19 +18,20 @@ class IBApp(EWrapper, EClient):
         print(f"ERROR {errorCode}: {errorString}")
 
 
-app = IBApp()
+if __name__ == "__main__":
+    app = IBApp()
 
-app.connect(
-    host="127.0.0.1",
-    port=7496,
-    clientId=10
-)
+    app.connect(
+        host="127.0.0.1",
+        port=7496,
+        clientId=10
+    )
 
-thread = threading.Thread(target=app.run, daemon=True)
-thread.start()
+    thread = threading.Thread(target=app.run, daemon=True)
+    thread.start()
 
-time.sleep(5)
+    time.sleep(5)
 
-print("Connected:", app.isConnected())
+    print("Connected:", app.isConnected())
 
-app.disconnect()
+    app.disconnect()

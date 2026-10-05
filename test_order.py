@@ -105,19 +105,20 @@ class App(EWrapper, EClient):
         )
 
 
-app = App()
+if __name__ == "__main__":
+    app = App()
 
-app.connect(
-    HOST,
-    PORT,
-    clientId=CLIENT_ID
-)
+    app.connect(
+        HOST,
+        PORT,
+        clientId=CLIENT_ID
+    )
 
-threading.Thread(
-    target=app.run,
-    daemon=True
-).start()
+    threading.Thread(
+        target=app.run,
+        daemon=True
+    ).start()
 
-time.sleep(15)
+    time.sleep(15)
 
-app.disconnect()
+    app.disconnect()

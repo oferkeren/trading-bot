@@ -897,3 +897,33 @@ Publish the research-only readiness snapshot from external evidence, never from 
 Configure the signal server with `MICROCAP_READINESS_PATH=/external/readiness.json` using an absolute path outside the repository. The server treats snapshots older than seven days as `STALE`; missing, invalid, forged, or unreadable snapshots render as `UNAVAILABLE`.
 
 The dashboard panel appears above Hot Pool as **Micro-cap Research · NO TRADE**. It is read-only, always displays `NO TRADE`, and makes no provider, broker, SEC, or research-data calls from the browser.
+
+## Micro-cap Batch Coverage Pilot
+
+Research only. Measures how often IBKR, Massive, Alpaca and SEC cover a mechanically selected batch of recent runner days. Every output is `NO_TRADE`. The selection uses the day's high (`SELECTION_USES_SAME_DAY_OUTCOME`), so these samples must never be used to calibrate or evaluate entry rules.
+
+All paths are absolute and outside the repository. Load the private environment without printing it (`set -a; . ~/.config/alpaca/microcap.env; . ~/.config/tradingmax/sec.env; set +a`, plus `MASSIVE_API_KEY` and `IB_PROBE_CLIENT_ID=177`).
+
+1. Select (Massive grouped daily and ticker type, SEC tickers; at most 5 Massive calls per minute):
+
+   ```bash
+   ./venv/bin/python microcap_batch_select.py --days 10 --per-day 2 --output /external/batch/batch-manifest.json
+   ```
+
+   Exit codes: 0 = ok; 2 = invalid input or `ENVIRONMENT_INCOMPLETE`; 3 = `PROVIDER_ERROR` or `NO_SAMPLES_SELECTED`.
+
+2. Run every sample through the existing IBKR, source and SEC CLIs. This takes about 25 s or more per sample. TWS paper on port 7497 must be up.
+
+   ```bash
+   ./venv/bin/python microcap_batch_run.py --manifest /external/batch/batch-manifest.json --out-dir /external/batch/runs [--resume]
+   ```
+
+   Each sample gets `<out-dir>/<date>-<cik>/` holding the stage inputs and outputs and `sample-result.json`. `--resume` reuses valid results. A failing stage is recorded as `<stage>:<PROVIDER_ERROR|INVALID|TIMEOUT|SKIPPED>` and never aborts the batch.
+
+3. Publish a schema 2 snapshot for the dashboard:
+
+   ```bash
+   ./venv/bin/python microcap_readiness.py --batch-report /external/batch/runs/batch-report.json --output "$MICROCAP_READINESS_PATH"
+   ```
+
+   `--batch-report` and `--source-report` are mutually exclusive. `--sec-report` applies only to `--source-report`.
