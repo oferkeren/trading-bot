@@ -1,12 +1,15 @@
 import copy
-import io
 import json
+import os
+import queue
+import tempfile
+import threading
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
-from microcap_readiness import _repository_roots, project_readiness
+from microcap_readiness import project_readiness
 from microcap_readiness_store import read_readiness
 from test_microcap_readiness import source_report
 
@@ -18,12 +21,16 @@ def snapshot(at=NOW):
     return project_readiness(source_report(), now=at)
 
 
+def external_tempdir():
+    return tempfile.TemporaryDirectory(prefix="microcap-readiness-", dir=Path.home())
+
+
 def configured_read(data, now=NOW):
     payload = data if isinstance(data, bytes) else json.dumps(data).encode()
-    roots = _repository_roots()
-    with patch("microcap_readiness._repository_roots", return_value=roots), \
-            patch("pathlib.Path.open", return_value=io.BytesIO(payload)):
-        return read_readiness("/etc/hosts", now=now)
+    with external_tempdir() as directory:
+        path = Path(directory) / "snapshot.json"
+        path.write_bytes(payload)
+        return read_readiness(str(path), now=now)
 
 
 class ReadReadinessTests(unittest.TestCase):
@@ -46,6 +53,57 @@ class ReadReadinessTests(unittest.TestCase):
         with Path(__file__).open("rb") as source:
             symlink = f"/proc/self/fd/{source.fileno()}"
             self.assertEqual(read_readiness(symlink, now=NOW)["status"], "UNAVAILABLE")
+
+    def test_fifo_swapped_after_validation_fails_closed_without_blocking(self):
+        with external_tempdir() as directory:
+            fifo = Path(directory) / "snapshot.json"
+            os.mkfifo(fifo)
+            results = queue.Queue()
+
+            def read_fifo():
+                with patch("microcap_readiness_store._external", return_value=fifo):
+                    results.put(read_readiness(str(fifo), now=NOW))
+
+            thread = threading.Thread(target=read_fifo, daemon=True)
+            thread.start()
+            thread.join(0.25)
+            if thread.is_alive():
+                for _ in range(20):
+                    try:
+                        fd = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
+                        break
+                    except OSError:
+                        fd = None
+                if fd is not None:
+                    try:
+                        os.write(fd, b"{")
+                    finally:
+                        os.close(fd)
+                thread.join(1)
+                self.fail("read_readiness blocked on a FIFO snapshot path")
+            self.assertEqual(results.get_nowait()["status"], "UNAVAILABLE")
+
+    def test_symlink_final_component_is_rejected(self):
+        with external_tempdir() as directory:
+            target = Path(directory) / "target.json"
+            link = Path(directory) / "snapshot.json"
+            target.write_bytes(json.dumps(snapshot()).encode())
+            link.symlink_to(target)
+            with patch("microcap_readiness_store._external", return_value=link):
+                self.assertEqual(read_readiness(str(link), now=NOW)["status"],
+                                 "UNAVAILABLE")
+
+    def test_inode_mismatch_after_validation_fails_closed(self):
+        with external_tempdir() as directory:
+            path = Path(directory) / "snapshot.json"
+            path.write_bytes(json.dumps(snapshot()).encode())
+            current = os.stat(path)
+            fields = list(current)
+            fields[1] += 1
+            mismatched = os.stat_result(fields)
+            with patch("os.fstat", return_value=mismatched):
+                self.assertEqual(read_readiness(str(path), now=NOW)["status"],
+                                 "UNAVAILABLE")
 
     def test_invalid_json_oversized_and_duplicate_keys_fail_closed(self):
         for data in (b"{", b'{"status":1,"status":2}', b"x" * (2 * 1024 * 1024 + 1)):

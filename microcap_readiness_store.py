@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+import json
+import os
+import stat
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from microcap_history import CoverageError
 from microcap_readiness import (
+    _MAX_JSON_BYTES,
     _ISSUER, _NEWS_STATUSES, _REPORT_REASONS, _ROSTER_STATUSES, _SEC_BLOCKERS,
-    _SYMBOL, _external, _is_count, _load, _utc_timestamp,
+    _SYMBOL, _external, _is_count, _reject_constant, _unique_object,
+    _utc_timestamp,
 )
 
 
@@ -127,6 +132,42 @@ def _validate(value: object) -> datetime:
     return generated
 
 
+def _load_validated(resolved: Path) -> dict[str, object]:
+    expected = os.stat(resolved, follow_symlinks=False)
+    if not stat.S_ISREG(expected.st_mode):
+        raise OSError()
+    fd: int | None = None
+    try:
+        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+        fd = os.open(resolved, flags)
+        actual = os.fstat(fd)
+        if (not stat.S_ISREG(actual.st_mode)
+                or actual.st_dev != expected.st_dev
+                or actual.st_ino != expected.st_ino):
+            raise OSError()
+        chunks = []
+        remaining = _MAX_JSON_BYTES + 1
+        while remaining:
+            chunk = os.read(fd, remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        payload = b"".join(chunks)
+        if len(payload) > _MAX_JSON_BYTES:
+            raise ValueError()
+        value = json.loads(payload, object_pairs_hook=_unique_object,
+                           parse_constant=_reject_constant)
+    except (OSError, UnicodeError, ValueError, RecursionError):
+        raise CoverageError("INPUT_INVALID") from None
+    finally:
+        if fd is not None:
+            os.close(fd)
+    if not isinstance(value, dict):
+        raise CoverageError("INPUT_INVALID")
+    return value
+
+
 def read_readiness(path: str | None, *, now: datetime) -> dict[str, object]:
     """Read only a configured absolute external file; never expose invalid/stale claims."""
     if not path or not isinstance(path, str):
@@ -135,7 +176,7 @@ def read_readiness(path: str | None, *, now: datetime) -> dict[str, object]:
         if not isinstance(now, datetime) or now.tzinfo is None or now.utcoffset() is None:
             raise ValueError()
         instant = now.astimezone(timezone.utc)
-        generated_file = _load(_external(Path(path), existing=True))
+        generated_file = _load_validated(_external(Path(path), existing=True))
         generated_at = _validate(generated_file)
         age = instant - generated_at
         if age < timedelta(0):
