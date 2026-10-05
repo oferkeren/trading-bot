@@ -61,6 +61,7 @@ _ROSTER_STATUSES = frozenset({
     "MISSING", "INVALID", "SAVED_EVIDENCE_UNVERIFIED", "PAGINATION_UNVERIFIED",
     "DATED_ROSTER_OBSERVED",
 })
+_ROSTER_SAMPLING_BIASES = frozenset({"ROSTER_UNVERIFIED", "UNVERIFIED_PILOT"})
 _NEWS_STATUSES = frozenset({"MISSING", "INVALID", "ARTICLES_OBSERVED", "EMPTY"})
 _CHANNEL_STATUSES = frozenset({
     "observed", "partial", "unavailable", "not_applicable", "unverified",
@@ -305,9 +306,15 @@ def _validate_source(
     if (not isinstance(roster_status, Mapping)
             or roster_status.get("status") not in ("verified", "unverified")):
         raise _invalid()
-    for key in ("reason", "sampling_bias"):
-        value = roster_status.get(key)
-        if value is not None and (not isinstance(value, str) or value not in _REPORT_REASONS):
+    if roster_status["status"] == "verified":
+        if (roster_status.get("reason") is not None
+                or roster_status.get("sampling_bias") is not None):
+            raise _invalid()
+    else:
+        bias = roster_status.get("sampling_bias")
+        if (roster_status.get("reason") != "ROSTER_UNVERIFIED"
+                or not isinstance(bias, str)
+                or bias not in _ROSTER_SAMPLING_BIASES):
             raise _invalid()
 
     matrix = report["matrix"]

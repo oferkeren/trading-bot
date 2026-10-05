@@ -9,7 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from microcap_history import CoverageError
-from microcap_coverage_probe import coverage_report
+from microcap_coverage_probe import _roster_status, coverage_report
 from microcap_readiness import main, project_readiness, publish_readiness
 from microcap_source_probe import extend_coverage
 from test_microcap_source_probe import base_report, news, roster
@@ -25,6 +25,31 @@ def source_report(issuer_id="issuer-1"):
     for row in report["matrix"]:
         row["issuer_id"] = issuer_id
     return report
+
+
+def pilot_source_report():
+    roster_status, _ = _roster_status(
+        {}, datetime(2025, 5, 28, tzinfo=timezone.utc), pilot=True,
+    )
+    base = coverage_report(
+        roster_status,
+        [{
+            "issuer_id": "0000000001", "date": "2025-05-28",
+            "session": "regular", "provider": "ibkr",
+            "bars": {"status": "observed", "intervals": {
+                "1 min": {"count": 3}, "1 hour": {"count": 2},
+            }},
+            "quotes": {"status": "observed"}, "news": {"status": "unavailable"},
+        }],
+        sample_manifest={"status": "predeclared", "issuer_ids": ["0000000001"],
+                         "dates": ["2025-05-28"]},
+    )
+    base["sample_manifest"]["symbol"] = "SORA"
+    base["request_window"] = {
+        "start_utc": "2025-05-28T00:00:00Z",
+        "end_utc": "2025-05-29T00:00:00Z",
+    }
+    return extend_coverage(base, roster=None, alpaca_news=None, cap_evidence=None)
 
 
 def sec_report():
@@ -228,6 +253,38 @@ class ProjectReadinessTests(unittest.TestCase):
         })
         self.assertIn("CLASS_COVERAGE_UNVERIFIED", result["blockers"])
         self.assertNotIn("shares_count", json.dumps(result))
+
+    def test_real_pilot_coverage_with_missing_sec_stays_unverified(self):
+        report = pilot_source_report()
+        self.assertEqual(report["roster_status"], {
+            "status": "unverified", "reason": "ROSTER_UNVERIFIED",
+            "sampling_bias": "UNVERIFIED_PILOT",
+        })
+
+        result = project_readiness(report, now=NOW)
+
+        self.assertEqual(result["sources"]["roster"]["status"], "UNVERIFIED")
+        self.assertEqual(result["sources"]["roster"]["evidence_status"], "MISSING")
+        self.assertEqual(result["sources"]["sec"]["status"], "MISSING")
+        self.assertIn("ROSTER_UNVERIFIED", result["blockers"])
+        self.assertIn("ROSTER_COVERAGE_UNVERIFIED", result["blockers"])
+        self.assertNotIn("UNVERIFIED_PILOT", result["blockers"])
+        self.assertNotIn("UNVERIFIED_PILOT", json.dumps(result))
+
+    def test_pilot_bias_is_only_allowed_in_unverified_roster_metadata(self):
+        for edit in (
+            lambda report: report["reasons"].append("UNVERIFIED_PILOT")
+            or report["reasons"].sort(),
+            lambda report: report["roster_status"].update(reason="UNVERIFIED_PILOT"),
+            lambda report: report["roster_status"].update(sampling_bias="PROVIDER_ERROR"),
+            lambda report: report["roster_status"].update(sampling_bias=[]),
+            lambda report: report["roster_status"].update(status="verified"),
+        ):
+            report = pilot_source_report()
+            edit(report)
+            with self.subTest(roster_status=report["roster_status"]), \
+                    self.assertRaises(CoverageError):
+                project_readiness(report, now=NOW)
 
     def test_sec_status_distinguishes_missing_and_unavailable_evidence(self):
         report = source_report()
