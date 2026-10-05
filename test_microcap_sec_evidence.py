@@ -178,6 +178,51 @@ class ObserveSharesTests(unittest.TestCase):
         self.assertEqual(result["observations"], [])
         self.assertNotIn("ISSUER INC", repr(result))
 
+    def test_accession_cik_must_match_requested_cik_before_count_is_accepted(self):
+        mismatched_accession = "0000000999-25-000001"
+        submissions, facts = documents(accession=mismatched_accession)
+        facts["facts"]["dei"]["EntityCommonStockSharesOutstanding"]["units"]["shares"][0][
+            "accn"
+        ] = mismatched_accession
+
+        result = observe(submissions, facts)
+
+        self.assertIn("ACCESSION_CIK_MISMATCH", result["blockers"])
+        self.assertFalse(any(
+            isinstance(item["shares_count"], int) and item["shares_count"] > 0
+            for item in result["observations"]
+        ))
+
+    def test_malformed_companyfacts_rows_block_positive_counts(self):
+        valid_row = {
+            "accn": ACCESSION, "end": "2025-03-31", "val": 100_000_000,
+            "filed": "2025-05-15",
+        }
+        malformed_rows = (
+            {"unexpected": [valid_row]},
+            [valid_row, None],
+            [valid_row, {"end": "2025-03-31", "val": 50_000_000}],
+            [valid_row, {
+                "accn": "not-an-accession", "end": "2025-03-31",
+                "val": 50_000_000,
+            }],
+        )
+        for rows in malformed_rows:
+            with self.subTest(rows=rows):
+                submissions, facts = documents()
+                facts["facts"]["dei"]["EntityCommonStockSharesOutstanding"]["units"][
+                    "shares"
+                ] = rows
+
+                result = observe(submissions, facts)
+
+                self.assertIn("FACT_ROWS_INVALID", result["blockers"])
+                self.assertFalse(any(
+                    isinstance(item["shares_count"], int) and item["shares_count"] > 0
+                    for item in result["observations"]
+                ))
+                self.assertLessEqual(len(result["observations"]), 2)
+
     def test_cik_values_must_be_digit_identifiers_not_coerced(self):
         submissions, facts = documents()
         submissions["cik"] = "issuer-123"

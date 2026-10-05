@@ -184,16 +184,25 @@ def observe_shares(
     fact_rows = units.get("shares")
     if not isinstance(fact_rows, list):
         fact_rows = []
+        blockers.add("FACT_ROWS_INVALID")
         blockers.add("SHARES_FACT_ABSENT")
 
     facts_by_accession: dict[str, list[Mapping]] = {}
+    invalid_fact_rows = False
     for row in fact_rows:
         if not isinstance(row, Mapping):
+            invalid_fact_rows = True
             blockers.add("FACT_ROWS_INVALID")
             continue
         accession = row.get("accn")
-        if isinstance(accession, str) and _ACCESSION_PATTERN.fullmatch(accession):
-            facts_by_accession.setdefault(accession, []).append(row)
+        if not isinstance(accession, str) or not _ACCESSION_PATTERN.fullmatch(accession):
+            invalid_fact_rows = True
+            blockers.add("FACT_ROWS_INVALID")
+            continue
+        if _cik(accession[:10]) != requested_cik:
+            blockers.add("ACCESSION_CIK_MISMATCH")
+            continue
+        facts_by_accession.setdefault(accession, []).append(row)
 
     matching_records = 0
     visited_accessions: set[str] = set()
@@ -268,7 +277,12 @@ def observe_shares(
         if len(class_values) > 1:
             blockers.add("AMBIGUOUS_CLASS_COVERAGE")
         shares_count: int | None = None
-        if not invalid_count and len(count_values) == 1 and len(class_values) <= 1:
+        if (
+            not invalid_fact_rows
+            and not invalid_count
+            and len(count_values) == 1
+            and len(class_values) <= 1
+        ):
             shares_count = next(iter(count_values))
 
         observations.append({
