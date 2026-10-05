@@ -67,6 +67,36 @@ def request(app, path, *, auth=False):
     return asyncio.run(run())
 
 
+def request_raw(app, path, *, auth=False):
+    headers = [(b"authorization", b"Basic dXNlcjpwYXNz")] if auth else []
+    if TestClient is not None:
+        with TestClient(app) as client:
+            response = client.get(path, headers=dict(headers))
+        return response.status_code, response.text, response.headers.get("content-type", "")
+
+    async def run():
+        replies = []
+
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        async def send(message):
+            replies.append(message)
+
+        await app({
+            "type": "http", "http_version": "1.1", "method": "GET", "path": path,
+            "raw_path": path.encode(), "query_string": b"", "headers": headers,
+            "scheme": "http", "server": ("test", 80), "client": ("test", 12345),
+        }, receive, send)
+        start = next(item for item in replies if item["type"] == "http.response.start")
+        body = b"".join(item.get("body", b"") for item in replies
+                        if item["type"] == "http.response.body")
+        content_type = dict(start.get("headers", [])).get(b"content-type", b"").decode()
+        return start["status"], body.decode(), content_type
+
+    return asyncio.run(run())
+
+
 class ReadinessRouteTests(unittest.TestCase):
     def setUp(self):
         self.server, self.auth = isolated_server()
@@ -102,6 +132,18 @@ class ReadinessRouteTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(original, {"heartbeat_epoch": None, "age_seconds": None,
                                     "fresh": False})
+
+    def test_microcap_panel_script_requires_auth_and_serves_javascript(self):
+        status, _, _ = request_raw(self.server.app, "/microcap-research-panel.js")
+        self.assertEqual(status, 401)
+        self.server.app.dependency_overrides[self.auth] = lambda: "authorized"
+        status, body, content_type = request_raw(
+            self.server.app, "/microcap-research-panel.js", auth=True
+        )
+        self.assertEqual(status, 200)
+        self.assertIn("application/javascript", content_type)
+        self.assertIn("renderMicrocapResearch", body)
+        self.assertIn("loadMicrocapResearch", body)
 
     def test_query_parameter_cannot_choose_snapshot_path(self):
         self.server.app.dependency_overrides[self.auth] = lambda: "authorized"

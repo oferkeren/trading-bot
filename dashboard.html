@@ -1454,6 +1454,68 @@ button:disabled {
 </section>
 
 
+
+<section id="microcapResearchSection">
+
+<div class="section-title">
+
+    <h2>
+        Micro-cap Research · NO TRADE
+    </h2>
+
+    <div
+        class="pill warn"
+        id="microcapDecision"
+    >
+        NO TRADE
+    </div>
+
+</div>
+
+<div class="grid metrics">
+
+    <div class="card">
+        <div class="card-title">Status</div>
+        <div
+            class="pill warn"
+            id="microcapStatus"
+        >
+            UNAVAILABLE
+        </div>
+        <div class="metric-sub">Generated <span id="microcapGeneratedAt">-</span></div>
+        <div class="metric-sub">Age <span id="microcapAge">-</span></div>
+    </div>
+
+    <div class="card">
+        <div class="card-title">Sample</div>
+        <div class="status-value" id="microcapSampleSymbol">-</div>
+        <div class="metric-sub">Date <span id="microcapSampleDate">-</span></div>
+    </div>
+
+    <div class="card">
+        <div class="card-title">Roster / News</div>
+        <div class="metric-sub">Roster <span id="microcapRosterStatus">-</span></div>
+        <div class="metric-sub" id="microcapRosterCounts">active - / inactive -</div>
+        <div class="metric-sub">News <span id="microcapNewsStatus">-</span> · <span id="microcapNewsCount">-</span> articles</div>
+    </div>
+
+    <div class="card">
+        <div class="card-title">Evidence Gates</div>
+        <div class="metric-sub">IBKR minute cells <span id="microcapIbkrMinuteCells">-</span></div>
+        <div class="metric-sub">IBKR quote cells <span id="microcapIbkrQuoteCells">-</span></div>
+        <div class="metric-sub">SEC <span id="microcapSecStatus">-</span></div>
+        <div class="metric-sub">Shares / cap <span id="microcapSharesStatus">-</span></div>
+    </div>
+
+</div>
+
+<div class="card">
+    <div class="card-title">Blocking reasons</div>
+    <div id="microcapBlockers">-</div>
+</div>
+
+</section>
+
 <section>
 
 <div class="section-title">
@@ -1797,6 +1859,8 @@ button:disabled {
 </div>
 
 
+<script src="/microcap-research-panel.js"></script>
+
 <script>
 
 const $ =
@@ -1808,6 +1872,24 @@ const $ =
 
 let requestedKillState =
     null;
+
+
+function refreshMicrocapResearch() {
+    if (
+        typeof window.loadMicrocapResearch
+        !==
+        "function"
+    ) {
+        return;
+    }
+
+    window.loadMicrocapResearch(
+        fetch,
+        id => document.getElementById(
+            id
+        )
+    );
+}
 
 
 function escapeHtml(
@@ -3775,11 +3857,17 @@ document
 
 
 refresh();
+refreshMicrocapResearch();
 
 
 setInterval(
     refresh,
     3000
+);
+
+setInterval(
+    refreshMicrocapResearch,
+    60000
 );
 
 </script>

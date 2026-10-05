@@ -4,8 +4,10 @@ import subprocess
 import time
 
 from datetime import datetime, timezone
+from pathlib import Path
 
 from fastapi import Depends
+from fastapi.responses import FileResponse
 
 from microcap_readiness_store import read_readiness
 from signal_server_core import *
@@ -1555,6 +1557,14 @@ def read_runtime_components():
         })
 
     return result
+
+
+@app.get("/microcap-research-panel.js")
+def microcap_research_panel_script(user=Depends(dashboard_auth)):
+    return FileResponse(
+        Path(__file__).with_name("microcap_research_panel.js"),
+        media_type="application/javascript",
+    )
 
 
 @app.get("/microcap-research-status")

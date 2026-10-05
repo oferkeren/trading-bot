@@ -882,3 +882,18 @@ Fetch calls `SecReader.fetch` once: at most one `https://data.sec.gov/submission
 Only the bounded `observe_shares` result enters the report (`market_cap_gate`): accession, SEC acceptance instant, filing/report dates, observed share count where safe, and explicit blockers. Acceptance must be no later than `--decision-at`; a company-facts `filed` *date* alone is not evidence of intraday availability. Only matched supported 10-K, 10-Q and 8-K filings can yield observed counts; amendments, unsupported forms, mismatched issuer/CIK, invalid dates/facts, ambiguous classes, future acceptance and truncated accession coverage block or suppress counts. Even a reported count does **not** establish completeness across share classes or independently verify the source, raw historical price, corporate actions, or decision-time market cap. `MARKET_CAP_UNVERIFIED` and `CLASS_COVERAGE_UNVERIFIED` remain; no orders, scanner, market-cap pass, calibrated model or target probabilities are produced. The decision is always `NO_TRADE`, `order_approval` and `model_calibrated` false, and `target_probabilities` `"unavailable"`.
 
 Exit 0 means a valid **no-trade** JSON report on stdout (and optionally at the external output path); invalid input exits 2, provider 403/timeout exits 3 with `SEC_ACCESS_UNAVAILABLE`, and 429 exits 3 with `SEC_RATE_LIMITED`. Errors have sanitized JSON on stderr and no success stdout. SEC live access has **not been verified by this offline implementation/test run**; if a real provider request fails, record access as unavailable, **not** as evidence that there are no filings. Do not infer actual filing absence from an empty or inaccessible response.
+
+## Micro-cap Research Readiness Panel
+
+Publish the research-only readiness snapshot from external evidence, never from the dashboard UI:
+
+```bash
+/home/oferke/trading-bot/venv/bin/python microcap_readiness.py \
+  --source-report /external/source.json \
+  --output /external/readiness.json \
+  [--sec-report /external/sec.json]
+```
+
+Configure the signal server with `MICROCAP_READINESS_PATH=/external/readiness.json` using an absolute path outside the repository. The server treats snapshots older than seven days as `STALE`; missing, invalid, forged, or unreadable snapshots render as `UNAVAILABLE`.
+
+The dashboard panel appears above Hot Pool as **Micro-cap Research · NO TRADE**. It is read-only, always displays `NO TRADE`, and makes no provider, broker, SEC, or research-data calls from the browser.
