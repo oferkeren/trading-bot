@@ -2,6 +2,7 @@ import contextlib
 import copy
 import io
 import json
+import subprocess
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -16,6 +17,15 @@ from test_microcap_source_probe import base_report, news, roster
 
 
 NOW = datetime(2026, 10, 5, 12, 19, 14, tzinfo=timezone.utc)
+
+
+def _main_checkout() -> Path:
+    here = Path(__file__).resolve().parent
+    common_dir = subprocess.run(
+        ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+        cwd=here, check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    return Path(common_dir).parent.resolve()
 
 
 def source_report(issuer_id="issuer-1"):
@@ -350,7 +360,7 @@ class PublishReadinessTests(unittest.TestCase):
                          ["source.json", "status.json"])
 
     def test_publish_rejects_paths_in_main_checkout(self):
-        main_checkout = Path(__file__).resolve().parents[2]
+        main_checkout = _main_checkout()
         with tempfile.TemporaryDirectory(dir=main_checkout) as checkout_temp:
             inside = Path(checkout_temp)
             source = inside / "source.json"
@@ -363,7 +373,7 @@ class PublishReadinessTests(unittest.TestCase):
                 publish_readiness(self.report_path, destination)
 
     def test_publish_rejects_symlinks_into_main_checkout_and_worktree(self):
-        roots = (Path(__file__).resolve().parents[2], Path(__file__).resolve().parent)
+        roots = (_main_checkout(), Path(__file__).resolve().parent)
         for root in roots:
             with self.subTest(root=root), tempfile.TemporaryDirectory(dir=root) as inside_temp, \
                     tempfile.TemporaryDirectory() as outside_temp:
