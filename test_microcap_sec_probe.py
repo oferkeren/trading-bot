@@ -175,6 +175,25 @@ class SecProbeTests(unittest.TestCase):
         self.assertEqual((code, stdout), (2, ""))
         self.assertEqual(json.loads(stderr)["error"], "INPUT_INVALID")
 
+    def test_offline_deeply_nested_json_is_input_error_without_traceback(self):
+        self.facts.write_text("[" * 100_000 + "]" * 100_000)
+        code, stdout, stderr = self.run_cli(
+            "--submissions", str(self.submissions), "--companyfacts", str(self.facts))
+        self.assertEqual((code, stdout), (2, ""))
+        self.assertEqual(json.loads(stderr), {"error": "INPUT_INVALID"})
+
+    def test_fetch_deeply_nested_response_is_provider_error_without_traceback(self):
+        body = b"[" * 100_000 + b"]" * 100_000
+        with patch.dict(os.environ, {"SEC_USER_AGENT": "Private contact@example.org"}):
+            with patch("microcap_sec_reader.urlopen", side_effect=lambda request, timeout:
+                       Response(request.full_url, body)) as request:
+                code, stdout, stderr = self.run_cli(
+                    "--fetch", "--output", str(self.directory / "out.json"))
+        self.assertEqual((code, stdout), (3, ""))
+        self.assertEqual(json.loads(stderr), {"error": "SEC_RESPONSE_INVALID"})
+        self.assertEqual(request.call_count, 1)
+        self.assertFalse((self.directory / "out.json").exists())
+
     def test_output_replace_is_atomic_and_cleans_temp_on_error(self):
         output = self.directory / "report.json"
         output.write_text("previous")

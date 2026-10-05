@@ -88,7 +88,7 @@ def _load(path: Path) -> dict:
         if len(payload) > _MAX_SAVED_BYTES:
             raise CoverageError("INPUT_INVALID")
         document = json.loads(payload, parse_constant=_reject_constant)
-    except (OSError, ValueError, UnicodeDecodeError):
+    except (OSError, ValueError, UnicodeDecodeError, RecursionError):
         raise CoverageError("INPUT_INVALID") from None
     if not isinstance(document, dict):
         raise CoverageError("INPUT_INVALID")
