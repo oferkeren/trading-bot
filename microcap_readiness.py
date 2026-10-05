@@ -728,8 +728,8 @@ def main(argv: list[str] | None = None) -> int:
                                              "(only with --source-report)")
     try:
         args = parser.parse_args(argv)
-        if args.batch_report:
-            if args.sec_report:
+        if args.batch_report is not None:
+            if args.sec_report is not None:
                 raise _invalid()
             result = publish_batch_readiness(Path(args.batch_report), Path(args.output))
         else:

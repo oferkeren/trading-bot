@@ -483,6 +483,9 @@ class PublishBatchReadinessTests(unittest.TestCase):
             ["--batch-report", str(self.batch_path), "--sec-report", str(self.batch_path),
              "--output", str(self.status_path)],
             ["--output", str(self.status_path)],
+            ["--batch-report", "", "--output", str(self.status_path)],
+            ["--batch-report", "", "--sec-report", str(self.batch_path),
+             "--output", str(self.status_path)],
         ):
             with self.subTest(argv=argv):
                 code, out, err = self.cli(argv)
