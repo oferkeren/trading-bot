@@ -26,6 +26,7 @@ _RFC3339_FRACTION = re.compile(r"^(.*T\d{2}:\d{2}:\d{2})\.(\d+)(.*)$")
 _BAR_FIELDS = ("o", "h", "l", "c", "v", "t")
 _NEWS_FIELDS = ("id", "created_at", "headline", "source", "symbols", "summary")
 _MARKET_TZ = ZoneInfo("America/New_York")
+_MAX_NEWS_PAGES = 10
 
 
 class CoverageError(RuntimeError):
@@ -243,9 +244,18 @@ class AlpacaHistory:
         return [self._validate_quote(raw, start_utc, end_utc, feed, fetched_at) for raw in raw_records]
 
     def fetch_news(
-        self, symbols: Sequence[str], start: str, end: str
+        self, symbols: Sequence[str], start: str, end: str, *, max_pages: int | None = None
     ) -> list[NewsRecord]:
-        """Fetch validated news articles, deduplicated by article ID."""
+        """Fetch validated news articles, rejecting conflicting records with the same ID.
+
+        With ``max_pages``, a page token remaining at the cap fails closed (no partial result).
+        """
+        if max_pages is not None and (
+            isinstance(max_pages, bool)
+            or not isinstance(max_pages, int)
+            or not 1 <= max_pages <= _MAX_NEWS_PAGES
+        ):
+            raise CoverageError(f"PARAMS_INVALID: max_pages must be within 1..{_MAX_NEWS_PAGES}")
         start_utc, end_utc = _period(start, end)
         symbol_query = _symbols_query(symbols)
         params: dict[str, str | int] = {
@@ -254,15 +264,18 @@ class AlpacaHistory:
             "end": _query_end(end_utc),
             "limit": 50,
         }
-        raw_records = self._pages(_NEWS_ENDPOINT, params, "news")
+        raw_records = self._pages(_NEWS_ENDPOINT, params, "news", max_pages=max_pages)
         fetched_at = _format_utc(datetime.now(timezone.utc))
         records: list[NewsRecord] = []
-        seen_ids: set[str | int] = set()
+        seen: dict[str | int, NewsRecord] = {}
         for raw in raw_records:
             record = self._validate_news(raw, start_utc, end_utc, fetched_at)
-            if record["id"] in seen_ids:
+            prior = seen.get(record["id"])
+            if prior is not None:
+                if prior != record:
+                    raise CoverageError("NEWS_DUPLICATE_CONFLICT: same ID has conflicting evidence")
                 continue
-            seen_ids.add(record["id"])
+            seen[record["id"]] = record
             records.append(record)
         return records
 
@@ -347,11 +360,12 @@ class AlpacaHistory:
 
     def _pages(
         self, endpoint: str, params: Mapping[str, str | int], collection: str,
-        *, symbols: Sequence[str] | None = None,
+        *, symbols: Sequence[str] | None = None, max_pages: int | None = None,
     ) -> list[Mapping[str, object]]:
         records: list[Mapping[str, object]] = []
         next_token: str | None = None
         seen_tokens: set[str] = set()
+        pages_read = 0
         while True:
             query = dict(params)
             if next_token is not None:
@@ -365,6 +379,7 @@ class AlpacaHistory:
                 },
             )
             payload = self._open_json(request, endpoint)
+            pages_read += 1
             if not isinstance(payload, dict):
                 raise CoverageError(f"RESPONSE_INVALID: {urlsplit(endpoint).path} returned a non-object")
             page = payload.get(collection)
@@ -397,6 +412,10 @@ class AlpacaHistory:
                 return records
             if not isinstance(token, str):
                 raise CoverageError(f"PAGINATION_INVALID: {urlsplit(endpoint).path} token is not a string")
+            if max_pages is not None and pages_read >= max_pages:
+                raise CoverageError(
+                    f"PAGINATION_TRUNCATED: {urlsplit(endpoint).path} has pages beyond max_pages={max_pages}"
+                )
             if token in seen_tokens:
                 raise CoverageError(f"PAGINATION_REPEAT: repeated page token from {urlsplit(endpoint).path}")
             seen_tokens.add(token)

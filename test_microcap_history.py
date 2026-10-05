@@ -212,6 +212,60 @@ class AlpacaHistoryTests(unittest.TestCase):
         self.assertEqual(records[0]["request_end"], END)
         self.assertEqual(parse_utc(records[0]["fetched_at"]).tzinfo, timezone.utc)
 
+    def test_news_rejects_conflicting_duplicate_article_ids(self) -> None:
+        conflicting = {**article(), "headline": "Different headline"}
+        for pages in (
+            [{"news": [article(), conflicting]}],
+            [
+                {"news": [article()], "next_page_token": "next"},
+                {"news": [conflicting]},
+            ],
+        ):
+            with self.subTest(pages=len(pages)), patch.object(
+                microcap_history, "urlopen",
+                side_effect=[FakeResponse(page) for page in pages],
+            ):
+                with self.assertRaisesRegex(CoverageError, "NEWS_DUPLICATE_CONFLICT"):
+                    self.client().fetch_news(["ABCD"], START, END)
+
+    def test_news_max_pages_rejects_remaining_page_token(self) -> None:
+        pages = [
+            {"news": [article(1)], "next_page_token": "p2"},
+            {"news": [article(2)], "next_page_token": "p3"},
+        ]
+        for cap in (1, 2):
+            with self.subTest(cap=cap), patch.object(
+                microcap_history, "urlopen",
+                side_effect=[FakeResponse(page) for page in pages[:cap]],
+            ) as opened:
+                with self.assertRaisesRegex(CoverageError, "PAGINATION_TRUNCATED"):
+                    self.client().fetch_news(["ABCD"], START, END, max_pages=cap)
+                self.assertEqual(opened.call_count, cap)
+
+    def test_news_max_pages_accepts_exhausted_pagination(self) -> None:
+        pages = [{"news": [article(1)], "next_page_token": "p2"}, {"news": [article(2)]}]
+        with patch.object(microcap_history, "urlopen",
+                          side_effect=[FakeResponse(page) for page in pages]) as opened:
+            records = self.client().fetch_news(["ABCD"], START, END, max_pages=2)
+        self.assertEqual([record["id"] for record in records], [1, 2])
+        self.assertEqual(opened.call_count, 2)
+
+    def test_news_max_pages_rejects_invalid_cap_before_request(self) -> None:
+        for cap in (0, 11, True, 1.5, "2"):
+            with self.subTest(cap=cap), patch.object(
+                microcap_history, "urlopen", side_effect=AssertionError("HTTP forbidden")
+            ):
+                with self.assertRaisesRegex(CoverageError, "PARAMS_INVALID"):
+                    self.client().fetch_news(["ABCD"], START, END, max_pages=cap)
+
+    def test_news_default_pagination_remains_unbounded(self) -> None:
+        pages = [{"news": [article(i)], "next_page_token": f"p{i}"} for i in range(1, 12)]
+        pages.append({"news": [article(12)]})
+        with patch.object(microcap_history, "urlopen",
+                          side_effect=[FakeResponse(page) for page in pages]):
+            records = self.client().fetch_news(["ABCD"], START, END)
+        self.assertEqual(len(records), 12)
+
     def test_empty_news_does_not_establish_historical_news_coverage(self) -> None:
         with self.assertRaisesRegex(CoverageError, "NEWS_COVERAGE"):
             AlpacaHistory.require_coverage(
