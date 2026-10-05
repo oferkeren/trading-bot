@@ -23,6 +23,32 @@ def source_report():
                            cap_evidence=None)
 
 
+def sec_report():
+    return {
+        "decision": "NO_TRADE",
+        "order_approval": False,
+        "model_calibrated": False,
+        "target_probabilities": "unavailable",
+        "market_cap_gate": {
+            "status": "MARKET_CAP_UNVERIFIED",
+            "source_verified": False,
+            "coverage": "UNVERIFIED",
+            "coverage_truncated": False,
+            "cik": "0000000001",
+            "decision_at": "2025-05-28T12:00:00Z",
+            "observations": [{
+                "accession": "0000000001-26-000001",
+                "accepted_at": "2025-05-28T11:00:00Z",
+                "report_date": "2025-05-27",
+                "fetched_at": "2025-05-28T12:01:00Z",
+                "filing_class": "quarterly",
+                "shares_count": 123456,
+            }],
+            "blockers": ["CLASS_COVERAGE_UNVERIFIED"],
+        },
+    }
+
+
 class ProjectReadinessTests(unittest.TestCase):
     def test_projects_actual_extended_source_report_as_sanitized_no_trade_snapshot(self):
         result = project_readiness(source_report(), now=NOW)
@@ -36,7 +62,12 @@ class ProjectReadinessTests(unittest.TestCase):
         self.assertEqual(result["sample"], {
             "issuer_id": "issuer-1", "symbol": "SORA", "date": "2025-05-28",
         })
-        self.assertEqual(result["sources"]["roster"]["status"], "MISSING")
+        self.assertEqual(result["sample_window"], {
+            "start_utc": "2025-05-28T00:00:00Z",
+            "end_utc": "2025-05-29T00:00:00Z",
+        })
+        self.assertEqual(result["sources"]["roster"]["status"], "UNVERIFIED")
+        self.assertEqual(result["sources"]["roster"]["evidence_status"], "MISSING")
         self.assertIsNone(result["sources"]["roster"]["active_count"])
         self.assertEqual(result["sources"]["news"]["status"], "MISSING")
         self.assertIsNone(result["sources"]["news"]["article_count"])
@@ -47,6 +78,16 @@ class ProjectReadinessTests(unittest.TestCase):
         self.assertEqual(result["blockers"], sorted(set(result["blockers"])))
         self.assertIn("ROSTER_COVERAGE_UNVERIFIED", result["blockers"])
         self.assertIn("MARKET_CAP_UNVERIFIED", result["blockers"])
+
+    def test_self_declared_verified_base_roster_stays_unverified_with_blockers(self):
+        report = source_report()
+        self.assertEqual(report["roster_status"]["status"], "verified")
+
+        result = project_readiness(report, now=NOW)
+
+        self.assertEqual(result["sources"]["roster"]["status"], "UNVERIFIED")
+        self.assertEqual(result["sources"]["roster"]["evidence_status"], "MISSING")
+        self.assertIn("ROSTER_COVERAGE_UNVERIFIED", result["blockers"])
 
     def test_untrusted_article_price_url_and_credential_text_never_enter_snapshot(self):
         report = source_report()
@@ -78,7 +119,8 @@ class ProjectReadinessTests(unittest.TestCase):
         result = project_readiness(report, now=NOW)
 
         self.assertEqual(result["sources"]["roster"], {
-            "status": "DATED_ROSTER_OBSERVED", "active_count": 1, "inactive_count": 0,
+            "status": "UNVERIFIED", "evidence_status": "DATED_ROSTER_OBSERVED",
+            "active_count": 1, "inactive_count": 0,
         })
         self.assertEqual(result["sources"]["news"], {
             "status": "ARTICLES_OBSERVED", "article_count": 1,
@@ -153,35 +195,61 @@ class ProjectReadinessTests(unittest.TestCase):
             with self.assertRaises(CoverageError):
                 project_readiness(report, now=NOW)
 
+    def test_duplicate_matrix_key_is_rejected_even_when_observation_count_matches(self):
+        report = source_report()
+        report["matrix"].append(copy.deepcopy(report["matrix"][0]))
+        report["counts"]["observations"] = 2
+
+        with self.assertRaises(CoverageError):
+            project_readiness(report, now=NOW)
+
+    def test_missing_fraction_must_match_channel_coverage_in_matrix(self):
+        for channel in ("bars", "quotes", "news"):
+            report = source_report()
+            current = report["missing_fractions"][channel]
+            report["missing_fractions"][channel] = (
+                current - 0.25 if current >= 0.25 else current + 0.25
+            )
+            with self.subTest(channel=channel), self.assertRaises(CoverageError):
+                project_readiness(report, now=NOW)
+
     def test_sec_pilot_adds_only_unverified_observation_summary_and_blockers(self):
-        sec = {
-            "decision": "NO_TRADE",
-            "order_approval": False,
-            "model_calibrated": False,
-            "target_probabilities": "unavailable",
-            "market_cap_gate": {
-                "status": "MARKET_CAP_UNVERIFIED",
-                "source_verified": False,
-                "coverage": "UNVERIFIED",
-                "coverage_truncated": False,
-                "cik": "0000000001",
-                "decision_at": "2026-10-05T12:00:00Z",
-                "observations": [{
-                    "accession": "0000000001-26-000001",
-                    "accepted_at": "2026-10-01T15:00:00Z",
-                    "report_date": "2026-09-30",
-                    "fetched_at": "2026-10-05T12:01:00Z",
-                    "filing_class": "quarterly",
-                    "shares_count": 123456,
-                }],
-                "blockers": ["CLASS_COVERAGE_UNVERIFIED"],
-            },
-        }
+        sec = sec_report()
         result = project_readiness(source_report(), sec, now=NOW)
         self.assertEqual(result["sources"]["shares"]["status"], "MARKET_CAP_UNVERIFIED")
         self.assertEqual(result["sources"]["shares"]["sec_observation_count"], 1)
+        self.assertEqual(result["sources"]["sec"], {
+            "status": "OBSERVED", "observation_count": 1,
+            "verification": "UNVERIFIED",
+        })
         self.assertIn("CLASS_COVERAGE_UNVERIFIED", result["blockers"])
         self.assertNotIn("shares_count", json.dumps(result))
+
+    def test_sec_status_distinguishes_missing_and_unavailable_evidence(self):
+        report = source_report()
+        missing = project_readiness(report, now=NOW)
+        unavailable_sec = sec_report()
+        unavailable_sec["market_cap_gate"]["observations"] = []
+        unavailable = project_readiness(report, unavailable_sec, now=NOW)
+
+        self.assertEqual(missing["sources"]["sec"]["status"], "MISSING")
+        self.assertEqual(unavailable["sources"]["sec"]["status"], "UNAVAILABLE")
+
+    def test_sec_decision_time_and_cik_must_match_declared_sample(self):
+        outside_window = sec_report()
+        outside_window["market_cap_gate"]["decision_at"] = "2025-05-29T00:00:00Z"
+        wrong_cik = sec_report()
+        wrong_cik["market_cap_gate"]["cik"] = "0000000002"
+
+        for sec in (outside_window, wrong_cik):
+            with self.subTest(sec=sec), self.assertRaises(CoverageError):
+                project_readiness(source_report(), sec, now=NOW)
+
+        numeric_cik_sample = source_report()
+        numeric_cik_sample["sample_manifest"]["issuer_ids"] = ["0000000002"]
+        numeric_cik_sample["matrix"][0]["issuer_id"] = "0000000002"
+        with self.assertRaises(CoverageError):
+            project_readiness(numeric_cik_sample, sec_report(), now=NOW)
 
     def test_sec_cannot_claim_verified_or_approve_trading(self):
         sec = {
@@ -218,6 +286,42 @@ class PublishReadinessTests(unittest.TestCase):
         self.assertEqual(result["decision"], "NO_TRADE")
         self.assertEqual(sorted(path.name for path in self.directory.iterdir()),
                          ["source.json", "status.json"])
+
+    def test_publish_rejects_paths_in_main_checkout(self):
+        main_checkout = Path(__file__).resolve().parents[2]
+        with tempfile.TemporaryDirectory(dir=main_checkout) as checkout_temp:
+            inside = Path(checkout_temp)
+            source = inside / "source.json"
+            destination = inside / "status.json"
+            source.write_text(json.dumps(source_report()), encoding="utf-8")
+
+            with self.assertRaises(CoverageError):
+                publish_readiness(source, self.status_path)
+            with self.assertRaises(CoverageError):
+                publish_readiness(self.report_path, destination)
+
+    def test_publish_rejects_symlinks_into_main_checkout_and_worktree(self):
+        roots = (Path(__file__).resolve().parents[2], Path(__file__).resolve().parent)
+        for root in roots:
+            with self.subTest(root=root), tempfile.TemporaryDirectory(dir=root) as inside_temp, \
+                    tempfile.TemporaryDirectory() as outside_temp:
+                inside = Path(inside_temp)
+                outside = Path(outside_temp)
+                source_target = inside / "source.json"
+                output_target = inside / "output.json"
+                source_target.write_text(json.dumps(source_report()), encoding="utf-8")
+                output_target.write_text("previous", encoding="utf-8")
+                source_link = outside / "source-link.json"
+                output_link = outside / "output-link.json"
+                source_link.symlink_to(source_target)
+                output_link.symlink_to(output_target)
+
+                with self.assertRaises(CoverageError):
+                    publish_readiness(source_link, self.status_path)
+                with self.assertRaises(CoverageError):
+                    publish_readiness(self.report_path, output_link)
+
+                self.assertEqual(output_target.read_text(encoding="utf-8"), "previous")
 
     def test_oversized_input_exits_two_without_echoing_input(self):
         self.report_path.write_text(" " * (2 * 1024 * 1024 + 1), encoding="utf-8")

@@ -120,6 +120,32 @@ def _validate_window(report: Mapping, day: str) -> None:
         raise _invalid()
 
 
+def _repository_roots() -> tuple[Path, ...]:
+    git_entry = _REPOSITORY / ".git"
+    if git_entry.is_dir():
+        return (_REPOSITORY,)
+    try:
+        pointer = git_entry.read_text(encoding="utf-8").strip()
+        match = re.fullmatch(r"gitdir:\s*(.+)", pointer)
+        if not match:
+            raise _invalid()
+        git_dir = Path(match.group(1))
+        if not git_dir.is_absolute():
+            git_dir = _REPOSITORY / git_dir
+        git_dir = git_dir.resolve(strict=True)
+        common_entry = git_dir / "commondir"
+        if common_entry.is_file():
+            common_dir = Path(common_entry.read_text(encoding="utf-8").strip())
+            if not common_dir.is_absolute():
+                common_dir = git_dir / common_dir
+            common_dir = common_dir.resolve(strict=True)
+        else:
+            common_dir = git_dir
+        return (_REPOSITORY, common_dir.parent.resolve(strict=True))
+    except (OSError, UnicodeError, RuntimeError, ValueError):
+        raise _invalid() from None
+
+
 def _validate_count_map(value: object, keys: tuple[str, ...]) -> dict[str, int]:
     if not isinstance(value, Mapping):
         raise _invalid()
@@ -232,7 +258,9 @@ def _validate_market_cap(value: object) -> None:
         raise _invalid()
 
 
-def _validate_source(report: Mapping) -> tuple[str, str, str, str, int, int, list[str]]:
+def _validate_source(
+    report: Mapping,
+) -> tuple[str, str, str, str, int, int, list[str], str, str]:
     required = (
         "schema_version", "decision", "coverage_status", "reasons", "order_approval",
         "model_calibrated", "target_probabilities", "sample_manifest", "roster_status",
@@ -285,10 +313,13 @@ def _validate_source(report: Mapping) -> tuple[str, str, str, str, int, int, lis
     matrix = report["matrix"]
     if not isinstance(matrix, list) or len(matrix) > _MAX_MATRIX_ROWS:
         raise _invalid()
-    sessions, providers = set(), set()
+    sessions, providers, row_keys = set(), set(), set()
     minute_cells: set[tuple[str, str]] = set()
     quote_cells: set[tuple[str, str]] = set()
     interval_cells = {"1 min": set(), "1 hour": set(), "1 day": set()}
+    denominators = {"bars": 0, "quotes": 0, "news": 0}
+    missing = {"bars": 0, "quotes": 0, "news": 0}
+    ibkr_channel_cells = {"bars": set(), "quotes": set()}
     blockers = set(reasons) | {"ROSTER_COVERAGE_UNVERIFIED", "MARKET_CAP_UNVERIFIED"}
     blockers.update(_reason_list(report["massive_roster"].get("blocking_reasons", [])))
     blockers.update(_reason_list(report["alpaca_news"].get("blocking_reasons", [])))
@@ -300,6 +331,10 @@ def _validate_source(report: Mapping) -> tuple[str, str, str, str, int, int, lis
         if (not isinstance(session, str) or session not in _SESSIONS
                 or not isinstance(provider, str) or provider not in _PROVIDERS):
             raise _invalid()
+        row_key = (row["issuer_id"], row["date"], session, provider)
+        if row_key in row_keys:
+            raise _invalid()
+        row_keys.add(row_key)
         sessions.add(session)
         providers.add(provider)
         if "symbol" in row and row["symbol"] != symbol:
@@ -314,16 +349,41 @@ def _validate_source(report: Mapping) -> tuple[str, str, str, str, int, int, lis
         row_blockers = _reason_list(row.get("blocking_reasons"))
         blockers.update(row_blockers)
 
+        channel_values = {}
         bars_status, bars_reasons, bars_errors = _validate_channel(
             row.get("bars"), channel="bars")
         quotes_status, quotes_reasons, quotes_errors = _validate_channel(
             row.get("quotes"), channel="quotes")
-        _, news_reasons, news_errors = _validate_channel(
+        news_status, news_reasons, news_errors = _validate_channel(
             row.get("news"), channel="news")
+        channel_values.update({
+            "bars": (bars_status, bars_reasons, bars_errors),
+            "quotes": (quotes_status, quotes_reasons, quotes_errors),
+            "news": (news_status, news_reasons, news_errors),
+        })
         blockers.update(
             bars_reasons + bars_errors + quotes_reasons + quotes_errors
             + news_reasons + news_errors
         )
+        for channel, (status, channel_reasons, errors) in channel_values.items():
+            if status == "not_applicable":
+                continue
+            denominators[channel] += 1
+            channel_missing = (
+                status not in ("observed", "NEWS_ARTICLES_OBSERVED")
+                or bool(channel_reasons) or bool(errors)
+            )
+            if channel == "bars":
+                intervals = row["bars"].get("intervals")
+                if provider == "ibkr":
+                    ibkr_channel_cells["bars"].add((issuers[0], dates[0]))
+                if (intervals is None
+                        or _validate_count_map(intervals, ("1 min", "1 hour"))["1 min"] == 0):
+                    channel_missing = True
+            elif channel == "quotes" and provider == "ibkr":
+                ibkr_channel_cells["quotes"].add((issuers[0], dates[0]))
+            if channel_missing:
+                missing[channel] += 1
         if bars_status != "not_applicable":
             intervals = _validate_count_map(row["bars"].get("intervals"),
                                             ("1 min", "1 hour")) \
@@ -373,6 +433,13 @@ def _validate_source(report: Mapping) -> tuple[str, str, str, str, int, int, lis
         if (isinstance(value, bool) or not isinstance(value, (int, float))
                 or not math.isfinite(value) or not 0 <= value <= 1):
             raise _invalid()
+        if channel in ("bars", "quotes") and (issuers[0], dates[0]) not in \
+                ibkr_channel_cells[channel]:
+            denominators[channel] += 1
+            missing[channel] += 1
+        expected = missing[channel] / denominators[channel] if denominators[channel] else 1.0
+        if not math.isclose(value, expected):
+            raise _invalid()
     interval_summary = report["bar_interval_coverage"]
     if not isinstance(interval_summary, Mapping):
         raise _invalid()
@@ -396,11 +463,15 @@ def _validate_source(report: Mapping) -> tuple[str, str, str, str, int, int, lis
             or daily_summary.get("decision_time_verified") is not False
             or daily_summary.get("intraday_gate_eligible") is not False):
         raise _invalid()
+    window = report["request_window"]
     return (issuers[0], symbol, dates[0], roster["status"],
-            len(minute_cells), len(quote_cells), sorted(blockers))
+            len(minute_cells), len(quote_cells), sorted(blockers),
+            window["start_utc"], window["end_utc"])
 
 
-def _validate_sec(sec: Mapping) -> tuple[int, list[str]]:
+def _validate_sec(
+    sec: Mapping, *, issuer: str, start: str, end: str
+) -> tuple[int, list[str]]:
     if (sec.get("decision") != "NO_TRADE" or sec.get("order_approval") is not False
             or sec.get("model_calibrated") is not False
             or sec.get("target_probabilities") != "unavailable"):
@@ -418,7 +489,15 @@ def _validate_sec(sec: Mapping) -> tuple[int, list[str]]:
         raise _invalid()
     decision_at = gate.get("decision_at")
     if decision_at is not None:
-        _utc_timestamp(decision_at)
+        decision = _utc_timestamp(decision_at)
+        if not _utc_timestamp(start) <= decision < _utc_timestamp(end):
+            raise _invalid()
+    elif gate.get("observations"):
+        raise _invalid()
+    sample_cik = issuer.zfill(10) if issuer.isdigit() else None
+    gate_cik = cik.zfill(10) if cik is not None else None
+    if sample_cik is not None and gate_cik is not None and sample_cik != gate_cik:
+        raise _invalid()
     observations = gate.get("observations")
     if not isinstance(observations, list) or len(observations) > 2:
         raise _invalid()
@@ -429,8 +508,14 @@ def _validate_sec(sec: Mapping) -> tuple[int, list[str]]:
         if (not isinstance(accession, str)
                 or not re.fullmatch(r"[0-9]{10}-[0-9]{2}-[0-9]{6}", accession)):
             raise _invalid()
-        _utc_timestamp(observation.get("accepted_at"))
+        accession_cik = accession[:10]
+        if ((gate_cik is not None and accession_cik != gate_cik)
+                or (sample_cik is not None and accession_cik != sample_cik)):
+            raise _invalid()
+        accepted_at = _utc_timestamp(observation.get("accepted_at"))
         _utc_timestamp(observation.get("fetched_at"))
+        if decision_at is not None and accepted_at > decision:
+            raise _invalid()
         report_date = observation.get("report_date")
         if not isinstance(report_date, str):
             raise _invalid()
@@ -456,13 +541,18 @@ def project_readiness(
             or now.utcoffset() is None):
         raise _invalid()
     instant = now.astimezone(timezone.utc)
-    issuer, symbol, day, roster_status, minute_cells, quote_cells, blockers = \
+    (issuer, symbol, day, roster_status, minute_cells, quote_cells, blockers,
+     window_start, window_end) = \
         _validate_source(report)
     sec_count = 0
+    sec_status = "MISSING"
     if sec is not None:
         if not isinstance(sec, Mapping):
             raise _invalid()
-        sec_count, sec_blockers = _validate_sec(sec)
+        sec_count, sec_blockers = _validate_sec(
+            sec, issuer=issuer, start=window_start, end=window_end,
+        )
+        sec_status = "OBSERVED" if sec_count else "UNAVAILABLE"
         blockers = sorted(set(blockers) | set(sec_blockers))
         if sec["market_cap_gate"]["coverage_truncated"]:
             blockers = sorted(set(blockers) | {"SEC_COVERAGE_TRUNCATED"})
@@ -474,9 +564,11 @@ def project_readiness(
         "model_calibrated": False,
         "target_probabilities": "unavailable",
         "sample": {"issuer_id": issuer, "symbol": symbol, "date": day},
+        "sample_window": {"start_utc": window_start, "end_utc": window_end},
         "sources": {
             "roster": {
-                "status": roster_status,
+                "status": "UNVERIFIED",
+                "evidence_status": roster_status,
                 "active_count": report["massive_roster"]["active_count"],
                 "inactive_count": report["massive_roster"]["inactive_count"],
             },
@@ -488,6 +580,11 @@ def project_readiness(
             "shares": {
                 "status": "MARKET_CAP_UNVERIFIED",
                 "sec_observation_count": sec_count,
+            },
+            "sec": {
+                "status": sec_status,
+                "observation_count": sec_count,
+                "verification": "UNVERIFIED",
             },
         },
         "blockers": blockers,
@@ -518,7 +615,7 @@ def _external(value: Path, *, existing: bool) -> Path:
         raise _invalid()
     try:
         resolved = path.resolve(strict=existing)
-        if resolved.is_relative_to(_REPOSITORY):
+        if any(resolved.is_relative_to(root) for root in _repository_roots()):
             raise _invalid()
         if existing and not resolved.is_file():
             raise _invalid()
