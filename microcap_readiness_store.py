@@ -8,6 +8,7 @@ import stat
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
+from microcap_batch_schema import validate_snapshot_v2
 from microcap_history import CoverageError
 from microcap_readiness import (
     _MAX_JSON_BYTES,
@@ -132,6 +133,13 @@ def _validate(value: object) -> datetime:
     return generated
 
 
+def _validate_any(value: object) -> datetime:
+    if type(value) is dict and type(value.get("schema_version")) is int \
+            and value["schema_version"] == 2:
+        return validate_snapshot_v2(value)
+    return _validate(value)
+
+
 def _load_validated(resolved: Path) -> dict[str, object]:
     expected = os.stat(resolved, follow_symlinks=False)
     if not stat.S_ISREG(expected.st_mode):
@@ -177,7 +185,7 @@ def read_readiness(path: str | None, *, now: datetime) -> dict[str, object]:
             raise ValueError()
         instant = now.astimezone(timezone.utc)
         generated_file = _load_validated(_external(Path(path), existing=True))
-        generated_at = _validate(generated_file)
+        generated_at = _validate_any(generated_file)
         age = instant - generated_at
         if age < timedelta(0):
             return _fallback("UNAVAILABLE")

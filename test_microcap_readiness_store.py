@@ -169,6 +169,21 @@ class ReadReadinessTests(unittest.TestCase):
         self.assertEqual(read_readiness(None, now=NOW)["blockers"],
                          ["READINESS_UNAVAILABLE"])
 
+    def test_schema_2_snapshot_is_current_and_forged_one_is_unavailable(self):
+        from microcap_batch_schema import project_batch_snapshot
+        from test_microcap_batch_schema import batch_report
+        value = project_batch_snapshot(batch_report(), now=NOW - timedelta(seconds=30))
+        result = configured_read(value)
+        self.assertEqual(result["status"], "CURRENT")
+        self.assertEqual(result["schema_version"], 2)
+        self.assertEqual(result["samples"], value["samples"])
+        forged = copy.deepcopy(value)
+        forged["order_approval"] = True
+        self.assertEqual(configured_read(forged)["status"], "UNAVAILABLE")
+        forged = copy.deepcopy(value)
+        forged["schema_version"] = 3
+        self.assertEqual(configured_read(forged)["status"], "UNAVAILABLE")
+
 
 if __name__ == "__main__":
     unittest.main()

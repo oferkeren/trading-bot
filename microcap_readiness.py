@@ -700,6 +700,19 @@ def publish_readiness(
     return result
 
 
+def publish_batch_readiness(batch_path: Path, status_path: Path) -> dict[str, object]:
+    """Validate an external batch report and atomically publish a schema 2 snapshot."""
+    from microcap_batch_schema import project_batch_snapshot
+
+    source = _external(batch_path, existing=True)
+    destination = _external(status_path, existing=False)
+    if destination == source:
+        raise _invalid()
+    result = project_batch_snapshot(_load(source), now=datetime.now(timezone.utc))
+    _save(destination, result)
+    return result
+
+
 class _Parser(argparse.ArgumentParser):
     def error(self, message: str) -> None:
         raise _invalid()
@@ -707,13 +720,21 @@ class _Parser(argparse.ArgumentParser):
 
 def main(argv: list[str] | None = None) -> int:
     parser = _Parser(description="Publish a sanitized, always-NO_TRADE micro-cap readiness snapshot")
-    parser.add_argument("--source-report", required=True, help="absolute external source report JSON")
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--source-report", help="absolute external source report JSON (schema 1)")
+    group.add_argument("--batch-report", help="absolute external batch report JSON (schema 2)")
     parser.add_argument("--output", required=True, help="absolute external readiness snapshot JSON")
-    parser.add_argument("--sec-report", help="optional absolute external SEC pilot JSON")
+    parser.add_argument("--sec-report", help="optional absolute external SEC pilot JSON "
+                                             "(only with --source-report)")
     try:
         args = parser.parse_args(argv)
-        result = publish_readiness(Path(args.source_report), Path(args.output),
-                                   Path(args.sec_report) if args.sec_report else None)
+        if args.batch_report:
+            if args.sec_report:
+                raise _invalid()
+            result = publish_batch_readiness(Path(args.batch_report), Path(args.output))
+        else:
+            result = publish_readiness(Path(args.source_report), Path(args.output),
+                                       Path(args.sec_report) if args.sec_report else None)
     except CoverageError:
         diagnostic = _error_output()
         if diagnostic is not None:

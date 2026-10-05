@@ -13,6 +13,7 @@ from microcap_history import CoverageError
 from microcap_coverage_probe import _roster_status, coverage_report
 from microcap_readiness import main, project_readiness, publish_readiness
 from microcap_source_probe import extend_coverage
+from test_microcap_batch_schema import batch_report as batch_report_fixture
 from test_microcap_source_probe import base_report, news, roster
 
 
@@ -446,6 +447,56 @@ class PublishReadinessTests(unittest.TestCase):
         self.assertEqual((exit_code, stdout.getvalue()), (2, ""))
         self.assertNotIn("INPUT_INVALID", stderr.getvalue())
         self.assertEqual(json.loads(stderr.getvalue()), {"failure": "INVALID_INPUT"})
+        self.assertFalse(self.status_path.exists())
+
+
+class PublishBatchReadinessTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.directory = Path(self.temp.name)
+        self.batch_path = self.directory / "batch-report.json"
+        self.status_path = self.directory / "status.json"
+        self.batch_path.write_text(json.dumps(batch_report_fixture()), encoding="utf-8")
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def cli(self, argv):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = main(argv)
+        return code, stdout.getvalue(), stderr.getvalue()
+
+    def test_cli_publishes_schema_2_snapshot(self):
+        code, out, err = self.cli(["--batch-report", str(self.batch_path),
+                                   "--output", str(self.status_path)])
+        self.assertEqual((code, err), (0, ""))
+        saved = json.loads(self.status_path.read_text(encoding="utf-8"))
+        self.assertEqual(saved, json.loads(out))
+        self.assertEqual(saved["schema_version"], 2)
+        self.assertEqual(saved["coverage"]["ibkr_minute"], {"observed": 1, "total": 1})
+
+    def test_source_and_batch_are_mutually_exclusive_and_sec_needs_source(self):
+        for argv in (
+            ["--batch-report", str(self.batch_path), "--source-report", str(self.batch_path),
+             "--output", str(self.status_path)],
+            ["--batch-report", str(self.batch_path), "--sec-report", str(self.batch_path),
+             "--output", str(self.status_path)],
+            ["--output", str(self.status_path)],
+        ):
+            with self.subTest(argv=argv):
+                code, out, err = self.cli(argv)
+                self.assertEqual((code, out), (2, ""))
+                self.assertEqual(json.loads(err), {"error": "INPUT_INVALID"})
+                self.assertFalse(self.status_path.exists())
+
+    def test_inconsistent_batch_report_is_refused(self):
+        value = batch_report_fixture()
+        value["coverage"]["sec_shares"]["observed"] = 0
+        self.batch_path.write_text(json.dumps(value), encoding="utf-8")
+        code, _, _ = self.cli(["--batch-report", str(self.batch_path),
+                               "--output", str(self.status_path)])
+        self.assertEqual(code, 2)
         self.assertFalse(self.status_path.exists())
 
 
