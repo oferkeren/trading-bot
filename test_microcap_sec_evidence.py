@@ -531,6 +531,91 @@ class ObserveSharesTests(unittest.TestCase):
             [item["accession"] for item in result["observations"]],
             accessions[:2],
         )
+        self.assertIs(result["coverage_truncated"], True)
+
+    def test_malformed_third_joined_metadata_suppresses_observed_counts(self):
+        accessions = [
+            "0000000123-25-000001",
+            "0000000123-25-000002",
+            "0000000123-25-000003",
+        ]
+        malformed_metadata = (
+            (
+                ["2025-05-15T16:30:00-04:00", "2025-05-14T16:30:00-04:00", "bad-time"],
+                ["2025-03-31"] * 3,
+                "ACCEPTANCE_TIME_INVALID",
+            ),
+            (
+                ["2025-05-15T16:30:00-04:00", "2025-05-14T16:30:00-04:00",
+                 "2025-05-13T16:30:00-04:00"],
+                ["2025-03-31", "2025-03-31", "bad-date"],
+                "REPORT_DATE_INVALID",
+            ),
+        )
+
+        for accepted_values, report_dates, blocker in malformed_metadata:
+            with self.subTest(blocker=blocker):
+                submissions, facts = documents()
+                recent = submissions["filings"]["recent"]
+                recent["accessionNumber"] = accessions
+                recent["acceptanceDateTime"] = accepted_values
+                recent["reportDate"] = report_dates
+                recent["form"] = ["10-Q"] * 3
+                shares = facts["facts"]["dei"]["EntityCommonStockSharesOutstanding"][
+                    "units"
+                ]["shares"]
+                shares.extend(
+                    {
+                        "accn": accession, "end": "2025-03-31",
+                        "val": 100_000_000, "filed": "2025-05-15",
+                    }
+                    for accession in accessions[1:]
+                )
+
+                result = observe(submissions, facts)
+
+                self.assertIn(blocker, result["blockers"])
+                self.assertEqual(len(result["observations"]), 2)
+                self.assertTrue(all(
+                    item["shares_count"] is None for item in result["observations"]
+                ))
+                self.assertIs(result["coverage_truncated"], True)
+
+    def test_valid_third_joined_accession_is_marked_truncated_without_emission(self):
+        accessions = [
+            "0000000123-25-000001",
+            "0000000123-25-000002",
+            "0000000123-25-000003",
+        ]
+        submissions, facts = documents()
+        recent = submissions["filings"]["recent"]
+        recent["accessionNumber"] = accessions
+        recent["acceptanceDateTime"] = [
+            "2025-05-15T16:30:00-04:00",
+            "2025-05-14T16:30:00-04:00",
+            "2025-05-13T16:30:00-04:00",
+        ]
+        recent["reportDate"] = ["2025-03-31"] * 3
+        recent["form"] = ["10-Q"] * 3
+        shares = facts["facts"]["dei"]["EntityCommonStockSharesOutstanding"][
+            "units"
+        ]["shares"]
+        shares.extend(
+            {
+                "accn": accession, "end": "2025-03-31", "val": 100_000_000,
+                "filed": "2025-05-15",
+            }
+            for accession in accessions[1:]
+        )
+
+        result = observe(submissions, facts)
+
+        self.assertEqual(len(result["observations"]), 2)
+        self.assertEqual(
+            [item["accession"] for item in result["observations"]],
+            accessions[:2],
+        )
+        self.assertIs(result["coverage_truncated"], True)
 
 
 if __name__ == "__main__":

@@ -120,6 +120,7 @@ def observe_shares(
         "status": "MARKET_CAP_UNVERIFIED",
         "source_verified": False,
         "coverage": "UNVERIFIED",
+        "coverage_truncated": False,
         "cik": requested_cik,
         "decision_at": _timestamp_text(decision) if decision is not None else None,
         "observations": observations,
@@ -236,21 +237,17 @@ def observe_shares(
             continue
         visited_accessions.add(accession_value)
         matching_records += 1
-        if len(observations) >= limit:
-            continue
+        over_cap = len(observations) >= limit
 
         accepted = _timestamp(accepted_value, sec_local=True)
         report_date = _date(report_value)
         filing_class = _filing_class(form_value)
         if accepted is None:
             blockers.add("ACCEPTANCE_TIME_INVALID")
-            continue
-        if accepted > decision:
+        elif accepted > decision:
             blockers.add("FUTURE_ACCEPTANCE")
-            continue
         if report_date is None:
             blockers.add("REPORT_DATE_INVALID")
-            continue
         # Amended filings are flagged separately and never yield a count:
         # whether they restate or supersede the original fact is unverified.
         unsupported_form = filing_class in ("amendment", "other")
@@ -258,6 +255,15 @@ def observe_shares(
             blockers.add("AMENDMENT_PRESENT")
         elif filing_class == "other":
             blockers.add("FILING_FORM_UNSUPPORTED")
+        if over_cap:
+            result["coverage_truncated"] = True
+        if (
+            accepted is None
+            or accepted > decision
+            or report_date is None
+            or over_cap
+        ):
+            continue
 
         dated_rows: list[Mapping] = []
         invalid_required_dates = False
