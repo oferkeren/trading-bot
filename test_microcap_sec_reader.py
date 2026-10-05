@@ -121,6 +121,12 @@ class SecReaderTests(unittest.TestCase):
                     self.assert_code("SEC_RESPONSE_INVALID", lambda: self.reader().fetch("123"))
                 self.assertEqual(open_request.call_count, 1)
 
+    def test_deeply_nested_json_is_invalid_not_recursion_error(self):
+        body = b"[" * 100_000 + b"]" * 100_000
+        with patch("microcap_sec_reader.urlopen", return_value=Response(SUBMISSIONS, body)) as open_request:
+            self.assert_code("SEC_RESPONSE_INVALID", lambda: self.reader().fetch("123"))
+        self.assertEqual(open_request.call_count, 1)
+
     def test_http_read_failures_are_invalid_not_partial_success_or_raw_exceptions(self):
         class BrokenRead(Response):
             def __init__(self, url, failure):

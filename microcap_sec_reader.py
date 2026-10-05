@@ -115,7 +115,7 @@ class SecReader:
             raise CoverageError("SEC_RESPONSE_INVALID")
         try:
             document = json.loads(body, parse_constant=_reject_non_json_constant)
-        except (ValueError, UnicodeDecodeError):
+        except (ValueError, UnicodeDecodeError, RecursionError):
             raise CoverageError("SEC_RESPONSE_INVALID") from None
         if not isinstance(document, dict):
             raise CoverageError("SEC_RESPONSE_INVALID")
