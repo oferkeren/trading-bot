@@ -69,12 +69,14 @@ def _timestamp_text(value: datetime) -> str:
 def _filing_class(value: object) -> str:
     if not isinstance(value, str):
         return "other"
-    if value in ("10-K/A", "10-Q/A"):
+    if value in ("10-K/A", "10-Q/A", "8-K/A"):
         return "amendment"
     if value == "10-K":
         return "annual"
     if value == "10-Q":
         return "quarterly"
+    if value == "8-K":
+        return "current"
     return "other"
 
 
@@ -101,15 +103,18 @@ def observe_shares(
     """
     blockers: set[str] = {"CLASS_COVERAGE_UNVERIFIED"}
     observations: list[dict[str, object]] = []
+    requested_cik = _cik(cik)
+    decision = _timestamp(decision_at)
     result: dict[str, object] = {
         "status": "MARKET_CAP_UNVERIFIED",
         "source_verified": False,
         "coverage": "UNVERIFIED",
+        "cik": requested_cik,
+        "decision_at": _timestamp_text(decision) if decision is not None else None,
         "observations": observations,
         "blockers": [],
     }
 
-    requested_cik = _cik(cik)
     submissions_cik = _cik(_mapping(submissions).get("cik"))
     facts_cik = _cik(_mapping(companyfacts).get("cik"))
     if (
@@ -132,7 +137,6 @@ def observe_shares(
         result["blockers"] = sorted(blockers)
         return result
 
-    decision = _timestamp(decision_at)
     fetched = _timestamp(fetched_at)
     if decision is None:
         blockers.add("DECISION_TIME_INVALID")

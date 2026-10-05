@@ -75,6 +75,8 @@ class ObserveSharesTests(unittest.TestCase):
         result = observe(submissions, facts)
 
         self.assertEqual(result["status"], "MARKET_CAP_UNVERIFIED")
+        self.assertEqual(result["cik"], "0000000123")
+        self.assertEqual(result["decision_at"], DECISION_AT)
         self.assertIs(result["source_verified"], False)
         self.assertEqual(result["coverage"], "UNVERIFIED")
         self.assertEqual(result["observations"], [{
@@ -90,6 +92,24 @@ class ObserveSharesTests(unittest.TestCase):
         self.assertNotIn("classes_complete", result)
         self.assertNotIn("market_cap", result)
         self.assertNotIn("trade_approval", result)
+
+    def test_current_report_form_is_observed_as_factual_evidence(self):
+        submissions, facts = documents(form="8-K")
+
+        result = observe(submissions, facts)
+
+        self.assertEqual(result["observations"][0]["filing_class"], "current")
+        self.assertNotIn("FILING_FORM_UNSUPPORTED", result["blockers"])
+        self.assertEqual(result["status"], "MARKET_CAP_UNVERIFIED")
+
+    def test_current_report_amendment_is_flagged_and_classified_as_amendment(self):
+        submissions, facts = documents(form="8-K/A")
+
+        result = observe(submissions, facts)
+
+        self.assertIn("AMENDMENT_PRESENT", result["blockers"])
+        self.assertEqual(result["observations"][0]["filing_class"], "amendment")
+        self.assertEqual(result["status"], "MARKET_CAP_UNVERIFIED")
 
     def test_later_acceptance_is_not_made_available_by_an_old_report_date(self):
         submissions, facts = documents(
@@ -239,11 +259,16 @@ class ObserveSharesTests(unittest.TestCase):
             "val": 100_000_000, "filed": "2025-05-15",
         }])
 
-        result = observe(submissions, facts)
+        result = observe(
+            submissions, facts, cik="123",
+            decision_at="2025-05-15T16:30:00-04:00",
+        )
 
         self.assertIn("SHARES_FACT_ABSENT", result["blockers"])
         self.assertEqual(result["coverage"], "UNVERIFIED")
         self.assertEqual(result["observations"], [])
+        self.assertEqual(result["cik"], "0000000123")
+        self.assertEqual(result["decision_at"], DECISION_AT)
 
     def test_nonpositive_and_malformed_share_counts_are_never_returned(self):
         for value in (-1, 0, 1.5, "100000000", True, None):
