@@ -45,7 +45,10 @@ def _external(value: str, *, existing: bool) -> Path:
     path = Path(value)
     if not path.is_absolute():
         raise CoverageError("INPUT_INVALID")
-    resolved = path.resolve()
+    try:
+        resolved = path.resolve()
+    except (OSError, RuntimeError):
+        raise CoverageError("INPUT_INVALID") from None
     if resolved.is_relative_to(_REPOSITORY):
         raise CoverageError("INPUT_INVALID")
     if existing:

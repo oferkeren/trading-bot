@@ -168,6 +168,23 @@ class SecProbeTests(unittest.TestCase):
         self.assertEqual(json.loads(stderr)["error"], "INPUT_INVALID")
         reader.assert_not_called()
 
+    def test_self_referential_symlinks_are_input_errors_without_path_leak(self):
+        loop = self.directory / "loop.json"
+        loop.symlink_to(loop)
+        cases = [
+            ["--fetch", "--output", str(loop)],
+            ["--submissions", str(loop), "--companyfacts", str(self.facts)],
+            ["--submissions", str(self.submissions), "--companyfacts", str(loop)],
+        ]
+        for options in cases:
+            with self.subTest(options=options):
+                with patch("microcap_sec_probe.SecReader.from_environment") as reader:
+                    code, stdout, stderr = self.run_cli(*options)
+                self.assertEqual((code, stdout), (2, ""))
+                self.assertEqual(json.loads(stderr), {"error": "INPUT_INVALID"})
+                self.assertNotIn(str(self.directory), stderr)
+                reader.assert_not_called()
+
     def test_offline_malformed_json_is_input_error(self):
         self.facts.write_text('{"cik":NaN}')
         code, stdout, stderr = self.run_cli(
