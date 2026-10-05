@@ -2,24 +2,39 @@
 
 from __future__ import annotations
 
+import argparse
+import json
 import math
+import os
 import re
+import sys
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from collections import deque
 from collections.abc import Callable, Mapping
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from microcap_batch_schema import (
-    BIAS, MAX_CALENDAR_DAYS, SYMBOL_PATTERN, manifest_hash, session_window,
+    BIAS, DEFAULT_RULE, MAX_CALENDAR_DAYS, SYMBOL_PATTERN, manifest_hash, session_window,
     validate_manifest, validate_rule,
 )
 from microcap_history import CoverageError
+from microcap_readiness import _external, _reject_constant, _save, _unique_object
 
 
 _NEW_YORK = ZoneInfo("America/New_York")
 _TICKER = re.compile(SYMBOL_PATTERN + r"\Z")
 _REQUEST_ID = re.compile(r"[A-Za-z0-9_-]{1,64}\Z")
+_MASSIVE = "https://api.massive.com"
+_SEC_TICKERS = "https://www.sec.gov/files/company_tickers.json"
+_GROUPED_LIMIT = 16 * 1024 * 1024
+_TYPE_LIMIT = 1024 * 1024
+_SEC_LIMIT = 4 * 1024 * 1024
+_TIMEOUT = 30
 
 
 class SelectionError(RuntimeError):
@@ -166,3 +181,138 @@ def select_batch(provider, sec_map: Mapping[str, tuple[str, str]], *, as_of: dat
     except CoverageError:
         raise SelectionError("INPUT_INVALID") from None
     return manifest
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
+def _open(request: urllib.request.Request, timeout: float):
+    return _OPENER.open(request, timeout=timeout)
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _get_json(url: str, *, limit: int, headers: Mapping[str, str] | None = None) -> object:
+    request = urllib.request.Request(url, headers={"Accept": "application/json",
+                                                   **(headers or {})})
+    try:
+        with _open(request, _TIMEOUT) as response:
+            if getattr(response, "status", 200) != 200:
+                raise ProviderError("PROVIDER_ERROR")
+            chunks, total = [], 0
+            while chunk := response.read(65536):
+                total += len(chunk)
+                if total > limit:
+                    raise ProviderError("PROVIDER_ERROR")
+                chunks.append(chunk)
+        return json.loads(b"".join(chunks), object_pairs_hook=_unique_object,
+                          parse_constant=_reject_constant)
+    except ProviderError:
+        raise
+    except Exception:
+        raise ProviderError("PROVIDER_ERROR") from None
+
+
+class MassiveDaily:
+    def __init__(self, api_key: str, limiter: RateLimiter) -> None:
+        self._key = api_key
+        self._limiter = limiter
+
+    def _url(self, path: str, params: Mapping[str, str]) -> str:
+        query = urllib.parse.urlencode({**params, "apiKey": self._key})
+        return f"{_MASSIVE}{path}?{query}"
+
+    def grouped(self, day: date) -> tuple[str, list]:
+        self._limiter.wait()
+        body = _get_json(self._url(
+            f"/v2/aggs/grouped/locale/us/market/stocks/{day.isoformat()}",
+            {"adjusted": "false"}), limit=_GROUPED_LIMIT)
+        if not isinstance(body, Mapping) or body.get("status") not in ("OK", "DELAYED"):
+            raise ProviderError("PROVIDER_ERROR")
+        count, results, request_id = (body.get("resultsCount"), body.get("results"),
+                                      body.get("request_id"))
+        if type(count) is not int or count < 0 or not isinstance(request_id, str):
+            raise ProviderError("PROVIDER_ERROR")
+        if results is None and count == 0:
+            results = []
+        if not isinstance(results, list):
+            raise ProviderError("PROVIDER_ERROR")
+        return request_id, results
+
+    def ticker_type(self, ticker: str, day: date) -> str:
+        if not _TICKER.fullmatch(ticker):
+            raise ProviderError("PROVIDER_ERROR")
+        self._limiter.wait()
+        body = _get_json(self._url(f"/v3/reference/tickers/{ticker}",
+                                   {"date": day.isoformat()}), limit=_TYPE_LIMIT)
+        results = body.get("results") if isinstance(body, Mapping) else None
+        kind = results.get("type") if isinstance(results, Mapping) else None
+        if not isinstance(kind, str):
+            raise ProviderError("PROVIDER_ERROR")
+        return kind
+
+
+def fetch_sec_tickers(user_agent: str) -> dict[str, tuple[str, str]]:
+    try:
+        payload = _get_json(_SEC_TICKERS, limit=_SEC_LIMIT,
+                            headers={"User-Agent": user_agent})
+    except ProviderError:
+        raise SelectionError("PROVIDER_ERROR") from None
+    return parse_sec_tickers(payload)
+
+
+class _Parser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        raise SelectionError("INPUT_INVALID")
+
+
+def _fail(code: str) -> int:
+    print(json.dumps({"error": code}), file=sys.stderr)
+    return 2 if code in ("INPUT_INVALID", "ENVIRONMENT_INCOMPLETE") else 3
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = _Parser(description="Select micro-cap runner days for a coverage-only pilot; "
+                                 "always NO_TRADE")
+    parser.add_argument("--as-of", help="latest US trading date to consider (YYYY-MM-DD)")
+    parser.add_argument("--days", type=int, default=DEFAULT_RULE["days"])
+    parser.add_argument("--per-day", type=int, default=DEFAULT_RULE["per_day"])
+    parser.add_argument("--output", required=True, help="absolute external manifest JSON")
+    try:
+        args = parser.parse_args(argv)
+        api_key = os.environ.get("MASSIVE_API_KEY", "").strip()
+        user_agent = os.environ.get("SEC_USER_AGENT", "").strip()
+        if not api_key or not user_agent:
+            return _fail("ENVIRONMENT_INCOMPLETE")
+        now = _now()
+        as_of = (date.fromisoformat(args.as_of) if args.as_of
+                 else now.astimezone(_NEW_YORK).date() - timedelta(days=1))
+        rule = {**DEFAULT_RULE, "days": args.days, "per_day": args.per_day}
+        try:
+            output = _external(Path(args.output), existing=False)
+        except CoverageError:
+            return _fail("INPUT_INVALID")
+        sec_map = fetch_sec_tickers(user_agent)
+        manifest = select_batch(MassiveDaily(api_key, RateLimiter()), sec_map,
+                                as_of=as_of, rule=rule, now=now)
+        _save(output, manifest)
+    except SelectionError as error:
+        return _fail(str(error))
+    except (CoverageError, ValueError):
+        return _fail("INPUT_INVALID")
+    print(json.dumps({"output": str(output), "samples": len(manifest["samples"]),
+                      "sha256": manifest["sha256"],
+                      "trading_days": len(manifest["trading_days"])},
+                     sort_keys=True, separators=(",", ":")))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

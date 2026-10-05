@@ -165,5 +165,132 @@ class SelectBatchTests(unittest.TestCase):
         self.assertEqual(str(raised.exception), "INPUT_INVALID")
 
 
+import io
+import json
+import os
+from pathlib import Path
+from unittest import mock
+
+import microcap_batch_select as selection
+
+
+class FakeResponse(io.BytesIO):
+    status = 200
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+
+def routed(routes):
+    def fake_open(request, timeout):
+        url = request.full_url
+        for fragment, body in routes.items():
+            if fragment in url:
+                if isinstance(body, Exception):
+                    raise body
+                return FakeResponse(json.dumps(body).encode())
+        raise OSError("unrouted")
+    return fake_open
+
+
+GROUPED_OK = {"status": "OK", "resultsCount": 2, "request_id": "abc123",
+              "results": [bar("AAA", 2.0, 4.0), bar("BBB", 2.0, 2.1)]}
+GROUPED_EMPTY = {"status": "OK", "resultsCount": 0, "request_id": "def456"}
+TICKERS = {"0": {"cik_str": 1, "ticker": "AAA", "title": "Alpha Inc"}}
+
+
+class HttpClientTests(unittest.TestCase):
+    def test_massive_grouped_and_type(self):
+        limiter = RateLimiter(clock=lambda: 0.0, sleep=lambda s: None)
+        client = selection.MassiveDaily("k-test", limiter)
+        with mock.patch.object(selection, "_open", routed({
+            "/grouped/locale/us/market/stocks/2025-05-30": GROUPED_OK,
+            "/grouped/locale/us/market/stocks/2025-05-31": GROUPED_EMPTY,
+            "/v3/reference/tickers/AAA": {"status": "OK", "results": {"type": "CS"}},
+        })):
+            self.assertEqual(client.grouped(date(2025, 5, 30))[0], "abc123")
+            self.assertEqual(client.grouped(date(2025, 5, 31)), ("def456", []))
+            self.assertEqual(client.ticker_type("AAA", date(2025, 5, 30)), "CS")
+
+    def test_malformed_and_failing_responses_raise_fixed_code(self):
+        client = selection.MassiveDaily("k-test", RateLimiter(clock=lambda: 0.0,
+                                                               sleep=lambda s: None))
+        for body in ({"status": "ERROR"}, {"status": "OK", "resultsCount": "2"},
+                     {"status": "OK", "resultsCount": 2}, OSError("k-test leaked")):
+            with self.subTest(body=body), mock.patch.object(
+                    selection, "_open", routed({"/grouped/": body})):
+                with self.assertRaises(ProviderError) as raised:
+                    client.grouped(date(2025, 5, 30))
+                self.assertEqual(str(raised.exception), "PROVIDER_ERROR")
+
+    def test_oversized_body_is_rejected(self):
+        def fake_open(request, timeout):
+            return FakeResponse(b" " * (selection._TYPE_LIMIT + 1))
+        client = selection.MassiveDaily("k", RateLimiter(clock=lambda: 0.0,
+                                                          sleep=lambda s: None))
+        with mock.patch.object(selection, "_open", fake_open):
+            with self.assertRaises(ProviderError):
+                client.ticker_type("AAA", date(2025, 5, 30))
+
+    def test_redirects_are_refused(self):
+        self.assertIsNone(selection._NoRedirect().redirect_request(
+            None, None, 302, "Found", {}, "https://elsewhere.example/"))
+
+
+class CliTests(unittest.TestCase):
+    def scratch_output(self, name):
+        root = Path(os.environ.get(
+            "MICROCAP_BATCH_TEST_DIR",
+            str(Path.home() / ".copilot" / "microcap_batch_select_tests"),
+        ))
+        root.mkdir(parents=True, exist_ok=True)
+        path = root / name
+        path.unlink(missing_ok=True)
+        return path
+
+    def run_cli(self, argv, env, routes):
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch.object(selection, "_open", routed(routes)), \
+                mock.patch.object(selection, "_now",
+                                  lambda: datetime(2025, 6, 2, 12, tzinfo=timezone.utc)), \
+                mock.patch("sys.stdout", out), mock.patch("sys.stderr", err):
+            code = selection.main(argv)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_successful_run_writes_valid_manifest(self):
+        output = self.scratch_output("batch-manifest.json")
+        env = {"MASSIVE_API_KEY": "k-secret-value", "SEC_USER_AGENT": "Test test@example.com"}
+        code, out, err = self.run_cli(
+            ["--as-of", "2025-05-30", "--days", "1", "--output", str(output)], env,
+            {"/grouped/": GROUPED_OK, "company_tickers.json": TICKERS,
+             "/v3/reference/tickers/AAA": {"status": "OK", "results": {"type": "CS"}}})
+        self.assertEqual((code, err), (0, ""))
+        manifest = json.loads(output.read_text())
+        validate_manifest(manifest)
+        self.assertEqual(json.loads(out)["samples"], 1)
+        self.assertNotIn("k-secret-value", out + output.read_text())
+        output.unlink(missing_ok=True)
+
+    def test_missing_environment_and_provider_failure(self):
+        output = self.scratch_output("m.json")
+        code, _, err = self.run_cli(["--output", str(output)], {}, {})
+        self.assertEqual((code, json.loads(err)), (2, {"error": "ENVIRONMENT_INCOMPLETE"}))
+        env = {"MASSIVE_API_KEY": "k-secret-value", "SEC_USER_AGENT": "Test test@example.com"}
+        code, _, err = self.run_cli(["--as-of", "2025-05-30", "--output", str(output)], env,
+                                    {"company_tickers.json": TICKERS,
+                                     "/grouped/": OSError("k-secret-value")})
+        self.assertEqual((code, json.loads(err)), (3, {"error": "PROVIDER_ERROR"}))
+        self.assertFalse(output.exists())
+
+    def test_relative_or_repository_output_is_invalid(self):
+        env = {"MASSIVE_API_KEY": "k", "SEC_USER_AGENT": "T t@example.com"}
+        code, _, err = self.run_cli(["--output", "relative.json"], env, {})
+        self.assertEqual((code, json.loads(err)), (2, {"error": "INPUT_INVALID"}))
+
+
 if __name__ == "__main__":
     unittest.main()
