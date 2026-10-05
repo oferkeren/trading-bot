@@ -1,3 +1,4 @@
+import os
 import sqlite3
 import subprocess
 import time
@@ -6,6 +7,7 @@ from datetime import datetime, timezone
 
 from fastapi import Depends
 
+from microcap_readiness_store import read_readiness
 from signal_server_core import *
 from strategy_status import read_snapshot
 
@@ -1553,6 +1555,14 @@ def read_runtime_components():
         })
 
     return result
+
+
+@app.get("/microcap-research-status")
+def microcap_research_status(user=Depends(dashboard_auth)):
+    return read_readiness(
+        os.environ.get("MICROCAP_READINESS_PATH"),
+        now=datetime.now(timezone.utc),
+    )
 
 
 @app.get(
