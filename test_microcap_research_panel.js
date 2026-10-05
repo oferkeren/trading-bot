@@ -1,9 +1,17 @@
 const assert = require("node:assert/strict");
 const { renderMicrocapResearch, loadMicrocapResearch } = require("./microcap_research_panel.js");
 
+function fakeNode(tag) {
+  return {
+    tagName: tag, textContent: "", className: "initial", hidden: false, children: [],
+    appendChild(child) { this.children.push(child); return child; },
+    replaceChildren(...nodes) { this.children = nodes; },
+  };
+}
+
 function elementMap(ids) {
-  const nodes = Object.fromEntries(ids.map(id => [id, { textContent: "", className: "initial" }]));
-  return { nodes, getElement: id => nodes[id] || null };
+  const nodes = Object.fromEntries(ids.map(id => [id, fakeNode("div")]));
+  return { nodes, getElement: id => nodes[id] || null, createElement: tag => fakeNode(tag) };
 }
 
 const ids = [
@@ -12,6 +20,13 @@ const ids = [
   "microcapNewsStatus", "microcapNewsCount", "microcapIbkrMinuteCells",
   "microcapIbkrQuoteCells", "microcapSecStatus", "microcapSharesStatus",
   "microcapBlockers",
+];
+
+const batchIds = [
+  "microcapBatchView", "microcapSingleView", "microcapBatchAsOf", "microcapBatchCount",
+  "microcapBatchBias", "microcapSampleRows",
+  ...["ibkr_minute", "ibkr_quotes", "roster_dated", "news_found", "sec_shares"]
+    .flatMap(key => ["microcapCov-" + key, "microcapCovPct-" + key]),
 ];
 
 async function testValidSnapshot() {
@@ -119,6 +134,85 @@ async function testLoadSuccessAndFailures() {
   }
 }
 
+function batchSnapshot() {
+  return {
+    status: "CURRENT", schema_version: 2, generated_at: "2026-10-05T12:00:00Z", age_seconds: 75,
+    decision: "NO_TRADE", order_approval: false,
+    batch: { as_of: "2026-10-02", manifest_sha256: "a".repeat(64), sample_count: 2,
+             rule: {}, bias: ["RUNNER_SCREEN_SELECTED", "SELECTION_USES_SAME_DAY_OUTCOME",
+                              "UNVERIFIED_PILOT"] },
+    coverage: {
+      ibkr_minute: { observed: 2, total: 2 }, ibkr_quotes: { observed: 1, total: 2 },
+      roster_dated: { observed: 0, total: 2 }, news_found: { observed: 1, total: 2 },
+      sec_shares: { observed: 2, total: 2 },
+    },
+    samples: [
+      { date: "2026-10-02", symbol: "SORA", issuer_id: "0002033515", move_pct: 52.3,
+        ibkr_minute: true, ibkr_quotes: true, roster: "DATED_ROSTER_OBSERVED", news_count: 2,
+        sec_observations: 2, stage_errors: [] },
+      { date: "2026-10-01", symbol: "ABCD", issuer_id: "0000000002", move_pct: 31,
+        ibkr_minute: true, ibkr_quotes: false, roster: "MISSING", news_count: null,
+        sec_observations: 1, stage_errors: ["ibkr:PROVIDER_ERROR", "source:SKIPPED"] },
+    ],
+    blockers: ["MARKET_CAP_UNVERIFIED", "SAMPLE_INCOMPLETE"],
+  };
+}
+
+async function testBatchSnapshotRendersKpisAndRows() {
+  const { nodes, getElement, createElement } = elementMap([...ids, ...batchIds]);
+  renderMicrocapResearch(batchSnapshot(), getElement, createElement);
+  assert.equal(nodes.microcapBatchView.hidden, false);
+  assert.equal(nodes.microcapSingleView.hidden, true);
+  assert.equal(nodes["microcapCov-ibkr_minute"].textContent, "2/2");
+  assert.equal(nodes["microcapCovPct-ibkr_quotes"].textContent, "50%");
+  assert.equal(nodes["microcapCovPct-roster_dated"].textContent, "0%");
+  assert.equal(nodes.microcapBatchCount.textContent, "2");
+  assert.equal(nodes.microcapBatchAsOf.textContent, "2026-10-02");
+  assert.match(nodes.microcapBatchBias.textContent, /SELECTION_USES_SAME_DAY_OUTCOME/);
+  const rows = nodes.microcapSampleRows.children;
+  assert.equal(rows.length, 2);
+  assert.deepEqual(rows[0].children.map(cell => cell.textContent),
+    ["2026-10-02", "SORA", "+52.3%", "✓", "✓", "DATED_ROSTER_OBSERVED", "2", "2", "—"]);
+  assert.deepEqual(rows[1].children.map(cell => cell.textContent),
+    ["2026-10-01", "ABCD", "+31.0%", "✓", "✗", "MISSING", "-", "1",
+     "ibkr:PROVIDER_ERROR, source:SKIPPED"]);
+  assert.equal(nodes.microcapBlockers.className, "blocker-text");
+  assert.equal(nodes.microcapDecision.textContent, "NO TRADE");
+}
+
+async function testBatchGarbageAndXss() {
+  const { nodes, getElement, createElement } = elementMap([...ids, ...batchIds]);
+  const attack = "<img src=x onerror=alert(1)>";
+  renderMicrocapResearch({
+    schema_version: 2, status: "CURRENT", batch: { bias: [attack], sample_count: attack },
+    coverage: { ibkr_minute: { observed: -1, total: 2 }, news_found: "bad" },
+    samples: [{ symbol: attack, move_pct: "x", stage_errors: [attack] }, null, "bad"],
+  }, getElement, createElement);
+  assert.equal(nodes["microcapCov-ibkr_minute"].textContent, "-");
+  assert.equal(nodes["microcapCovPct-news_found"].textContent, "-");
+  assert.equal(nodes.microcapBatchCount.textContent, "-");
+  const rows = nodes.microcapSampleRows.children;
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].children[1].textContent, attack);
+  assert.equal(rows[0].children[2].textContent, "-");
+}
+
+async function testUnavailableHidesBothViews() {
+  const { nodes, getElement, createElement } = elementMap([...ids, ...batchIds]);
+  renderMicrocapResearch({ status: "UNAVAILABLE", blockers: ["READINESS_UNAVAILABLE"] },
+    getElement, createElement);
+  assert.equal(nodes.microcapBatchView.hidden, true);
+  assert.equal(nodes.microcapSingleView.hidden, true);
+}
+
+async function testSchema1ShowsSingleView() {
+  const { nodes, getElement, createElement } = elementMap([...ids, ...batchIds]);
+  renderMicrocapResearch({ status: "CURRENT", sample: { symbol: "SORA" } }, getElement,
+    createElement);
+  assert.equal(nodes.microcapSingleView.hidden, false);
+  assert.equal(nodes.microcapBatchView.hidden, true);
+}
+
 (async () => {
   await testValidSnapshot();
   await testWarnStates();
@@ -126,6 +220,10 @@ async function testLoadSuccessAndFailures() {
   await testMaliciousStringsUseTextOnly();
   await testMissingGarbageFieldsRenderDash();
   await testLoadSuccessAndFailures();
+  await testBatchSnapshotRendersKpisAndRows();
+  await testBatchGarbageAndXss();
+  await testUnavailableHidesBothViews();
+  await testSchema1ShowsSingleView();
   console.log("microcap_research_panel tests passed");
 })().catch(error => {
   console.error(error);
