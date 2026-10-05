@@ -111,6 +111,129 @@ class ObserveSharesTests(unittest.TestCase):
         self.assertEqual(result["observations"][0]["filing_class"], "amendment")
         self.assertEqual(result["status"], "MARKET_CAP_UNVERIFIED")
 
+    def test_supported_original_forms_report_observed_count(self):
+        for form, filing_class in (
+            ("10-K", "annual"), ("10-Q", "quarterly"), ("8-K", "current"),
+        ):
+            with self.subTest(form=form):
+                submissions, facts = documents(form=form)
+                result = observe(submissions, facts)
+                self.assertEqual(result["observations"][0]["filing_class"], filing_class)
+                self.assertEqual(result["observations"][0]["shares_count"], 100_000_000)
+
+    def test_unsupported_or_amended_forms_never_report_share_counts(self):
+        cases = (
+            ("S-1", "FILING_FORM_UNSUPPORTED"),
+            ("10-K405", "FILING_FORM_UNSUPPORTED"),
+            ("10-q", "FILING_FORM_UNSUPPORTED"),
+            ("", "FILING_FORM_UNSUPPORTED"),
+            ("10-K/A", "AMENDMENT_PRESENT"),
+            ("10-Q/A", "AMENDMENT_PRESENT"),
+            ("8-K/A", "AMENDMENT_PRESENT"),
+        )
+        for form, blocker in cases:
+            with self.subTest(form=form):
+                submissions, facts = documents(form=form)
+                result = observe(submissions, facts)
+                self.assertIn(blocker, result["blockers"])
+                self.assertIsNone(result["observations"][0]["shares_count"])
+                self.assertIs(result["source_verified"], False)
+
+    def test_unsupported_form_only_suppresses_its_own_count(self):
+        other = "0000000123-25-000002"
+        submissions, facts = documents()
+        recent = submissions["filings"]["recent"]
+        recent["accessionNumber"].append(other)
+        recent["acceptanceDateTime"].append("2025-03-01T10:00:00-05:00")
+        recent["reportDate"].append("2024-12-31")
+        recent["form"].append("S-1")
+        facts["facts"]["dei"]["EntityCommonStockSharesOutstanding"]["units"][
+            "shares"
+        ].append({
+            "accn": other, "end": "2024-12-31", "val": 90_000_000,
+            "filed": "2025-03-01",
+        })
+
+        result = observe(submissions, facts)
+
+        self.assertIn("FILING_FORM_UNSUPPORTED", result["blockers"])
+        self.assertEqual(
+            [item["shares_count"] for item in result["observations"]],
+            [100_000_000, None],
+        )
+
+    def test_non_string_form_never_reports_share_count(self):
+        submissions, facts = documents()
+        submissions["filings"]["recent"]["form"] = [None]
+
+        result = observe(submissions, facts)
+
+        self.assertIn("FILING_FORM_UNSUPPORTED", result["blockers"])
+        self.assertIsNone(result["observations"][0]["shares_count"])
+
+    def test_integrity_blockers_elsewhere_suppress_all_share_counts(self):
+        other = "0000000123-25-000002"
+
+        def two_filings(accepted, report_date, form, accession=other):
+            submissions, facts = documents()
+            recent = submissions["filings"]["recent"]
+            recent["accessionNumber"].append(accession)
+            recent["acceptanceDateTime"].append(accepted)
+            recent["reportDate"].append(report_date)
+            recent["form"].append(form)
+            facts["facts"]["dei"]["EntityCommonStockSharesOutstanding"]["units"][
+                "shares"
+            ].append({
+                "accn": other, "end": "2024-12-31", "val": 90_000_000,
+                "filed": "2025-03-01",
+            })
+            return submissions, facts
+
+        cases = (
+            ("AMENDMENT_PRESENT",
+             two_filings("2025-05-15T10:00:00-04:00", "2025-03-31", "10-Q/A",
+                         accession="0000000123-25-000009")),
+            ("ACCEPTANCE_TIME_INVALID",
+             two_filings("bad-time", "2024-12-31", "10-K")),
+            ("REPORT_DATE_INVALID",
+             two_filings("2025-03-01T10:00:00-05:00", "bad-date", "10-K")),
+            ("SUBMISSIONS_ROW_INVALID",
+             two_filings("2025-03-01T10:00:00-05:00", "2024-12-31", "10-K",
+                         accession=ACCESSION)),
+            ("SUBMISSIONS_ROW_INVALID",
+             two_filings("2025-03-01T10:00:00-05:00", "2024-12-31", "10-K",
+                         accession="malformed")),
+        )
+        for blocker, (submissions, facts) in cases:
+            with self.subTest(blocker=blocker):
+                result = observe(submissions, facts)
+                self.assertIn(blocker, result["blockers"])
+                self.assertTrue(result["observations"])
+                self.assertTrue(all(
+                    item["shares_count"] is None for item in result["observations"]
+                ))
+
+    def test_future_filing_does_not_suppress_earlier_valid_count(self):
+        submissions, facts = documents()
+        recent = submissions["filings"]["recent"]
+        recent["accessionNumber"].insert(0, "0000000123-25-000002")
+        recent["acceptanceDateTime"].insert(0, "2025-05-16T09:00:00-04:00")
+        recent["reportDate"].insert(0, "2025-03-31")
+        recent["form"].insert(0, "8-K")
+        facts["facts"]["dei"]["EntityCommonStockSharesOutstanding"]["units"][
+            "shares"
+        ].append({
+            "accn": "0000000123-25-000002", "end": "2025-03-31",
+            "val": 120_000_000, "filed": "2025-05-16",
+        })
+
+        result = observe(submissions, facts)
+
+        self.assertIn("FUTURE_ACCEPTANCE", result["blockers"])
+        self.assertEqual(
+            [item["shares_count"] for item in result["observations"]], [100_000_000]
+        )
+
     def test_later_acceptance_is_not_made_available_by_an_old_report_date(self):
         submissions, facts = documents(
             accepted="2025-05-15T16:30:01-04:00",

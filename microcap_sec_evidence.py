@@ -14,6 +14,17 @@ _SEC_EASTERN = ZoneInfo("America/New_York")
 _MAX_OBSERVATIONS = 2
 
 
+# Issuer-level integrity failures that make every observed count unsafe.
+_COUNT_SUPPRESSING_BLOCKERS = frozenset({
+    "ACCEPTANCE_TIME_INVALID",
+    "ACCESSION_CIK_MISMATCH",
+    "AMENDMENT_PRESENT",
+    "FACT_ROWS_INVALID",
+    "REPORT_DATE_INVALID",
+    "SUBMISSIONS_ROW_INVALID",
+})
+
+
 def _mapping(value: object) -> Mapping:
     return value if isinstance(value, Mapping) else {}
 
@@ -240,6 +251,9 @@ def observe_shares(
         if report_date is None:
             blockers.add("REPORT_DATE_INVALID")
             continue
+        # Amended filings are flagged separately and never yield a count:
+        # whether they restate or supersede the original fact is unverified.
+        unsupported_form = filing_class in ("amendment", "other")
         if filing_class == "amendment":
             blockers.add("AMENDMENT_PRESENT")
         elif filing_class == "other":
@@ -287,6 +301,7 @@ def observe_shares(
         shares_count: int | None = None
         if (
             not invalid_fact_rows
+            and not unsupported_form
             and not invalid_count
             and not invalid_required_dates
             and len(count_values) == 1
@@ -305,5 +320,8 @@ def observe_shares(
 
     if matching_records == 0:
         blockers.add("SHARES_FACT_ABSENT")
+    if blockers & _COUNT_SUPPRESSING_BLOCKERS:
+        for observation in observations:
+            observation["shares_count"] = None
     result["blockers"] = sorted(blockers)
     return result
