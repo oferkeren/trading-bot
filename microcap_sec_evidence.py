@@ -246,25 +246,29 @@ def observe_shares(
             blockers.add("FILING_FORM_UNSUPPORTED")
 
         dated_rows: list[Mapping] = []
+        invalid_required_dates = False
+        accepted_eastern_date = accepted.astimezone(_SEC_EASTERN).date()
         for row in matching_rows:
             fact_end = _date(row.get("end"))
             if fact_end == report_date:
                 dated_rows.append(row)
             else:
                 blockers.add("REPORT_DATE_MISMATCH")
+                invalid_required_dates = True
+            filed_date = _date(row.get("filed"))
+            if filed_date is None:
+                blockers.add("FILED_DATE_INVALID")
+                invalid_required_dates = True
+            elif filed_date != accepted_eastern_date:
+                blockers.add("FILED_DATE_MISMATCH")
+                invalid_required_dates = True
         if not dated_rows:
             blockers.add("SHARES_FACT_ABSENT")
 
-        accepted_eastern_date = accepted.astimezone(_SEC_EASTERN).date()
         count_values: set[int] = set()
         invalid_count = False
         class_values: set[str] = set()
         for row in dated_rows:
-            filed_date = _date(row.get("filed"))
-            if filed_date is None:
-                blockers.add("FILED_DATE_INVALID")
-            elif filed_date != accepted_eastern_date:
-                blockers.add("FILED_DATE_MISMATCH")
             value = row.get("val")
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 invalid_count = True
@@ -284,6 +288,7 @@ def observe_shares(
         if (
             not invalid_fact_rows
             and not invalid_count
+            and not invalid_required_dates
             and len(count_values) == 1
             and len(class_values) <= 1
         ):

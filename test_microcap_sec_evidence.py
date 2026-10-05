@@ -299,6 +299,54 @@ class ObserveSharesTests(unittest.TestCase):
         self.assertIn("CONTRADICTORY_FACTS", result["blockers"])
         self.assertIsNone(result["observations"][0]["shares_count"])
 
+    def test_any_bad_end_in_joined_accession_blocks_its_share_count(self):
+        for bad_end in ("not-a-date", None, "2025-03-30"):
+            with self.subTest(bad_end=bad_end):
+                bad_row = {
+                    "accn": ACCESSION, "val": 50_000_000, "filed": "2025-05-15",
+                }
+                if bad_end is not None:
+                    bad_row["end"] = bad_end
+                submissions, facts = documents(fact_rows=[
+                    {
+                        "accn": ACCESSION, "end": "2025-03-31",
+                        "val": 100_000_000, "filed": "2025-05-15",
+                    },
+                    bad_row,
+                ])
+
+                result = observe(submissions, facts)
+
+                self.assertIn("REPORT_DATE_MISMATCH", result["blockers"])
+                self.assertIsNone(result["observations"][0]["shares_count"])
+                self.assertLessEqual(len(result["observations"]), 2)
+
+    def test_any_bad_filed_date_in_joined_accession_blocks_its_share_count(self):
+        for bad_filed in ("not-a-date", None, "2025-05-16"):
+            with self.subTest(bad_filed=bad_filed):
+                bad_row = {
+                    "accn": ACCESSION, "end": "2025-03-31", "val": 100_000_000,
+                }
+                if bad_filed is not None:
+                    bad_row["filed"] = bad_filed
+                submissions, facts = documents(fact_rows=[
+                    {
+                        "accn": ACCESSION, "end": "2025-03-31",
+                        "val": 100_000_000, "filed": "2025-05-15",
+                    },
+                    bad_row,
+                ])
+
+                result = observe(submissions, facts)
+
+                expected_blocker = (
+                    "FILED_DATE_INVALID" if bad_filed is None or bad_filed == "not-a-date"
+                    else "FILED_DATE_MISMATCH"
+                )
+                self.assertIn(expected_blocker, result["blockers"])
+                self.assertIsNone(result["observations"][0]["shares_count"])
+                self.assertLessEqual(len(result["observations"]), 2)
+
     def test_malformed_filing_arrays_are_not_partially_zipped(self):
         submissions, facts = documents()
         recent = submissions["filings"]["recent"]
