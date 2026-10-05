@@ -1567,6 +1567,24 @@ def microcap_research_panel_script(user=Depends(dashboard_auth)):
     )
 
 
+@app.get("/dashboard-legacy")
+def dashboard_legacy(user=Depends(dashboard_auth)):
+    return FileResponse(
+        Path(__file__).with_name("dashboard_legacy.html"),
+        media_type="text/html",
+        headers={"Cache-Control": "no-cache"},
+    )
+
+
+@app.get("/dashboard-app.js")
+def dashboard_app_script(user=Depends(dashboard_auth)):
+    return FileResponse(
+        Path(__file__).with_name("dashboard_app.js"),
+        media_type="application/javascript",
+        headers={"Cache-Control": "no-cache"},
+    )
+
+
 @app.get("/microcap-research-status")
 def microcap_research_status(user=Depends(dashboard_auth)):
     return read_readiness(

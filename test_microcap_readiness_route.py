@@ -145,6 +145,18 @@ class ReadinessRouteTests(unittest.TestCase):
         self.assertIn("renderMicrocapResearch", body)
         self.assertIn("loadMicrocapResearch", body)
 
+    def test_dashboard_legacy_and_app_script_require_auth(self):
+        server, _ = isolated_server()
+        for path, media in (("/dashboard-legacy", "text/html"),
+                            ("/dashboard-app.js", "application/javascript")):
+            with self.subTest(path=path):
+                status, _, _ = request_raw(server.app, path)
+                self.assertEqual(status, 401)
+                status, body, content_type = request_raw(server.app, path, auth=True)
+                self.assertEqual(status, 200)
+                self.assertTrue(content_type.startswith(media))
+                self.assertTrue(body.strip())
+
     def test_query_parameter_cannot_choose_snapshot_path(self):
         self.server.app.dependency_overrides[self.auth] = lambda: "authorized"
         route = next(route for route in self.server.app.routes
