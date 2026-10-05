@@ -1,7 +1,7 @@
 # Micro-cap Multi-sample Coverage Pilot and Focused Dashboard — Design
 
 Date: 2026-10-05
-Status: approved in brainstorming (sections 1–4), pending written-spec review
+Status: approved
 
 ## Goal
 
@@ -50,7 +50,7 @@ Requires `MASSIVE_API_KEY` and `SEC_USER_AGENT` in the environment.
    The SEC decision time is `start_utc`.
 6. Manifest fields: `schema_version: 1`, `kind: "microcap_batch_manifest"`,
    `created_at`, `as_of`, `rule` (days, per_day, min_open, max_open, min_volume,
-   min_move, max_candidates_per_day), `trading_days` (date + Massive `request_id`),
+   min_move, max_candidates_per_day, symbol_pattern `[A-Z]{1,6}`), `trading_days` (date + Massive `request_id`),
    `candidates` (audit rows above), `samples`, `bias`
    (`["RUNNER_SCREEN_SELECTED", "SELECTION_USES_SAME_DAY_OUTCOME", "UNVERIFIED_PILOT"]`),
    and `sha256` over the canonical JSON (sorted keys, no whitespace) of every other field.
@@ -117,8 +117,8 @@ blockers: [ sorted allowlisted codes ]
 
 Validation: allowlisted keys only; counts are non-negative ints with
 `observed <= total == sample_count == len(samples)`; coverage recomputed from rows must
-match; no duplicate (`date`, `issuer_id`); `issuer_id` is 10 digits; `symbol` uppercase
-1–10 chars `[A-Z.]`; stage error codes and blockers from fixed allowlists; bias exactly
+match; no duplicate (`date`, `issuer_id`); `issuer_id` is 10 digits; `symbol` matches
+`[A-Z]{1,6}` (class/unit symbols such as `BRK.B` are excluded at selection); stage error codes and blockers from fixed allowlists; bias exactly
 the three labels. No prices beyond `move_pct`, no article text, URLs, share counts, or
 credentials. Paths external, atomic write. Schema 1 publishing is unchanged.
 
