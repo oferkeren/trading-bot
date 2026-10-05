@@ -18,9 +18,13 @@ from test_microcap_source_probe import base_report, news, roster
 NOW = datetime(2026, 10, 5, 12, 19, 14, tzinfo=timezone.utc)
 
 
-def source_report():
-    return extend_coverage(base_report(), roster=None, alpaca_news=None,
-                           cap_evidence=None)
+def source_report(issuer_id="issuer-1"):
+    report = extend_coverage(base_report(), roster=None, alpaca_news=None,
+                             cap_evidence=None)
+    report["sample_manifest"]["issuer_ids"] = [issuer_id]
+    for row in report["matrix"]:
+        row["issuer_id"] = issuer_id
+    return report
 
 
 def sec_report():
@@ -215,7 +219,7 @@ class ProjectReadinessTests(unittest.TestCase):
 
     def test_sec_pilot_adds_only_unverified_observation_summary_and_blockers(self):
         sec = sec_report()
-        result = project_readiness(source_report(), sec, now=NOW)
+        result = project_readiness(source_report("0000000001"), sec, now=NOW)
         self.assertEqual(result["sources"]["shares"]["status"], "MARKET_CAP_UNVERIFIED")
         self.assertEqual(result["sources"]["shares"]["sec_observation_count"], 1)
         self.assertEqual(result["sources"]["sec"], {
@@ -235,6 +239,10 @@ class ProjectReadinessTests(unittest.TestCase):
         self.assertEqual(missing["sources"]["sec"]["status"], "MISSING")
         self.assertEqual(unavailable["sources"]["sec"]["status"], "UNAVAILABLE")
 
+    def test_sec_observations_require_a_canonical_numeric_sample_cik(self):
+        with self.assertRaises(CoverageError):
+            project_readiness(source_report(), sec_report(), now=NOW)
+
     def test_sec_decision_time_and_cik_must_match_declared_sample(self):
         outside_window = sec_report()
         outside_window["market_cap_gate"]["decision_at"] = "2025-05-29T00:00:00Z"
@@ -243,13 +251,10 @@ class ProjectReadinessTests(unittest.TestCase):
 
         for sec in (outside_window, wrong_cik):
             with self.subTest(sec=sec), self.assertRaises(CoverageError):
-                project_readiness(source_report(), sec, now=NOW)
+                project_readiness(source_report("0000000001"), sec, now=NOW)
 
-        numeric_cik_sample = source_report()
-        numeric_cik_sample["sample_manifest"]["issuer_ids"] = ["0000000002"]
-        numeric_cik_sample["matrix"][0]["issuer_id"] = "0000000002"
         with self.assertRaises(CoverageError):
-            project_readiness(numeric_cik_sample, sec_report(), now=NOW)
+            project_readiness(source_report("0000000002"), sec_report(), now=NOW)
 
     def test_sec_cannot_claim_verified_or_approve_trading(self):
         sec = {

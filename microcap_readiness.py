@@ -552,6 +552,8 @@ def project_readiness(
         sec_count, sec_blockers = _validate_sec(
             sec, issuer=issuer, start=window_start, end=window_end,
         )
+        if sec_count and not re.fullmatch(r"[0-9]{10}", issuer):
+            raise _invalid()
         sec_status = "OBSERVED" if sec_count else "UNAVAILABLE"
         blockers = sorted(set(blockers) | set(sec_blockers))
         if sec["market_cap_gate"]["coverage_truncated"]:
