@@ -13,9 +13,15 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import rebound_exits
 import rebound_journal as journal
+from trade_state import ACTIVE_STATES, ALLOWED_TRANSITIONS, transition_signal
 
 CLOSE_RETRY_SECONDS = 60
+ENTRY_TIMEOUT_SECONDS = 180
 _EASTERN = ZoneInfo("America/New_York")
+CANCELABLE_ENTRY_STATUSES = frozenset(
+    status for status in ACTIVE_STATES
+    if "CANCEL_REQUESTED" in ALLOWED_TRANSITIONS.get(status, set())
+)
 
 
 def parse_ib_time(value):
@@ -35,9 +41,84 @@ def parse_ib_time(value):
 
 
 def _open_signals(conn):
+    placeholders = ",".join("?" * len(journal.TERMINAL_STATUSES))
     return [dict(r) for r in conn.execute(
-        "SELECT * FROM signals WHERE strategy=? AND status='OPEN_POSITION' "
-        "AND entry_fill_price IS NOT NULL AND stop IS NOT NULL", (journal.STRATEGY,))]
+        f"SELECT * FROM signals WHERE strategy=? "
+        f"AND COALESCE(status,'') NOT IN ({placeholders}) "
+        "AND entry_fill_price IS NOT NULL AND stop IS NOT NULL",
+        (journal.STRATEGY, *sorted(journal.TERMINAL_STATUSES)))]
+
+
+def _signals_columns(conn):
+    return {row["name"] for row in conn.execute("PRAGMA table_info(signals)")}
+
+
+def _parse_signal_timestamp(value):
+    parsed = parse_ib_time(value)
+    if parsed is None:
+        return None
+    return parsed.astimezone(timezone.utc)
+
+
+def _entry_expired(signal, now):
+    created = _parse_signal_timestamp(signal.get("created_at") or signal.get("signal_time"))
+    if created is None:
+        return True, None
+    return (now.astimezone(timezone.utc) - created) >= timedelta(seconds=ENTRY_TIMEOUT_SECONDS), created
+
+
+def _entry_expired_recorded(conn, signal_id):
+    row = conn.execute(
+        "SELECT 1 FROM rebound_journal WHERE event='ENTRY_EXPIRED' AND signal_id=? LIMIT 1",
+        (signal_id,),
+    ).fetchone()
+    return row is not None
+
+
+def _request_entry_cancel(db_file, conn, signal, now):
+    sid = signal["signal_id"]
+    if not _entry_expired_recorded(conn, sid):
+        created = _parse_signal_timestamp(signal.get("created_at") or signal.get("signal_time"))
+        detail = {}
+        if created is not None:
+            detail["age_seconds"] = int((now.astimezone(timezone.utc) - created).total_seconds())
+        journal.record(db_file, "ENTRY_EXPIRED", symbol=signal.get("symbol"), signal_id=sid,
+                       reason="ENTRY_TIMEOUT", detail=detail, now=now)
+    try:
+        transition_signal(
+            db_file=db_file,
+            signal_id=sid,
+            new_status="CANCEL_REQUESTED",
+            event_type="CANCEL_REQUESTED",
+            source="rebound_stop_manager",
+            message="Rebound entry expired before fill",
+            payload={"parent_order_id": signal.get("parent_order_id")},
+            force=(signal.get("status") == "CANCEL_UNKNOWN"),
+        )
+    except Exception as exc:
+        journal.record(db_file, "ERROR", symbol=signal.get("symbol"), signal_id=sid,
+                       reason="ENTRY_CANCEL_REQUEST_FAILED",
+                       detail={"error": repr(exc), "status": signal.get("status")}, now=now)
+
+
+def _cancel_stale_entries(db_file, conn, now):
+    columns = _signals_columns(conn)
+    required = {"status", "entry_fill_price", "created_at", "signal_time", "parent_order_id"}
+    if not required.issubset(columns):
+        return
+    if not CANCELABLE_ENTRY_STATUSES:
+        return
+    placeholders = ",".join("?" * len(CANCELABLE_ENTRY_STATUSES))
+    rows = conn.execute(
+        f"SELECT * FROM signals WHERE strategy=? AND entry_fill_price IS NULL "
+        f"AND status IN ({placeholders}) AND parent_order_id IS NOT NULL",
+        (journal.STRATEGY, *sorted(CANCELABLE_ENTRY_STATUSES)),
+    ).fetchall()
+    for row in rows:
+        signal = dict(row)
+        expired, _ = _entry_expired(signal, now)
+        if expired:
+            _request_entry_cancel(db_file, conn, signal, now)
 
 
 def _ensure_position(db_file, conn, signal, now):
@@ -88,16 +169,27 @@ def _record_exits(db_file, conn, now):
 
 def _close_or_record_error(db_file, broker, signal, reason, symbol, sid, now):
     try:
-        broker.close(signal, reason)
+        return broker.close(signal, reason)
     except Exception as exc:
         journal.record(db_file, "ERROR", symbol=symbol, signal_id=sid, reason="CLOSE_FAILED",
                        detail={"error": repr(exc), "close_reason": reason}, now=now)
+        return None
+
+
+def _mark_flat_at_broker(db_file, conn, signal, position, now):
+    sid, symbol = position["signal_id"], position["symbol"]
+    _update(conn, sid, now, state="CLOSED", close_reason="FLAT_AT_BROKER")
+    journal.record(db_file, "EXIT", symbol=symbol, signal_id=sid, reason="FLAT_AT_BROKER",
+                   detail={"status": signal.get("status"), "exit_price": signal.get("exit_fill_price"),
+                           "pnl": signal.get("net_realized_pnl") or signal.get("realized_pnl"),
+                           "exit_reason": "FLAT_AT_BROKER"}, now=now)
 
 
 def tick(db_file, broker, now=None):
     now = now or datetime.now(timezone.utc)
     conn = journal.connect(db_file)
     try:
+        _cancel_stale_entries(db_file, conn, now)
         for signal in _open_signals(conn):
             try:
                 _manage(db_file, conn, broker, signal, now)
@@ -119,7 +211,19 @@ def _manage(db_file, conn, broker, signal, now):
             _update(conn, sid, now)
             journal.record(db_file, "CLOSE_REQUEST", symbol=symbol, signal_id=sid,
                            reason=position["close_reason"], detail={"retry": True}, now=now)
-            _close_or_record_error(db_file, broker, signal, position["close_reason"], symbol, sid, now)
+            result = _close_or_record_error(
+                db_file, broker, signal, position["close_reason"], symbol, sid, now)
+            if result == "FLAT":
+                _mark_flat_at_broker(db_file, conn, signal, position, now)
+        return
+    if not broker.stop_active(signal):
+        reason = "UNPROTECTED"
+        _update(conn, sid, now, state="CLOSING", close_reason=reason)
+        journal.record(db_file, "CLOSE_REQUEST", symbol=symbol, signal_id=sid,
+                       reason=reason, detail={"stop_active": False}, now=now)
+        result = _close_or_record_error(db_file, broker, signal, reason, symbol, sid, now)
+        if result == "FLAT":
+            _mark_flat_at_broker(db_file, conn, signal, position, now)
         return
     opened = datetime.fromisoformat(position["opened_at"])
     high = position["high_since_entry"]
@@ -152,7 +256,9 @@ def _manage(db_file, conn, broker, signal, now):
             _update(conn, sid, now, state="CLOSING", close_reason=reason)
             journal.record(db_file, "CLOSE_REQUEST", symbol=symbol, signal_id=sid,
                            reason=reason, detail={"high": high}, now=now)
-            _close_or_record_error(db_file, broker, signal, reason, symbol, sid, now)
+            result = _close_or_record_error(db_file, broker, signal, reason, symbol, sid, now)
+            if result == "FLAT":
+                _mark_flat_at_broker(db_file, conn, signal, position, now)
             return
         _update(conn, sid, now, current_stop=decision["stop"])
         journal.record(db_file, "STOP_MOVE", symbol=symbol, signal_id=sid,
@@ -163,26 +269,44 @@ def _manage(db_file, conn, broker, signal, now):
         _update(conn, sid, now, state="CLOSING", close_reason=reason)
         journal.record(db_file, "CLOSE_REQUEST", symbol=symbol, signal_id=sid,
                        reason=reason, detail={"high": high}, now=now)
-        _close_or_record_error(db_file, broker, signal, reason, symbol, sid, now)
+        result = _close_or_record_error(db_file, broker, signal, reason, symbol, sid, now)
+        if result == "FLAT":
+            _mark_flat_at_broker(db_file, conn, signal, position, now)
 
 
-def has_work(db_file):
+def has_work(db_file, now=None):
     """Cheap read-only check so the worker only connects to IBKR when needed."""
     import sqlite3
+    now = now or datetime.now(timezone.utc)
     try:
         conn = sqlite3.connect(f"file:{db_file}?mode=ro", uri=True, timeout=10)
+        conn.row_factory = sqlite3.Row
     except sqlite3.Error:
         return False
     try:
+        placeholders = ",".join("?" * len(journal.TERMINAL_STATUSES))
         open_signals = conn.execute(
-            "SELECT COUNT(*) FROM signals WHERE strategy=? AND status='OPEN_POSITION'",
-            (journal.STRATEGY,)).fetchone()[0]
+            f"SELECT COUNT(*) FROM signals WHERE strategy=? "
+            f"AND COALESCE(status,'') NOT IN ({placeholders}) "
+            "AND entry_fill_price IS NOT NULL",
+            (journal.STRATEGY, *sorted(journal.TERMINAL_STATUSES))).fetchone()[0]
+        stale_entries = 0
+        columns = _signals_columns(conn)
+        required = {"status", "entry_fill_price", "created_at", "signal_time", "parent_order_id"}
+        if required.issubset(columns) and CANCELABLE_ENTRY_STATUSES:
+            cancel_placeholders = ",".join("?" * len(CANCELABLE_ENTRY_STATUSES))
+            rows = conn.execute(
+                f"SELECT * FROM signals WHERE strategy=? AND entry_fill_price IS NULL "
+                f"AND status IN ({cancel_placeholders}) AND parent_order_id IS NOT NULL",
+                (journal.STRATEGY, *sorted(CANCELABLE_ENTRY_STATUSES)),
+            ).fetchall()
+            stale_entries = sum(1 for row in rows if _entry_expired(dict(row), now)[0])
         try:
             open_positions = conn.execute(
                 "SELECT COUNT(*) FROM rebound_positions WHERE state != 'CLOSED'").fetchone()[0]
         except sqlite3.OperationalError:
             open_positions = 0
-        return bool(open_signals or open_positions)
+        return bool(open_signals or stale_entries or open_positions)
     except sqlite3.Error:
         return False
     finally:

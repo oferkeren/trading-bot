@@ -1369,6 +1369,39 @@ def process_candidate(
         candidate
     )
 
+    strategy = str(
+        candidate.get(
+            "strategy",
+            STRATEGY_NAME,
+        )
+    ).strip()
+    symbol_for_gate = (
+        str(
+            candidate.get(
+                "symbol",
+                "",
+            )
+        )
+        .strip()
+        .upper()
+    )
+    if (
+        strategy == rebound_strategy.STRATEGY_NAME
+        and
+        candidate.get("_rebound_gated") is not True
+    ):
+        print(
+            "REBOUND UNGATED BLOCK | "
+            f"{symbol_for_gate} | "
+            "microcap_rebound_v1 must use ai_signal_bridge.process_rebound_candidate",
+            flush=True,
+        )
+        return {
+            "status": "REBOUND_UNGATED",
+            "symbol": symbol_for_gate,
+            "reason": "REBOUND_REQUIRES_AI_BRIDGE",
+        }
+
     payload = (
         build_payload(
             candidate,

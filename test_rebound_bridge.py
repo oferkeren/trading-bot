@@ -60,12 +60,14 @@ class ProcessReboundCandidateTests(unittest.TestCase):
         self.assertEqual(posted_candidate["_ai_final_quantity"], 500)
         self.assertEqual(self.journal_with_detail()[0][2]["quantity"], 500)
 
-    def test_rebound_payload_includes_designed_quantity(self):
+    def test_rebound_payload_includes_designed_quantity_without_gate_marker(self):
         self.run_with(MagicMock(return_value=STRONG))
         posted_candidate = self.post.call_args.args[0]
+        self.assertTrue(posted_candidate["_rebound_gated"])
         payload = ai_signal_bridge.build_payload(posted_candidate, "secret")
         self.assertEqual(payload["quantity"], 500)
         self.assertEqual(payload["strategy"], "microcap_rebound_v1")
+        self.assertNotIn("_rebound_gated", payload)
 
     def test_large_entry_skips_when_designed_size_is_below_one_share(self):
         candidate = {**CANDIDATE, "entry": 1500.0}
@@ -107,6 +109,42 @@ class ProcessReboundCandidateTests(unittest.TestCase):
                           return_value={"status": "X"}) as strict:
             self.assertEqual(ai_signal_bridge.process_candidate(dict(CANDIDATE), "s"), {"status": "X"})
         strict.assert_called_once()
+
+
+class OriginalBridgeReboundGateTests(unittest.TestCase):
+    def setUp(self):
+        self.settings = {
+            "BRIDGE_MODE": signal_bridge.BRIDGE_MODE,
+            "BRIDGE_DRY_RUN": signal_bridge.BRIDGE_DRY_RUN,
+            "BRIDGE_ALLOW_POST": signal_bridge.BRIDGE_ALLOW_POST,
+        }
+        signal_bridge.BRIDGE_MODE = "TEST"
+        signal_bridge.BRIDGE_DRY_RUN = False
+        signal_bridge.BRIDGE_ALLOW_POST = True
+
+    def tearDown(self):
+        for key, value in self.settings.items():
+            setattr(signal_bridge, key, value)
+
+    def test_original_process_candidate_rejects_ungated_rebound_without_posting(self):
+        with patch.object(signal_bridge, "send_payload") as send:
+            outcome = signal_bridge.process_candidate(dict(CANDIDATE), "secret")
+        self.assertEqual(outcome, {"status": "REBOUND_UNGATED", "symbol": "ABC",
+                                   "reason": "REBOUND_REQUIRES_AI_BRIDGE"})
+        send.assert_not_called()
+
+    def test_original_process_candidate_posts_gated_rebound(self):
+        candidate = dict(CANDIDATE, _rebound_gated=True)
+        with patch.object(signal_bridge, "signal_already_sent", return_value=False), \
+                patch.object(signal_bridge, "symbol_action_in_cooldown", return_value=(False, None)), \
+                patch.object(signal_bridge, "enforce_mode_api", return_value={"mode": "TEST", "test_mode": True}), \
+                patch.object(signal_bridge, "record_sent_signal"), \
+                patch.object(signal_bridge, "send_payload", return_value=(200, {"ok": True}, "ok")) as send:
+            outcome = signal_bridge.process_candidate(candidate, "secret")
+        self.assertEqual(outcome["status"], "TEST_SENT")
+        payload = send.call_args.args[0]
+        self.assertEqual(payload["strategy"], "microcap_rebound_v1")
+        self.assertNotIn("_rebound_gated", payload)
 
 
 class ReboundModeTests(unittest.TestCase):

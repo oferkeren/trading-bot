@@ -618,6 +618,7 @@ def process_rebound_candidate(candidate, secret, db_file=None):
         return skip("SKIP_SIZE")
     final_candidate = dict(candidate)
     final_candidate["_ai_final_quantity"] = quantity
+    final_candidate["_rebound_gated"] = True
     outcome = _original_process_candidate(final_candidate, secret)
     rebound_journal.record(
         db_file, "SIGNAL", symbol=symbol,

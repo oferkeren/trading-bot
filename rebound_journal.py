@@ -5,12 +5,11 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from trade_state import TERMINAL_STATES
+
 STRATEGY = "microcap_rebound_v1"
 DEFAULT_DB = str(Path(__file__).resolve().with_name("trading.db"))
-TERMINAL_STATUSES = frozenset({
-    "CLOSED_SL", "CLOSED_TP", "CLOSED", "CANCELLED", "REJECTED",
-    "BLOCKED", "TESTED", "ERROR", "EXPIRED",
-})
+TERMINAL_STATUSES = frozenset(TERMINAL_STATES)
 SKIP_DEDUPE_MINUTES = 10
 
 

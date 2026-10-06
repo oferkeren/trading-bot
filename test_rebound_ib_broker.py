@@ -11,6 +11,8 @@ def fake_wc():
     wc = types.SimpleNamespace(IB_ACCOUNT="DU1", ALLOW_OUTSIDE_RTH=True)
     wc.stock_contract = lambda symbol: ("contract", symbol)
     wc.load_order_state = lambda ib: None
+    wc.load_position_state = lambda ib: {symbol: dict(pos) for symbol, pos in ib.positions.items()}
+    wc.get_safe_parent_order_id = lambda ib_next_order_id: ib_next_order_id
     wc.check_market_session = lambda ib, symbol: {"market_rule": [], "min_tick": 0.01}
     wc.normalize_price_to_market_rule = worker_core.normalize_price_to_market_rule
     wc.build_stop_limit_price = worker_core.build_stop_limit_price
@@ -25,9 +27,17 @@ class FakeIB:
         self.placed = []
         self.fatal_order_error = threading.Event()
         self.expected_order_ids, self.reject_messages = set(), []
-        self.open_orders = [{"order_id": 12, "status": "PreSubmitted", "action": "SELL",
-                             "order_type": "STP LMT", "total_quantity": 500.0, "parent_id": 10,
-                             "order_ref": "ref-sl", "symbol": "ABC"}]
+        self.next_order_id = 99
+        self.cancelled = []
+        self.positions = {"ABC": {"quantity": 500.0, "avg_cost": 2.0}}
+        self.open_orders = [
+            {"order_id": 10, "status": "Filled", "action": "BUY", "order_type": "LMT",
+             "total_quantity": 500.0, "parent_id": 0, "order_ref": "ref-entry", "symbol": "ABC"},
+            {"order_id": 11, "status": "Submitted", "action": "SELL", "order_type": "LMT",
+             "total_quantity": 500.0, "parent_id": 10, "order_ref": "ref-tp", "symbol": "ABC"},
+            {"order_id": 12, "status": "PreSubmitted", "action": "SELL",
+             "order_type": "STP LMT", "total_quantity": 500.0, "parent_id": 10,
+             "order_ref": "ref-sl", "symbol": "ABC"}]
 
     def reqHistoricalData(self, req_id, *args):
         self.historical_bars[req_id] = list(self.bars)
@@ -42,8 +52,12 @@ class FakeIB:
             self.reject_messages.append("IBKR 201: rejected")
             self.fatal_order_error.set()
 
+    def cancelOrder(self, order_id, cancel):
+        self.cancelled.append(order_id)
 
-SIGNAL = {"signal_id": "s1", "symbol": "ABC", "stop_order_id": 12}
+
+SIGNAL = {"signal_id": "s1", "symbol": "ABC", "entry_order_id": 10,
+          "parent_order_id": 10, "target_order_id": 11, "stop_order_id": 12}
 
 
 class BrokerTests(unittest.TestCase):
@@ -83,9 +97,38 @@ class BrokerTests(unittest.TestCase):
         self.assertIs(type(order.lmtPrice), float)
         self.assertEqual((order.auxPrice, order.lmtPrice), (3.04, 2.91))
 
+    def test_stop_active_reports_stop_child_state(self):
+        ib = FakeIB()
+        broker = rib.IBReboundBroker(ib, fake_wc())
+        self.assertTrue(broker.stop_active(SIGNAL))
+        ib.open_orders[2]["status"] = "Filled"
+        self.assertFalse(broker.stop_active(SIGNAL))
+
+    def test_close_missing_stop_flattens_long_broker_position(self):
+        ib = FakeIB(bars=[{"timestamp": 4102444800, "close": 2.00, "high": 2.0}])
+        ib.open_orders[2]["status"] = "Filled"
+        result = rib.IBReboundBroker(ib, fake_wc()).close(SIGNAL, "MAX_HOLD")
+        self.assertEqual(result, "FLATTEN_SENT")
+        self.assertEqual(ib.cancelled, [11])
+        order_id, contract, order = ib.placed[-1]
+        self.assertEqual((order_id, contract), (99, ("contract", "ABC")))
+        self.assertEqual(ib.next_order_id, 100)
+        self.assertEqual((order.action, order.orderType, order.totalQuantity, order.lmtPrice),
+                         ("SELL", "LMT", 500.0, 1.94))
+        self.assertEqual((order.tif, order.outsideRth, order.account, order.orderRef),
+                         ("DAY", True, "DU1", "rebound-flatten-s1"))
+
+    def test_close_missing_stop_returns_flat_without_long_position(self):
+        ib = FakeIB(bars=[{"timestamp": 4102444800, "close": 2.00, "high": 2.0}])
+        ib.open_orders[2]["status"] = "Filled"
+        ib.positions = {}
+        result = rib.IBReboundBroker(ib, fake_wc()).close(SIGNAL, "MAX_HOLD")
+        self.assertEqual(result, "FLAT")
+        self.assertEqual(ib.placed, [])
+
     def test_missing_stop_and_reject_raise(self):
         ib = FakeIB()
-        ib.open_orders[0]["status"] = "Filled"
+        ib.open_orders[2]["status"] = "Filled"
         with self.assertRaises(LookupError):
             rib.IBReboundBroker(ib, fake_wc()).modify_stop(SIGNAL, 2.1)
         with self.assertRaises(RuntimeError):

@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import ROUND_CEILING, ROUND_FLOOR
 
 from ibapi.order import Order
+from ibapi.order_cancel import OrderCancel
 
 HISTORY_TIMEOUT_SECONDS = 10
 REJECT_WAIT_SECONDS = 3
@@ -56,6 +57,13 @@ class IBReboundBroker:
                 return item
         raise LookupError(f"{signal['signal_id']}: stop order {stop_id} not active")
 
+    def stop_active(self, signal):
+        try:
+            self._stop_order(signal)
+            return True
+        except LookupError:
+            return False
+
     def _rules(self, symbol):
         session = self.wc.check_market_session(self.ib, symbol)
         return session.get("market_rule") or [], float(session.get("min_tick") or 0.01)
@@ -96,10 +104,74 @@ class IBReboundBroker:
         if not bars:
             raise LookupError(f"{signal['symbol']}: no bars to price the close")
         last = float(bars[-1]["close"])
-        item = self._stop_order(signal)
+        try:
+            item = self._stop_order(signal)
+        except LookupError:
+            return self._flatten_without_stop(signal, last)
         rule, tick = self._rules(signal["symbol"])
         trigger, _ = self.wc.normalize_price_to_market_rule(last * CLOSE_TRIGGER_UP, rule, tick,
                                                             ROUND_CEILING)
         limit, _ = self.wc.normalize_price_to_market_rule(last * CLOSE_LIMIT_DOWN, rule, tick,
                                                           ROUND_FLOOR)
         self._place_stop(item, trigger, limit)
+
+    def _flatten_without_stop(self, signal, last):
+        self.wc.load_order_state(self.ib)
+        self._cancel_active_bracket_children(signal)
+        positions = self.wc.load_position_state(self.ib)
+        symbol = str(signal["symbol"]).strip().upper()
+        position = positions.get(symbol) or {}
+        quantity = float(position.get("quantity") or 0)
+        if quantity <= 0:
+            return "FLAT"
+        rule, tick = self._rules(symbol)
+        limit, _ = self.wc.normalize_price_to_market_rule(last * CLOSE_LIMIT_DOWN, rule, tick,
+                                                          ROUND_FLOOR)
+        order_id = self.wc.get_safe_parent_order_id(self.ib.next_order_id)
+        if order_id is None:
+            raise RuntimeError("flatten order id unavailable")
+        self.ib.next_order_id = int(order_id) + 1
+        order = Order()
+        order.orderId = int(order_id)
+        order.account = self.wc.IB_ACCOUNT
+        order.action = "SELL"
+        order.orderType = "LMT"
+        order.totalQuantity = quantity
+        order.lmtPrice = limit
+        order.tif = "DAY"
+        order.outsideRth = self.wc.ALLOW_OUTSIDE_RTH
+        order.transmit = True
+        order.orderRef = f"rebound-flatten-{signal['signal_id']}"
+        self.ib.expected_order_ids = {order.orderId}
+        self.ib.reject_messages = []
+        self.ib.fatal_order_error.clear()
+        self.ib.placeOrder(order.orderId, self.wc.stock_contract(symbol), order)
+        if self.ib.fatal_order_error.wait(timeout=REJECT_WAIT_SECONDS):
+            raise RuntimeError("; ".join(self.ib.reject_messages) or "flatten order rejected")
+        return "FLATTEN_SENT"
+
+    def _cancel_active_bracket_children(self, signal):
+        parent_ids = {
+            self._as_int(signal.get("entry_order_id")),
+            self._as_int(signal.get("parent_order_id")),
+        }
+        parent_ids.discard(None)
+        child_ids = {
+            self._as_int(signal.get("target_order_id")),
+            self._as_int(signal.get("stop_order_id")),
+        }
+        child_ids.discard(None)
+        for item in self.ib.open_orders:
+            order_id = self._as_int(item.get("order_id"))
+            parent_id = self._as_int(item.get("parent_id"))
+            if item.get("status") not in _ACTIVE_STATUSES:
+                continue
+            if order_id in child_ids or (parent_id in parent_ids and order_id not in parent_ids):
+                self.ib.cancelOrder(order_id, OrderCancel())
+
+    @staticmethod
+    def _as_int(value):
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
