@@ -200,6 +200,30 @@ class BrokerTests(unittest.TestCase):
 
         self.assertEqual(rib.IBReboundBroker(ib, fake_wc()).protection_state(signal), "EXITED")
 
+    def test_zero_parent_id_does_not_match_filled_entry_as_exit(self):
+        # Identity recovery can overwrite parent_order_id with IBKR's completed-order id 0;
+        # the filled entry (parent_id 0, LMT) must not be mistaken for a filled target.
+        signal = dict(SIGNAL, parent_order_id=0, entry_order_id=0)
+        ib = FakeIB()
+        ib.open_orders = ib.open_orders[1:]
+        ib.completed_orders = [
+            {"account": "DU1", "con_id": 0, "order_id": 0, "perm_id": 1000, "symbol": "ABC",
+             "status": "Filled", "parent_id": 0, "action": "BUY", "order_type": "LMT",
+             "total_quantity": 500.0, "order_ref": "TM:s1:ENTRY"}]
+
+        self.assertEqual(rib.IBReboundBroker(ib, fake_wc()).protection_state(signal), "ACTIVE")
+
+    def test_zero_stored_child_id_does_not_match_completed_zero_id_orders(self):
+        signal = dict(SIGNAL, target_order_id=0, target_order_ref=None, target_perm_id=None,
+                      signal_id="other")
+        ib = FakeIB()
+        ib.completed_orders = [
+            {"account": "DU1", "con_id": 0, "order_id": 0, "perm_id": 7, "symbol": "XYZ",
+             "status": "Filled", "parent_id": 3, "action": "SELL", "order_type": "LMT",
+             "total_quantity": 1.0, "order_ref": "unrelated"}]
+
+        self.assertEqual(rib.IBReboundBroker(ib, fake_wc()).protection_state(signal), "ACTIVE")
+
     def test_completed_target_with_ibapi_zero_order_id_matches_perm_id(self):
         signal = dict(SIGNAL)
         signal.pop("target_order_ref")

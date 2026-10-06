@@ -167,15 +167,15 @@ class IBReboundBroker:
         return [order for order in orders if self._valid_perm_id(order.get("perm_id")) == wanted]
 
     def _orders_by_id(self, orders, order_id):
-        wanted = self._as_int(order_id)
+        wanted = self._valid_order_id(order_id)
         if wanted is None:
             return []
         return [order for order in orders if self._as_int(order.get("order_id")) == wanted]
 
     def _orders_by_parent_and_type(self, signal, orders, role):
         parent_ids = {
-            self._as_int(signal.get("entry_order_id")),
-            self._as_int(signal.get("parent_order_id")),
+            self._valid_order_id(signal.get("entry_order_id")),
+            self._valid_order_id(signal.get("parent_order_id")),
         }
         parent_ids.discard(None)
         if not parent_ids:
@@ -189,6 +189,12 @@ class IBReboundBroker:
             if self._as_int(order.get("parent_id")) in parent_ids
             and order.get("order_type") in types
         ]
+
+    @classmethod
+    def _valid_order_id(cls, value):
+        # IBKR reports order_id 0 for completed orders, so 0 can't identify an order.
+        value = cls._as_int(value)
+        return value if value is not None and value > 0 else None
 
     @staticmethod
     def _valid_perm_id(value):
