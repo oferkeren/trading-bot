@@ -361,6 +361,10 @@ function testRenderRebound() {
   const doc = fakeDoc();
   app.renderRebound(doc, {
     stats: { trades: 3, wins: 2, losses: 1, total_pnl: 42.5 },
+    stats_by_session: {
+      EARLY_PRE: { trades: 2, wins: 1, losses: 1, total_pnl: 20 },
+      RTH: { trades: 1, wins: 0, losses: 1, total_pnl: -10 },
+    },
     open_positions: [{ symbol: ATTACK, entry: 2, initial_stop: 1.9, current_stop: 2.02,
       high_since_entry: 2.1, opened_at: "2026-10-06T14:00:00+00:00", state: "OPEN" }],
     trades: [{ exit_time: "x", symbol: "ABC", status: "CLOSED_TP", entry_fill_price: 2,
@@ -375,9 +379,12 @@ function testRenderRebound() {
     [ATTACK, "2.0000", "1.9000", "2.0200", "2.1000", "2026-10-06T14:00:00+00:00", "OPEN"]);
   assert.equal(doc.nodes.reboundTradeRows.children[0].children[5].className, "num neg");
   assert.deepEqual(cells(doc.nodes.reboundEventRows.children[0]), ["t", "SKIP", "ABC", "SKIP_CYCLES"]);
+  assert.equal(doc.nodes.reboundSessions.textContent,
+    "EARLY_PRE: 2 trades, 1W/1L, +20.00 · RTH: 1 trades, 0W/1L, -10.00");
   app.renderRebound(doc, null);
   assert.equal(doc.nodes.reboundTrades.textContent, "-");
   assert.equal(cells(doc.nodes.reboundOpenRows.children[0])[0], "No open rebound position");
+  assert.equal(doc.nodes.reboundSessions.textContent, "No closed trades by session yet");
 }
 
 async function testReboundFetchFailureShowsUnavailable() {

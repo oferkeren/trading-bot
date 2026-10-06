@@ -272,6 +272,13 @@
     setText(doc, "reboundTrades", plain(stats.trades));
     setText(doc, "reboundWinLoss", `${plain(stats.wins)} / ${plain(stats.losses)}`);
     setText(doc, "reboundPnl", signed(stats.total_pnl), pnlClass(stats.total_pnl));
+    const order = ["EARLY_PRE", "PRE", "RTH", "POST", "UNKNOWN"];
+    const sessions = object(body.stats_by_session);
+    const parts = order.filter(name => sessions[name]).map(name => {
+      const s = object(sessions[name]);
+      return `${name}: ${plain(s.trades)} trades, ${plain(s.wins)}W/${plain(s.losses)}L, ${signed(s.total_pnl)}`;
+    });
+    setText(doc, "reboundSessions", parts.length ? parts.join(" · ") : "No closed trades by session yet");
     fillRows(doc, "reboundOpenRows", list(body.open_positions).map(item => [
       [str(item.symbol)], [num(item.entry, 4), "num"], [num(item.initial_stop, 4), "num"],
       [num(item.current_stop, 4), "num"], [num(item.high_since_entry, 4), "num"],
@@ -402,6 +409,7 @@
         renderRebound(doc, await fetchJson(fetchImpl, "/rebound-journal", {}, win));
       } catch (error) {
         markUnavailable(doc, REBOUND_KPI_IDS);
+        setText(doc, "reboundSessions", "UNAVAILABLE");
         fillRows(doc, "reboundOpenRows", [], "UNAVAILABLE", 7);
         fillRows(doc, "reboundTradeRows", [], "UNAVAILABLE", 6);
         fillRows(doc, "reboundEventRows", [], "UNAVAILABLE", 4);
