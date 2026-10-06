@@ -116,6 +116,10 @@ class Base(unittest.TestCase):
 
 
 class JournalTests(Base):
+    def set_entry_time(self, sid, value):
+        with sqlite3.connect(self.db) as conn:
+            conn.execute("UPDATE signals SET entry_time=? WHERE signal_id=?", (value, sid))
+
     def test_terminal_statuses_match_trade_state(self):
         self.assertEqual(journal.TERMINAL_STATUSES, frozenset(trade_state.TERMINAL_STATES))
         self.assertNotIn("ERROR", journal.TERMINAL_STATUSES)
@@ -153,6 +157,32 @@ class JournalTests(Base):
         result = journal.summary(self.db)
         self.assertEqual(result["stats"], {"trades": 2, "wins": 1, "losses": 1, "total_pnl": 100.0})
         self.assertEqual(result["events"][0]["detail"], {"a": 1})
+
+    def test_session_of_entry_time(self):
+        self.assertEqual(journal.session_of_entry_time("20261006 05:12:00 US/Eastern"), "EARLY_PRE")
+        self.assertEqual(journal.session_of_entry_time("20261006 08:00:00 US/Eastern"), "PRE")
+        self.assertEqual(journal.session_of_entry_time("20261006 10:00:00 US/Eastern"), "RTH")
+        self.assertEqual(journal.session_of_entry_time("20261006 17:00:00 US/Eastern"), "POST")
+        self.assertEqual(journal.session_of_entry_time("20261006 14:00:00 Asia/Jerusalem"), "PRE")
+        for bad in (None, "", "garbage", "20261006 02:00:00 US/Eastern"):
+            self.assertEqual(journal.session_of_entry_time(bad), "UNKNOWN")
+
+    def test_summary_stats_by_session(self):
+        rows = [("e1", "20261006 05:10:00 US/Eastern", "CLOSED_TP", 40.0),
+                ("e2", "20261006 06:30:00 US/Eastern", "CLOSED_SL", -20.0),
+                ("r1", "20261006 10:00:00 US/Eastern", "CLOSED_SL", -10.0),
+                ("u1", None, "CLOSED_TP", 5.0)]
+        for sid, entry_time, status, pnl in rows:
+            add_signal(self.db, sid)
+            set_status(self.db, sid, status, 2.0, pnl)
+            self.set_entry_time(sid, entry_time)
+        by_session = journal.summary(self.db)["stats_by_session"]
+        self.assertEqual(by_session["EARLY_PRE"],
+                         {"trades": 2, "wins": 1, "losses": 1, "total_pnl": 20.0})
+        self.assertEqual(by_session["RTH"],
+                         {"trades": 1, "wins": 0, "losses": 1, "total_pnl": -10.0})
+        self.assertEqual(by_session["UNKNOWN"]["trades"], 1)
+        self.assertNotIn("POST", by_session)
 
     def test_summary_stats_include_all_closed_trades_when_trade_rows_limited(self):
         for i in range(40):

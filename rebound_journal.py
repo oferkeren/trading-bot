@@ -4,7 +4,9 @@ import json
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+import rebound_strategy
 from trade_state import TERMINAL_STATES
 
 STRATEGY = "microcap_rebound_v1"
@@ -31,6 +33,18 @@ def connect(db_file):
 
 def _iso(now):
     return (now or datetime.now(timezone.utc)).astimezone(timezone.utc).isoformat(timespec="seconds")
+
+
+def session_of_entry_time(value):
+    """Session label for an IB ``"YYYYMMDD HH:MM:SS Zone"`` entry time, else UNKNOWN."""
+    try:
+        date_part, time_part, *zone = str(value or "").split(" ")
+        tz = ZoneInfo(zone[0]) if zone else rebound_strategy.NEW_YORK
+        moment = datetime.strptime(f"{date_part} {time_part}", "%Y%m%d %H:%M:%S").replace(tzinfo=tz)
+    except (ValueError, ZoneInfoNotFoundError):
+        return "UNKNOWN"
+    profile = rebound_strategy.profile_for(moment)
+    return profile.session if profile else "UNKNOWN"
 
 
 def record(db_file, event, *, symbol=None, signal_id=None, reason=None, detail=None, now=None):
@@ -112,10 +126,26 @@ def summary(db_file, limit=50):
                 "losses": int(stats_row["losses"] or 0),
                 "total_pnl": float(stats_row["total_pnl"] or 0.0),
             }
+            by_session = {}
+            for row in conn.execute(
+                    "SELECT entry_time, COALESCE(net_realized_pnl, realized_pnl) AS pnl "
+                    "FROM signals WHERE strategy=? AND status IN ('CLOSED_SL','CLOSED_TP','CLOSED')",
+                    (STRATEGY,)):
+                bucket = by_session.setdefault(session_of_entry_time(row["entry_time"]),
+                                               {"trades": 0, "wins": 0, "losses": 0,
+                                                "total_pnl": 0.0})
+                pnl = row["pnl"]
+                bucket["trades"] += 1
+                if pnl is not None and float(pnl) > 0:
+                    bucket["wins"] += 1
+                elif pnl is not None:
+                    bucket["losses"] += 1
+                bucket["total_pnl"] = round(bucket["total_pnl"] + float(pnl or 0.0), 2)
         except sqlite3.OperationalError:
             trades = []
             stats = {"trades": 0, "wins": 0, "losses": 0, "total_pnl": 0.0}
+            by_session = {}
     for event in events:
         event["detail"] = json.loads(event["detail"]) if event["detail"] else None
     return {"strategy": STRATEGY, "stats": stats, "open_positions": positions,
-            "trades": trades, "events": events}
+            "stats_by_session": by_session, "trades": trades, "events": events}
