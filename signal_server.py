@@ -7,9 +7,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import Depends
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
+import rebound_journal
 from microcap_readiness_store import read_readiness
 from signal_server_core import *
 from strategy_status import read_snapshot
@@ -1587,6 +1588,18 @@ def dashboard_app_script(user=Depends(dashboard_auth)):
     )
 
 
+@app.get("/rebound-journal")
+def rebound_journal_status(user=Depends(dashboard_auth)):
+    db_file = os.environ.get("REBOUND_DB_FILE") or rebound_journal.DEFAULT_DB
+    try:
+        return rebound_journal.summary(db_file)
+    except Exception as exc:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "REBOUND_JOURNAL_UNAVAILABLE", "detail": type(exc).__name__},
+        )
+
+
 @app.get("/microcap-research-status")
 def microcap_research_status(user=Depends(dashboard_auth)):
     return read_readiness(
@@ -2666,4 +2679,3 @@ def trading_mode_change(
     return _mode_command(
         mode
     )
-

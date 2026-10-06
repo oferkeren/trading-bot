@@ -357,6 +357,36 @@ async function testResearchFetchHasTimeout() {
   assert.equal(outcome, "failed");
 }
 
+function testRenderRebound() {
+  const doc = fakeDoc();
+  app.renderRebound(doc, {
+    stats: { trades: 3, wins: 2, losses: 1, total_pnl: 42.5 },
+    open_positions: [{ symbol: ATTACK, entry: 2, initial_stop: 1.9, current_stop: 2.02,
+      high_since_entry: 2.1, opened_at: "2026-10-06T14:00:00+00:00", state: "OPEN" }],
+    trades: [{ exit_time: "x", symbol: "ABC", status: "CLOSED_TP", entry_fill_price: 2,
+      exit_fill_price: 2.3, pnl: -5 }],
+    events: [{ ts: "t", event: "SKIP", symbol: "ABC", reason: "SKIP_CYCLES" }],
+  });
+  assert.equal(doc.nodes.reboundTrades.textContent, "3");
+  assert.equal(doc.nodes.reboundWinLoss.textContent, "2 / 1");
+  assert.equal(doc.nodes.reboundPnl.textContent, "+42.50");
+  assert.equal(doc.nodes.reboundPnl.className, "pos");
+  assert.deepEqual(cells(doc.nodes.reboundOpenRows.children[0]),
+    [ATTACK, "2.0000", "1.9000", "2.0200", "2.1000", "2026-10-06T14:00:00+00:00", "OPEN"]);
+  assert.equal(doc.nodes.reboundTradeRows.children[0].children[5].className, "num neg");
+  assert.deepEqual(cells(doc.nodes.reboundEventRows.children[0]), ["t", "SKIP", "ABC", "SKIP_CYCLES"]);
+  app.renderRebound(doc, null);
+  assert.equal(doc.nodes.reboundTrades.textContent, "-");
+  assert.equal(cells(doc.nodes.reboundOpenRows.children[0])[0], "No open rebound position");
+}
+
+async function testReboundFetchFailureShowsUnavailable() {
+  const { doc, instance } = harness({ "/rebound-journal": new Error("down") });
+  await instance.refreshRebound();
+  assert.equal(doc.nodes.reboundTrades.textContent, "UNAVAILABLE");
+  assert.equal(cells(doc.nodes.reboundEventRows.children[0])[0], "UNAVAILABLE");
+}
+
 function testNoUnsafeHtmlSinks() {
   const source = fs.readFileSync(require.resolve("./dashboard_app.js"), "utf8");
   assert.doesNotMatch(source, /innerHTML|outerHTML|insertAdjacentHTML|document\.write|https?:\/\//);
@@ -377,6 +407,8 @@ function testNoUnsafeHtmlSinks() {
   await testFetchTimeoutUnblocksPolling();
   await testFetchTimeoutCoversBodyRead();
   await testResearchFetchHasTimeout();
+  testRenderRebound();
+  await testReboundFetchFailureShowsUnavailable();
   testNoUnsafeHtmlSinks();
   console.log("dashboard_app tests passed");
 })().catch(error => {

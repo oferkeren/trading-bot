@@ -6,6 +6,8 @@
   const POLL_MS = 5000;
   const MODE_POLL_MS = 30000;
   const RESEARCH_POLL_MS = 60000;
+  const REBOUND_POLL_MS = 15000;
+  const REBOUND_KPI_IDS = ["reboundTrades", "reboundWinLoss", "reboundPnl"];
   const POSITION_IDS = ["posManagedCount", "posTotalCount", "posMarketValue", "posUnrealized",
     "posUnprotected"];
 
@@ -264,6 +266,27 @@
     }
   }
 
+  function renderRebound(doc, data) {
+    const body = object(data);
+    const stats = object(body.stats);
+    setText(doc, "reboundTrades", plain(stats.trades));
+    setText(doc, "reboundWinLoss", `${plain(stats.wins)} / ${plain(stats.losses)}`);
+    setText(doc, "reboundPnl", signed(stats.total_pnl), pnlClass(stats.total_pnl));
+    fillRows(doc, "reboundOpenRows", list(body.open_positions).map(item => [
+      [str(item.symbol)], [num(item.entry, 4), "num"], [num(item.initial_stop, 4), "num"],
+      [num(item.current_stop, 4), "num"], [num(item.high_since_entry, 4), "num"],
+      [str(item.opened_at)], [str(item.state)],
+    ]), "No open rebound position", 7);
+    fillRows(doc, "reboundTradeRows", list(body.trades).map(item => [
+      [str(item.exit_time)], [str(item.symbol)], [str(item.status)],
+      [num(item.entry_fill_price, 4), "num"], [num(item.exit_fill_price, 4), "num"],
+      [signed(item.pnl), `num ${pnlClass(item.pnl)}`.trim()],
+    ]), "No closed rebound trades yet", 6);
+    fillRows(doc, "reboundEventRows", list(body.events).slice(0, 20).map(item => [
+      [str(item.ts)], [str(item.event)], [str(item.symbol)], [str(item.reason)],
+    ]), "No decisions yet", 4);
+  }
+
   async function fetchJson(fetchImpl, url, options, timerSource) {
     const timers = timerSource || root;
     const controller = typeof (timers || {}).AbortController === "function"
@@ -374,6 +397,17 @@
       }
     }
 
+    async function refreshRebound() {
+      try {
+        renderRebound(doc, await fetchJson(fetchImpl, "/rebound-journal", {}, win));
+      } catch (error) {
+        markUnavailable(doc, REBOUND_KPI_IDS);
+        fillRows(doc, "reboundOpenRows", [], "UNAVAILABLE", 7);
+        fillRows(doc, "reboundTradeRows", [], "UNAVAILABLE", 6);
+        fillRows(doc, "reboundEventRows", [], "UNAVAILABLE", 4);
+      }
+    }
+
     function openKill() {
       state.killTarget = state.killOn !== true;
       setText(doc, "killModalTitle", state.killTarget ? "Enable kill switch" : "Disable kill switch");
@@ -477,6 +511,7 @@
       const pollTop = guarded("top", refreshTop);
       const pollActive = guarded("active", refreshActive);
       const pollResearch = guarded("research", refreshResearch);
+      const pollRebound = guarded("rebound", refreshRebound);
       const pollMode = guarded("mode", loadMode);
       win.addEventListener("hashchange", () => {
         selectTab(win.location.hash);
@@ -486,17 +521,20 @@
       pollMode().then(pollTop);
       pollActive();
       pollResearch();
+      pollRebound();
       win.setInterval(() => { pollTop(); pollActive(); }, POLL_MS);
       win.setInterval(pollMode, MODE_POLL_MS);
       win.setInterval(pollResearch, RESEARCH_POLL_MS);
+      win.setInterval(pollRebound, REBOUND_POLL_MS);
     }
 
-    return { start, selectTab, refreshTop, refreshActive, refreshResearch, openKill,
+    return { start, selectTab, refreshTop, refreshActive, refreshResearch, refreshRebound, openKill,
       closeKill, confirmKill, changeMode, state };
   }
 
   const api = { TABS, tabFromHash, ibkrState, modeLabel, killSwitchBody, modeConfirmations,
-    renderTopBar, renderPositions, renderOrders, renderHealth, markUnavailable, createApp };
+    renderTopBar, renderPositions, renderOrders, renderHealth, renderRebound, markUnavailable,
+    createApp };
   if (typeof module !== "undefined" && module.exports) {
     module.exports = api;
   }

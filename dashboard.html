@@ -86,6 +86,29 @@ ul.list{margin:0;padding-left:18px;font-size:13px}
   <main>
     <section id="tab-research">
       <h1>Micro-cap research</h1>
+      <div class="card">
+        <h2>Paper trades · microcap_rebound_v1</h2>
+        <div class="kpis">
+          <div class="kpi"><div class="kpi-label">Closed trades</div><div id="reboundTrades" class="kpi-value">-</div></div>
+          <div class="kpi"><div class="kpi-label">Wins / losses</div><div id="reboundWinLoss" class="kpi-value">-</div></div>
+          <div class="kpi"><div class="kpi-label">Net P&amp;L</div><div id="reboundPnl" class="kpi-value">-</div></div>
+        </div>
+        <h3>Open position</h3>
+        <table>
+          <thead><tr><th>Symbol</th><th class="num">Entry</th><th class="num">Initial stop</th><th class="num">Stop now</th><th class="num">High</th><th>Opened</th><th>State</th></tr></thead>
+          <tbody id="reboundOpenRows"></tbody>
+        </table>
+        <h3>Closed trades</h3>
+        <table>
+          <thead><tr><th>Exit time</th><th>Symbol</th><th>Result</th><th class="num">Entry</th><th class="num">Exit</th><th class="num">P&amp;L</th></tr></thead>
+          <tbody id="reboundTradeRows"></tbody>
+        </table>
+        <h3>Recent decisions</h3>
+        <table>
+          <thead><tr><th>Time (UTC)</th><th>Event</th><th>Symbol</th><th>Reason</th></tr></thead>
+          <tbody id="reboundEventRows"></tbody>
+        </table>
+      </div>
       <div class="sub row">
         <span id="microcapDecision" class="pill warn">NO TRADE</span>
         <span id="microcapStatus" class="pill warn">-</span>
