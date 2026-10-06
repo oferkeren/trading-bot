@@ -1,19 +1,8 @@
 import inspect
-import os
-import sys
 import threading
-import types
 import unittest
 from decimal import Decimal
 from unittest.mock import MagicMock, patch
-
-os.environ.setdefault("PYTHON_DOTENV_DISABLED", "1")
-resolver = types.ModuleType("protection_position_resolver")
-resolver.resolve_recovery_position = lambda **kwargs: {"status": "UNKNOWN", "reason": "test stub"}
-sys.modules.setdefault("protection_position_resolver", resolver)
-guard = types.ModuleType("protection_guard")
-guard.evaluate_live_protection = lambda *args, **kwargs: None
-sys.modules.setdefault("protection_guard", guard)
 
 import worker_core
 
