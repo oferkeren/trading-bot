@@ -86,6 +86,14 @@ def _record_exits(db_file, conn, now):
                                    "pnl": row["pnl"], "exit_reason": row["exit_reason"]}, now=now)
 
 
+def _close_or_record_error(db_file, broker, signal, reason, symbol, sid, now):
+    try:
+        broker.close(signal, reason)
+    except Exception as exc:
+        journal.record(db_file, "ERROR", symbol=symbol, signal_id=sid, reason="CLOSE_FAILED",
+                       detail={"error": repr(exc), "close_reason": reason}, now=now)
+
+
 def tick(db_file, broker, now=None):
     now = now or datetime.now(timezone.utc)
     conn = journal.connect(db_file)
@@ -109,9 +117,9 @@ def _manage(db_file, conn, broker, signal, now):
         updated = datetime.fromisoformat(position["updated_at"])
         if now - updated >= timedelta(seconds=CLOSE_RETRY_SECONDS):
             _update(conn, sid, now)
-            broker.close(signal, position["close_reason"])
             journal.record(db_file, "CLOSE_REQUEST", symbol=symbol, signal_id=sid,
                            reason=position["close_reason"], detail={"retry": True}, now=now)
+            _close_or_record_error(db_file, broker, signal, position["close_reason"], symbol, sid, now)
         return
     opened = datetime.fromisoformat(position["opened_at"])
     high = position["high_since_entry"]
@@ -140,20 +148,22 @@ def _manage(db_file, conn, broker, signal, now):
         except Exception as exc:
             journal.record(db_file, "ERROR", symbol=symbol, signal_id=sid,
                            reason="STOP_MODIFY_FAILED", detail={"error": repr(exc)}, now=now)
-            broker.close(signal, "STOP_MODIFY_FAILED")
-            _update(conn, sid, now, state="CLOSING", close_reason="STOP_MODIFY_FAILED")
+            reason = "STOP_MODIFY_FAILED"
+            _update(conn, sid, now, state="CLOSING", close_reason=reason)
             journal.record(db_file, "CLOSE_REQUEST", symbol=symbol, signal_id=sid,
-                           reason="STOP_MODIFY_FAILED", detail={"high": high}, now=now)
+                           reason=reason, detail={"high": high}, now=now)
+            _close_or_record_error(db_file, broker, signal, reason, symbol, sid, now)
             return
         _update(conn, sid, now, current_stop=decision["stop"])
         journal.record(db_file, "STOP_MOVE", symbol=symbol, signal_id=sid,
                        detail={"from": position["current_stop"], "to": decision["stop"], "high": high},
                        now=now)
     elif decision["action"] == "CLOSE":
-        broker.close(signal, decision["reason"])
-        _update(conn, sid, now, state="CLOSING", close_reason=decision["reason"])
+        reason = decision["reason"]
+        _update(conn, sid, now, state="CLOSING", close_reason=reason)
         journal.record(db_file, "CLOSE_REQUEST", symbol=symbol, signal_id=sid,
-                       reason=decision["reason"], detail={"high": high}, now=now)
+                       reason=reason, detail={"high": high}, now=now)
+        _close_or_record_error(db_file, broker, signal, reason, symbol, sid, now)
 
 
 def has_work(db_file):

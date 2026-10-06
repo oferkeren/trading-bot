@@ -1,4 +1,5 @@
 import os
+import json
 import sqlite3
 import tempfile
 import unittest
@@ -65,6 +66,19 @@ class FakeBroker:
 def events(path):
     with sqlite3.connect(path) as conn:
         return [r[0] for r in conn.execute("SELECT event FROM rebound_journal ORDER BY id")]
+
+
+def journal_rows(path):
+    with sqlite3.connect(path) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT event, reason, detail FROM rebound_journal ORDER BY id").fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["detail"] = json.loads(item["detail"]) if item["detail"] else None
+            result.append(item)
+        return result
 
 
 def position(path, sid):
@@ -193,6 +207,67 @@ class ManagerTests(Base):
         self.assertEqual(broker.calls, [("close", "a", "STOP_MODIFY_FAILED")])
         self.assertEqual(position(self.db, "a")["state"], "CLOSING")
         self.assertEqual(position(self.db, "a")["close_reason"], "STOP_MODIFY_FAILED")
+
+    def test_stop_modify_failure_close_failure_waits_until_retry_window(self):
+        add_signal(self.db, "a")
+        broker = FakeBroker(highs=[2.25])
+
+        def fail_modify(signal, trigger):
+            broker.calls.append(("modify_stop", signal["signal_id"], trigger))
+            raise RuntimeError("modify down")
+
+        def fail_close(signal, reason):
+            broker.calls.append(("close", signal["signal_id"], reason))
+            raise RuntimeError("close down")
+
+        broker.modify_stop = fail_modify
+        broker.close = fail_close
+
+        first = T0 + timedelta(minutes=1)
+        for offset in (0, 5, 10):
+            manager.tick(self.db, broker, first + timedelta(seconds=offset))
+
+        self.assertEqual(broker.calls, [("modify_stop", "a", 2.15),
+                                        ("close", "a", "STOP_MODIFY_FAILED")])
+        self.assertEqual(position(self.db, "a")["state"], "CLOSING")
+        self.assertEqual(position(self.db, "a")["close_reason"], "STOP_MODIFY_FAILED")
+        rows = journal_rows(self.db)
+        self.assertIn({"event": "ERROR", "reason": "STOP_MODIFY_FAILED",
+                       "detail": {"error": "RuntimeError('modify down')"}}, rows)
+        self.assertIn({"event": "ERROR", "reason": "CLOSE_FAILED",
+                       "detail": {"close_reason": "STOP_MODIFY_FAILED",
+                                  "error": "RuntimeError('close down')"}}, rows)
+
+        manager.tick(self.db, broker, first + timedelta(seconds=61))
+        self.assertEqual(broker.calls, [("modify_stop", "a", 2.15),
+                                        ("close", "a", "STOP_MODIFY_FAILED"),
+                                        ("close", "a", "STOP_MODIFY_FAILED")])
+
+    def test_max_hold_close_failure_waits_until_retry_window(self):
+        add_signal(self.db)
+        broker = FakeBroker()
+
+        def fail_close(signal, reason):
+            broker.calls.append(("close", signal["signal_id"], reason))
+            raise RuntimeError("close down")
+
+        broker.close = fail_close
+
+        first = T0 + timedelta(minutes=20)
+        manager.tick(self.db, broker, first)
+
+        self.assertEqual(broker.calls, [("close", "s1", "MAX_HOLD")])
+        self.assertEqual(position(self.db, "s1")["state"], "CLOSING")
+        rows = journal_rows(self.db)
+        self.assertIn({"event": "ERROR", "reason": "CLOSE_FAILED",
+                       "detail": {"close_reason": "MAX_HOLD",
+                                  "error": "RuntimeError('close down')"}}, rows)
+
+        manager.tick(self.db, broker, first + timedelta(seconds=30))
+        self.assertEqual(len(broker.calls), 1)
+        manager.tick(self.db, broker, first + timedelta(seconds=61))
+        self.assertEqual(broker.calls, [("close", "s1", "MAX_HOLD"),
+                                        ("close", "s1", "MAX_HOLD")])
 
     def test_ignores_other_strategies(self):
         add_signal(self.db, strategy="scalp_pingpong_v1")
