@@ -132,6 +132,24 @@ class JournalTests(Base):
         self.assertEqual(result["stats"], {"trades": 2, "wins": 1, "losses": 1, "total_pnl": 100.0})
         self.assertEqual(result["events"][0]["detail"], {"a": 1})
 
+    def test_summary_stats_include_all_closed_trades_when_trade_rows_limited(self):
+        for i in range(40):
+            sid = f"w{i}"
+            add_signal(self.db, sid)
+            set_status(self.db, sid, "CLOSED_TP", 2.1, 2.0)
+        for i in range(20):
+            sid = f"l{i}"
+            add_signal(self.db, sid)
+            set_status(self.db, sid, "CLOSED_SL", 1.9, -1.0)
+
+        result = journal.summary(self.db, limit=50)
+
+        self.assertEqual(
+            result["stats"],
+            {"trades": 60, "wins": 40, "losses": 20, "total_pnl": 60.0},
+        )
+        self.assertEqual(len(result["trades"]), 50)
+
 
 class ManagerTests(Base):
     def test_entry_then_ratchet(self):

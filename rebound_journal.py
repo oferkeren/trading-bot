@@ -89,16 +89,24 @@ def summary(db_file, limit=50):
                 "COALESCE(net_realized_pnl, realized_pnl) AS pnl, exit_reason, entry_time, exit_time "
                 "FROM signals WHERE strategy=? AND status IN ('CLOSED_SL','CLOSED_TP','CLOSED') "
                 "ORDER BY rowid DESC LIMIT ?", (STRATEGY, int(limit)))]
+            stats_row = conn.execute(
+                "SELECT COUNT(*) AS trades, "
+                "SUM(CASE WHEN COALESCE(net_realized_pnl, realized_pnl) > 0 THEN 1 ELSE 0 END) AS wins, "
+                "SUM(CASE WHEN COALESCE(net_realized_pnl, realized_pnl) <= 0 THEN 1 ELSE 0 END) AS losses, "
+                "ROUND(COALESCE(SUM(COALESCE(net_realized_pnl, realized_pnl)), 0), 2) AS total_pnl "
+                "FROM signals WHERE strategy=? AND status IN ('CLOSED_SL','CLOSED_TP','CLOSED')",
+                (STRATEGY,),
+            ).fetchone()
+            stats = {
+                "trades": int(stats_row["trades"] or 0),
+                "wins": int(stats_row["wins"] or 0),
+                "losses": int(stats_row["losses"] or 0),
+                "total_pnl": float(stats_row["total_pnl"] or 0.0),
+            }
         except sqlite3.OperationalError:
             trades = []
+            stats = {"trades": 0, "wins": 0, "losses": 0, "total_pnl": 0.0}
     for event in events:
         event["detail"] = json.loads(event["detail"]) if event["detail"] else None
-    pnls = [t["pnl"] for t in trades if t["pnl"] is not None]
-    stats = {
-        "trades": len(trades),
-        "wins": sum(1 for p in pnls if p > 0),
-        "losses": sum(1 for p in pnls if p <= 0),
-        "total_pnl": round(sum(pnls), 2),
-    }
     return {"strategy": STRATEGY, "stats": stats, "open_positions": positions,
             "trades": trades, "events": events}
