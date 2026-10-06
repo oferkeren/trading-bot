@@ -607,14 +607,25 @@ def process_rebound_candidate(candidate, secret, db_file=None):
     }
     if not passed:
         return skip(reason, news)
-    outcome = _original_process_candidate(candidate, secret)
+    try:
+        entry = float(candidate["entry"])
+    except (KeyError, TypeError, ValueError):
+        return skip("SKIP_SIZE")
+    if not math.isfinite(entry) or entry <= 0:
+        return skip("SKIP_SIZE")
+    quantity = math.floor(rebound_strategy.MAX_POSITION_USD / entry)
+    if quantity < 1:
+        return skip("SKIP_SIZE")
+    final_candidate = dict(candidate)
+    final_candidate["_ai_final_quantity"] = quantity
+    outcome = _original_process_candidate(final_candidate, secret)
     rebound_journal.record(
         db_file, "SIGNAL", symbol=symbol,
         signal_id=(outcome or {}).get("signal_id"),
         reason=(outcome or {}).get("status"),
-        detail={"entry": candidate.get("entry"), "stop": candidate.get("stop"),
-                "target": candidate.get("target"), "news": news,
-                "rebound": candidate.get("rebound")},
+        detail={"entry": final_candidate.get("entry"), "stop": final_candidate.get("stop"),
+                "target": final_candidate.get("target"), "quantity": quantity,
+                "news": news, "rebound": final_candidate.get("rebound")},
     )
     return outcome
 

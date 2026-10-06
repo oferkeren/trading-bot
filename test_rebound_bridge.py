@@ -1,4 +1,5 @@
 import os
+import json
 import sqlite3
 import tempfile
 import unittest
@@ -38,11 +39,42 @@ class ProcessReboundCandidateTests(unittest.TestCase):
         with sqlite3.connect(self.db) as conn:
             return conn.execute("SELECT event, reason FROM rebound_journal ORDER BY id").fetchall()
 
+    def journal_with_detail(self):
+        with sqlite3.connect(self.db) as conn:
+            rows = conn.execute(
+                "SELECT event, reason, detail FROM rebound_journal ORDER BY id"
+            ).fetchall()
+        return [(event, reason, json.loads(detail) if detail else None)
+                for event, reason, detail in rows]
+
     def test_strong_news_posts_and_journals_signal(self):
-        outcome = self.run_with(MagicMock(return_value=STRONG))
+        original = dict(CANDIDATE)
+        with patch.object(ai_signal_bridge.ai_gate, "evaluate_trade_candidate",
+                          MagicMock(return_value=STRONG)):
+            outcome = ai_signal_bridge.process_rebound_candidate(original, "s", db_file=self.db)
         self.assertEqual(outcome["signal_id"], "sig-1")
         self.post.assert_called_once()
-        self.assertEqual(self.journal(), [("SIGNAL", "SENT")])
+        posted_candidate = self.post.call_args.args[0]
+        self.assertIsNot(posted_candidate, original)
+        self.assertNotIn("_ai_final_quantity", original)
+        self.assertEqual(posted_candidate["_ai_final_quantity"], 500)
+        self.assertEqual(self.journal_with_detail()[0][2]["quantity"], 500)
+
+    def test_rebound_payload_includes_designed_quantity(self):
+        self.run_with(MagicMock(return_value=STRONG))
+        posted_candidate = self.post.call_args.args[0]
+        payload = ai_signal_bridge.build_payload(posted_candidate, "secret")
+        self.assertEqual(payload["quantity"], 500)
+        self.assertEqual(payload["strategy"], "microcap_rebound_v1")
+
+    def test_large_entry_skips_when_designed_size_is_below_one_share(self):
+        candidate = {**CANDIDATE, "entry": 1500.0}
+        with patch.object(ai_signal_bridge.ai_gate, "evaluate_trade_candidate",
+                          MagicMock(return_value=STRONG)):
+            outcome = ai_signal_bridge.process_rebound_candidate(candidate, "s", db_file=self.db)
+        self.assertEqual(outcome["reason"], "SKIP_SIZE")
+        self.post.assert_not_called()
+        self.assertEqual(self.journal(), [("SKIP", "SKIP_SIZE")])
 
     def test_weak_news_is_skipped(self):
         weak = {**STRONG, "ai": {"news_score": 0.2, "event_type": "CONTRACT"}}
