@@ -334,6 +334,16 @@ def get_risk_preview(
 
                 "stop":
                     stop,
+
+                "action":
+                    str(
+                        candidate.get(
+                            "action",
+                            ""
+                        )
+                    )
+                    .strip()
+                    .upper(),
             }
         )
     )
@@ -635,34 +645,6 @@ def process_candidate(
 
 
     # ========================================================
-    # LONG ONLY FOR NOW
-    # ========================================================
-
-    if action != "BUY":
-        print(
-            "AI BRIDGE BLOCK | "
-            f"{symbol} | "
-            "Only BUY is currently enabled",
-            flush=True,
-        )
-
-
-        return {
-            "status":
-                "AI_BLOCKED",
-
-            "symbol":
-                symbol,
-
-            "reason":
-                "UNSUPPORTED_ACTION",
-
-            "ai_decision":
-                "BLOCK",
-        }
-
-
-    # ========================================================
     # AI DISABLED
     # ========================================================
 
@@ -720,6 +702,25 @@ def process_candidate(
             flush=True,
         )
 
+        error_text = str(exc).lower()
+
+        if (
+            "news request timeout"
+            in error_text
+        ):
+            print(
+                "AI NEWS TIMEOUT BYPASS | "
+                f"{symbol} | "
+                "continuing without news",
+                flush=True,
+            )
+
+            return (
+                _original_process_candidate(
+                    candidate,
+                    secret,
+                )
+            )
 
         if AI_BRIDGE_FAIL_CLOSED:
             return {
@@ -740,7 +741,6 @@ def process_candidate(
                 "ai_decision":
                     "BLOCK",
             }
-
 
         return (
             _original_process_candidate(
@@ -778,6 +778,77 @@ def process_candidate(
         flush=True,
     )
 
+
+    # ========================================================
+    # RATE LIMIT: SKIP AI ONLY, NEVER SKIP RISK CHECKS
+    # ========================================================
+    if decision == "SKIP":
+        # Both gate and bridge require explicit operator opt-in.
+        if (not ai_gate.AI_RATE_LIMIT_SKIP_ENABLED
+                or ai_result.get("reason") != "AI_RATE_LIMIT"):
+            return {
+                "status": "AI_BLOCKED", "symbol": symbol,
+                "reason": "INVALID_AI_SKIP", "ai_decision": decision,
+            }
+
+        if (action not in {"BUY", "SELL"} or candidate.get("qualified") is not True
+                or candidate.get("hard_pass") is not True
+                or candidate.get("hard_failures")):
+            return {
+                "status": "AI_BLOCKED", "symbol": symbol,
+                "reason": "SKIP_STRATEGY_GUARD", "ai_decision": decision,
+            }
+
+        # Opening short positions needs broker permission. Never bypass that rule.
+        # On a CASH account, leave this disabled.
+        if action == "SELL" and os.getenv(
+            "AI_SKIP_SHORTS_ENABLED", "false"
+        ).strip().lower() not in {"1", "true", "yes", "on"}:
+            print(f"AI SKIP SHORT BLOCK | {symbol} | shorts_not_authorized", flush=True)
+            return {
+                "status": "AI_BLOCKED", "symbol": symbol,
+                "reason": "AI_SKIP_SHORTS_NOT_AUTHORIZED", "ai_decision": decision,
+            }
+
+        try:
+            # A fresh deterministic market check remains mandatory.
+            market, _ = ai_gate.get_market_context()
+            state = ai_gate.deterministic_market_state(market)["state"]
+            if state == "UNKNOWN" or (
+                action == "BUY" and state in {"BEAR", "STRONG_BEAR"}
+            ) or (
+                action == "SELL" and state in {"BULL", "STRONG_BULL"}
+            ):
+                raise ValueError(f"Market state not eligible for AI fallback: {state}")
+
+            # Preview uses the existing server's sizing and risk checks.
+            # Do not turn missing / unavailable risk preview into an approval.
+            preview = get_risk_preview(candidate)
+            qty = int(preview["quantity"])
+            if qty < 1:
+                raise ValueError("No eligible risk-preview quantity")
+        except Exception as exc:
+            print(
+                f"AI SKIP RISK BLOCK | {symbol} | "
+                f"{type(exc).__name__}: {exc} | "
+                f"action={action} | market={locals().get('state', 'N/A')}",
+                flush=True,
+            )
+            return {
+                "status": "AI_BLOCKED", "symbol": symbol,
+                "reason": "AI_SKIP_RISK_CHECK_FAILED", "ai_decision": decision,
+            }
+
+        # Canary maximum: one share, regardless of the larger risk preview.
+        safe_candidate = dict(candidate)
+        safe_candidate["_ai_final_quantity"] = 1
+        print(f"AI SKIP ROUTE | {symbol} | action={action} | reason=429 | qty=1 | market={state}", flush=True)
+        outcome = _original_process_candidate(safe_candidate, secret)
+        outcome.update({
+            "ai_decision": "SKIP", "ai_reason": "AI_RATE_LIMIT",
+            "ai_multiplier": 0.0, "final_quantity": 1,
+        })
+        return outcome
 
     # ========================================================
     # BLOCK

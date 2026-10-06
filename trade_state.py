@@ -891,6 +891,8 @@ def update_signal_metadata(
 # ATOMIC CLAIM
 # ============================================================
 
+
+
 def claim_signal(
     *,
     db_file,
@@ -899,7 +901,9 @@ def claim_signal(
     event_type,
     source,
     order_by="created_at",
-    increment_attempts=False
+    increment_attempts=False,
+    broker_account=None,
+    broker_port=None
 ):
     if order_by not in {
         "created_at",
@@ -909,6 +913,15 @@ def claim_signal(
             "Invalid order_by"
         )
 
+    if (
+        (broker_account is None)
+        !=
+        (broker_port is None)
+    ):
+        raise ValueError(
+            "broker_account and broker_port "
+            "must be supplied together"
+        )
 
     conn = db_connect(
         db_file
@@ -919,67 +932,74 @@ def claim_signal(
             "BEGIN IMMEDIATE"
         )
 
-
-        row = conn.execute(
-            f"""
+        sql = """
             SELECT *
             FROM signals
-
             WHERE status = ?
+        """
 
+        params = [
+            from_status
+        ]
+
+        if broker_account is not None:
+            sql += """
+                AND (
+                    execution_mode IS NULL
+                    OR execution_mode <> 'LIVE'
+                    OR (
+                        execution_mode = 'LIVE'
+                        AND broker_account = ?
+                        AND broker_port = ?
+                    )
+                )
+            """
+
+            params.extend([
+                broker_account,
+                int(broker_port),
+            ])
+
+        sql += f"""
             ORDER BY {order_by} ASC
-
             LIMIT 1
-            """,
-            (
-                from_status,
-            )
-        ).fetchone()
+        """
 
+        row = conn.execute(
+            sql,
+            params,
+        ).fetchone()
 
         if row is None:
             conn.commit()
-
             return None
 
-
-        signal = dict(
-            row
-        )
-
+        signal = dict(row)
 
         assignments = [
             "status = ?",
             "updated_at = ?"
         ]
 
-
         values = [
             to_status,
             now_iso()
         ]
-
 
         if increment_attempts:
             assignments.append(
                 "attempts = attempts + 1"
             )
 
-
         values.extend([
-            signal[
-                "signal_id"
-            ],
+            signal["signal_id"],
             from_status
         ])
-
 
         cursor = conn.execute(
             f"""
             UPDATE signals
-
             SET {", ".join(assignments)}
-
             WHERE
                 signal_id = ?
                 AND status = ?
@@ -987,76 +1007,55 @@ def claim_signal(
             values
         )
 
-
         if cursor.rowcount != 1:
             conn.rollback()
-
             return None
-
 
         _insert_event(
             conn,
             event_key=None,
-
-            signal_id=
-                signal[
-                    "signal_id"
-                ],
-
-            event_type=
-                event_type,
-
-            source=
-                source,
-
-            old_status=
-                from_status,
-
-            new_status=
-                to_status,
-
+            signal_id=signal["signal_id"],
+            event_type=event_type,
+            source=source,
+            old_status=from_status,
+            new_status=to_status,
             message=(
                 f"Atomic claim "
-                f"{from_status} -> "
-                f"{to_status}"
+                f"{from_status} -> {to_status}"
             ),
-
-            payload=None
+            payload={
+                "execution_mode":
+                    signal.get("execution_mode"),
+                "broker_account":
+                    signal.get("broker_account"),
+                "broker_port":
+                    signal.get("broker_port"),
+            }
         )
-
 
         conn.commit()
 
-
-        signal[
-            "status"
-        ] = to_status
-
+        signal["status"] = to_status
 
         if increment_attempts:
-            signal[
-                "attempts"
-            ] = (
+            signal["attempts"] = (
                 int(
-                    signal.get(
-                        "attempts"
-                    )
+                    signal.get("attempts")
                     or 0
                 )
                 + 1
             )
 
-
         return signal
-
 
     except Exception:
         conn.rollback()
         raise
 
-
     finally:
         conn.close()
+
+
 
 
 # ============================================================

@@ -374,7 +374,15 @@ def count_trades_today(
             WHERE
                 test_mode=0
 
-                AND parent_order_id
+                AND COALESCE(
+                    filled_quantity,
+                    0
+                ) > 0
+
+                AND entry_fill_price
+                    IS NOT NULL
+
+                AND entry_time
                     IS NOT NULL
 
                 AND julianday(created_at)

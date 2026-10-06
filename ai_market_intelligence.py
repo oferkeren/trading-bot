@@ -6,7 +6,7 @@ from enum import Enum
 from typing import List, Optional
 
 from dotenv import load_dotenv
-from openai import OpenAI
+from openai import OpenAI, RateLimitError
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -779,6 +779,11 @@ def evaluate_candidate(
             flush=True,
         )
 
+
+        # Only HTTP 429 is passed to ai_gate's opt-in circuit breaker.
+        # Other API/network/validation errors retain fail-closed behavior.
+        if isinstance(exc, RateLimitError) and getattr(exc, "status_code", None) == 429:
+            raise
 
         if AI_FAIL_CLOSED:
             return (

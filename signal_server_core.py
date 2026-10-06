@@ -1387,15 +1387,44 @@ def resolve_position_size(
     "/health"
 )
 def health():
+    safety = (
+        build_safety_state()
+    )
+
     return {
         "status":
             "ok",
+
+        "mode":
+            (
+                "TEST"
+                if WEBHOOK_TEST_MODE
+                else "LIVE"
+            ),
 
         "live_trading":
             LIVE_TRADING,
 
         "test_mode":
             WEBHOOK_TEST_MODE,
+
+        "live_ready":
+            safety.get(
+                "live_ready",
+                False,
+            ),
+
+        "kill_switch":
+            safety.get(
+                "kill_switch",
+                True,
+            ),
+
+        "blockers":
+            safety.get(
+                "blockers",
+                [],
+            ),
 
         "signal_max_age_seconds":
             MAX_SIGNAL_AGE_SECONDS,
@@ -1513,7 +1542,15 @@ def status(
 
             updated_at,
             error_message,
-            monitor_message
+            monitor_message,
+
+            entry_fill_price,
+            exit_fill_price,
+            exit_reason,
+
+            realized_pnl,
+            gross_realized_pnl,
+            net_realized_pnl
 
         FROM signals
 
@@ -1778,6 +1815,141 @@ def status(
 
         "recent_events":
             recent_events,
+    }
+
+
+
+# ============================================================
+# STRATEGY_MODE_API_V2
+# ============================================================
+
+STRATEGY_MODE_FILE = os.path.expanduser(
+    "~/.cache/tradingmax/strategy_mode.txt"
+)
+
+VALID_STRATEGY_MODES = {
+    "AUTO",
+    "SCALP",
+    "MOMENTUM",
+    "BOTH",
+}
+
+
+def read_strategy_mode():
+    try:
+        if os.path.exists(
+            STRATEGY_MODE_FILE
+        ):
+            with open(
+                STRATEGY_MODE_FILE,
+                "r",
+                encoding="utf-8",
+            ) as handle:
+
+                mode = (
+                    handle
+                    .read()
+                    .strip()
+                    .upper()
+                )
+
+                if (
+                    mode
+                    in
+                    VALID_STRATEGY_MODES
+                ):
+                    return mode
+
+    except Exception as exc:
+        print(
+            "STRATEGY MODE READ ERROR | "
+            f"{type(exc).__name__}: {exc}"
+        )
+
+    return "AUTO"
+
+
+@app.get("/strategy-mode")
+def get_strategy_mode(
+    user=Depends(
+        dashboard_auth
+    ),
+):
+    return {
+        "mode":
+            read_strategy_mode(),
+
+        "valid_modes":
+            [
+                "AUTO",
+                "SCALP",
+                "MOMENTUM",
+                "BOTH",
+            ],
+    }
+
+
+@app.post("/strategy-mode")
+def set_strategy_mode(
+    payload: dict,
+    user=Depends(
+        dashboard_auth
+    ),
+):
+    mode = (
+        str(
+            payload.get(
+                "mode",
+                "",
+            )
+        )
+        .strip()
+        .upper()
+    )
+
+    if (
+        mode
+        not in
+        VALID_STRATEGY_MODES
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid strategy mode",
+        )
+
+    directory = os.path.dirname(
+        STRATEGY_MODE_FILE
+    )
+
+    os.makedirs(
+        directory,
+        exist_ok=True,
+    )
+
+    with open(
+        STRATEGY_MODE_FILE,
+        "w",
+        encoding="utf-8",
+    ) as handle:
+
+        handle.write(
+            mode
+            +
+            "\n"
+        )
+
+    print(
+        "STRATEGY MODE CHANGED | "
+        f"{mode}",
+        flush=True,
+    )
+
+    return {
+        "ok":
+            True,
+
+        "mode":
+            mode,
     }
 
 
@@ -2253,10 +2425,78 @@ def webhook(
 
 
     # --------------------------------------------------------
+    # LIVE INGEST QUANTITY HARD CAP
+    # --------------------------------------------------------
+
+    live_ingest_max_qty = int(
+        os.getenv(
+            "LIVE_INGEST_MAX_QTY",
+            "1",
+        )
+    )
+
+    if (
+        not WEBHOOK_TEST_MODE
+        and
+        int(
+            sizing[
+                "quantity"
+            ]
+        )
+        >
+        live_ingest_max_qty
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"LIVE quantity "
+                f"{sizing['quantity']} "
+                f"exceeds "
+                f"LIVE_INGEST_MAX_QTY="
+                f"{live_ingest_max_qty}"
+            ),
+        )
+
+
+    # --------------------------------------------------------
     # AUTHORITATIVE LIVE SAFETY GATE
     # --------------------------------------------------------
 
     enforce_live_safety()
+
+
+    broker_account = (
+        os.getenv(
+            "IB_ACCOUNT",
+            ""
+        )
+        .strip()
+    )
+
+    try:
+        broker_port = int(
+            os.getenv(
+                "IB_PORT",
+                "0"
+            )
+        )
+    except ValueError:
+        broker_port = 0
+
+    if (
+        not WEBHOOK_TEST_MODE
+        and (
+            not broker_account
+            or broker_port <= 0
+        )
+    ):
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Broker ownership is not configured: "
+                "IB_ACCOUNT/IB_PORT"
+            ),
+        )
 
 
     timestamp = now_iso()
@@ -2304,6 +2544,9 @@ def webhook(
                 test_mode,
                 attempts,
 
+                broker_account,
+                broker_port,
+
                 sizing_mode,
 
                 position_value,
@@ -2324,6 +2567,8 @@ def webhook(
                 ?,
 
                 ?, ?, ?, ?,
+
+                ?, ?,
 
                 ?, ?,
 
@@ -2394,6 +2639,18 @@ def webhook(
                 else 0,
 
                 0,
+
+                (
+                    broker_account
+                    if not WEBHOOK_TEST_MODE
+                    else None
+                ),
+
+                (
+                    broker_port
+                    if not WEBHOOK_TEST_MODE
+                    else None
+                ),
 
                 sizing[
                     "sizing_mode"
@@ -2532,6 +2789,20 @@ def webhook(
 
             "test_mode":
                 WEBHOOK_TEST_MODE,
+
+            "broker_account":
+                (
+                    broker_account
+                    if not WEBHOOK_TEST_MODE
+                    else None
+                ),
+
+            "broker_port":
+                (
+                    broker_port
+                    if not WEBHOOK_TEST_MODE
+                    else None
+                ),
         },
 
         event_key=(

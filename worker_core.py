@@ -1,4 +1,9 @@
+import json
+from pathlib import Path
+from protection_position_resolver import resolve_recovery_position
+from protection_guard import evaluate_live_protection
 import math
+from decimal import Decimal, ROUND_HALF_UP, ROUND_FLOOR, ROUND_CEILING
 import os
 import re
 import sqlite3
@@ -245,6 +250,33 @@ def init_db():
         DB_FILE
     )
 
+    conn = db_connect()
+
+    try:
+        columns = {
+            row["name"]
+            for row in conn.execute(
+                "PRAGMA table_info(signals)"
+            )
+        }
+
+        if "broker_account" not in columns:
+            conn.execute(
+                "ALTER TABLE signals "
+                "ADD COLUMN broker_account TEXT"
+            )
+
+        if "broker_port" not in columns:
+            conn.execute(
+                "ALTER TABLE signals "
+                "ADD COLUMN broker_port INTEGER"
+            )
+
+        conn.commit()
+
+    finally:
+        conn.close()
+
 
 def transition(
     signal_id,
@@ -271,6 +303,8 @@ def transition(
     )
 
 
+
+
 def get_next_signal():
     return claim_signal(
         db_file=DB_FILE,
@@ -280,7 +314,13 @@ def get_next_signal():
         source="worker",
         order_by="created_at",
         increment_attempts=True,
+        broker_account=IB_ACCOUNT,
+        broker_port=IB_PORT
     )
+
+
+
+
 
 
 def get_next_cancel_request():
@@ -292,7 +332,11 @@ def get_next_cancel_request():
         source="worker",
         order_by="updated_at",
         increment_attempts=False,
+        broker_account=IB_ACCOUNT,
+        broker_port=IB_PORT
     )
+
+
 
 
 def get_reconcile_candidates():
@@ -306,6 +350,9 @@ def get_reconcile_candidates():
 
             WHERE
                 test_mode = 0
+
+                AND broker_account = ?
+                AND broker_port = ?
 
                 AND status IN (
                     'PROCESSING',
@@ -324,7 +371,11 @@ def get_reconcile_candidates():
                 )
 
             ORDER BY created_at ASC
-            """
+            """,
+            (
+                IB_ACCOUNT,
+                IB_PORT,
+            ),
         ).fetchall()
 
         return [
@@ -607,6 +658,15 @@ def stock_contract(
     return contract
 
 
+
+def safe_con_id(value):
+    try:
+        result = int(value)
+        return result if result > 0 else 0
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
 class IBApp(
     EWrapper,
     EClient,
@@ -649,12 +709,17 @@ class IBApp(
         self.accounts = []
 
         self.positions = {}
+        self.positions_by_contract = {}
+        self.position_identity_errors = []
 
         self.open_orders = []
 
         self.completed_orders = []
 
         self.contract_details = []
+
+        self.market_rule_data = {}
+        self.market_rule_events = {}
 
         self.daily_pnl = None
 
@@ -663,6 +728,20 @@ class IBApp(
         self.seen_order_ids = set()
 
         self.order_statuses = {}
+
+        # Latest broker-reported fill state per order.
+        self.order_fill_state = {}
+
+        # Order snapshot freshness boundaries.
+        self.order_snapshot_started_at = None
+        self.order_snapshot_completed_at = None
+
+        # IBKR execution/commission correlation.
+        # commissionReport identifies fills by execId, while our
+        # database owns signals by IB order id.
+        self.execution_order_ids = {}
+        self.execution_details = {}
+        self.commission_reports = {}
 
         self.parent_order_id = None
 
@@ -733,6 +812,29 @@ class IBApp(
             return
 
 
+        con_id = safe_con_id(
+            getattr(contract, "conId", 0)
+        )
+
+        if con_id > 0:
+            self.positions_by_contract[
+                (account, con_id)
+            ] = {
+                "account": account,
+                "con_id": con_id,
+                "symbol": contract.symbol.upper(),
+                "quantity": quantity,
+                "avg_cost": float(avgCost),
+            }
+        else:
+            self.position_identity_errors.append(
+                {
+                    "account": account,
+                    "symbol": contract.symbol.upper(),
+                    "reason": "MISSING_CON_ID",
+                }
+            )
+
         self.positions[
             contract.symbol.upper()
         ] = {
@@ -767,6 +869,10 @@ class IBApp(
 
 
         item = {
+            "account": order.account,
+            "con_id": safe_con_id(
+                getattr(contract, "conId", 0)
+            ),
             "order_id":
                 orderId,
 
@@ -795,6 +901,16 @@ class IBApp(
 
             "order_type":
                 order.orderType,
+
+            "total_quantity":
+                float(
+                    getattr(
+                        order,
+                        "totalQuantity",
+                        0,
+                    )
+                    or 0
+                ),
 
             "order_ref":
                 getattr(
@@ -853,6 +969,10 @@ class IBApp(
 
 
         self.completed_orders.append({
+            "account": order.account,
+            "con_id": safe_con_id(
+                getattr(contract, "conId", 0)
+            ),
             "order_id":
                 getattr(
                     order,
@@ -886,6 +1006,16 @@ class IBApp(
             "order_type":
                 order.orderType,
 
+            "total_quantity":
+                float(
+                    getattr(
+                        order,
+                        "totalQuantity",
+                        0,
+                    )
+                    or 0
+                ),
+
             "order_ref":
                 getattr(
                     order,
@@ -917,6 +1047,34 @@ class IBApp(
         reqId,
     ):
         self.contract_details_done.set()
+
+
+    def marketRule(
+        self,
+        marketRuleId,
+        priceIncrements,
+    ):
+        self.market_rule_data[
+            int(marketRuleId)
+        ] = [
+            {
+                "low_edge":
+                    float(item.lowEdge),
+
+                "increment":
+                    float(item.increment),
+            }
+
+            for item
+            in priceIncrements
+        ]
+
+        event = self.market_rule_events.get(
+            int(marketRuleId)
+        )
+
+        if event is not None:
+            event.set()
 
 
     def pnl(
@@ -956,6 +1114,154 @@ class IBApp(
         self.pnl_done.set()
 
 
+    def execDetails(
+        self,
+        reqId,
+        contract,
+        execution,
+    ):
+        exec_id = getattr(
+            execution,
+            "execId",
+            "",
+        )
+
+        order_id = getattr(
+            execution,
+            "orderId",
+            None,
+        )
+
+        if not exec_id:
+            return
+
+        self.execution_order_ids[
+            exec_id
+        ] = order_id
+
+        self.execution_details[
+            exec_id
+        ] = {
+            "req_id":
+                reqId,
+
+            "order_id":
+                order_id,
+
+            "symbol":
+                getattr(
+                    contract,
+                    "symbol",
+                    "",
+                ),
+
+            "shares":
+                float(
+                    getattr(
+                        execution,
+                        "shares",
+                        0,
+                    )
+                    or 0
+                ),
+
+            "price":
+                float(
+                    getattr(
+                        execution,
+                        "price",
+                        0,
+                    )
+                    or 0
+                ),
+        }
+
+        print(
+            "EXECUTION | "
+            f"execId={exec_id} | "
+            f"orderId={order_id} | "
+            f"symbol={getattr(contract, 'symbol', '')} | "
+            f"shares={getattr(execution, 'shares', None)} | "
+            f"price={getattr(execution, 'price', None)}",
+            flush=True,
+        )
+
+
+    def commissionReport(
+        self,
+        commissionReport,
+    ):
+        exec_id = getattr(
+            commissionReport,
+            "execId",
+            "",
+        )
+
+        try:
+            commission = float(
+                getattr(
+                    commissionReport,
+                    "commission",
+                    0,
+                )
+                or 0
+            )
+
+        except Exception:
+            commission = 0.0
+
+        order_id = (
+            self.execution_order_ids
+            .get(
+                exec_id
+            )
+        )
+
+        self.commission_reports[
+            exec_id
+        ] = {
+            "order_id":
+                order_id,
+
+            "commission":
+                commission,
+
+            "currency":
+                getattr(
+                    commissionReport,
+                    "currency",
+                    None,
+                ),
+
+            "realized_pnl":
+                getattr(
+                    commissionReport,
+                    "realizedPNL",
+                    None,
+                ),
+        }
+
+        print(
+            "COMMISSION | "
+            f"execId={exec_id} | "
+            f"orderId={order_id} | "
+            f"commission={commission} | "
+            f"currency="
+            f"{getattr(commissionReport, 'currency', None)}",
+            flush=True,
+        )
+
+        if (
+            order_id is not None
+            and
+            commission >= 0
+        ):
+            persist_commission(
+                order_id,
+                commission,
+            )
+
+
     def orderStatus(
         self,
         orderId,
@@ -979,6 +1285,44 @@ class IBApp(
             f"permId={permId}",
             flush=True,
         )
+
+
+        self.order_fill_state[
+            orderId
+        ] = {
+            "order_id":
+                orderId,
+
+            "received_at":
+                time.monotonic(),
+
+            "status":
+                status,
+
+            "filled":
+                float(
+                    filled
+                    or 0
+                ),
+
+            "remaining":
+                float(
+                    remaining
+                    or 0
+                ),
+
+            "avg_fill_price":
+                float(
+                    avgFillPrice
+                    or 0
+                ),
+
+            "perm_id":
+                permId,
+
+            "parent_id":
+                parentId,
+        }
 
 
         if (
@@ -1120,6 +1464,193 @@ class IBApp(
             self.fatal_order_error.set()
 
 
+def find_signal_by_order_id(
+    order_id,
+):
+    conn = db_connect()
+
+    try:
+        row = conn.execute(
+            """
+            SELECT *
+            FROM signals
+            WHERE
+                entry_order_id = ?
+                OR target_order_id = ?
+                OR stop_order_id = ?
+                OR parent_order_id = ?
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (
+                order_id,
+                order_id,
+                order_id,
+                order_id,
+            ),
+        ).fetchone()
+
+        return (
+            dict(row)
+            if row is not None
+            else None
+        )
+
+    finally:
+        conn.close()
+
+
+def classify_order_leg(
+    signal,
+    order_id,
+):
+    if not signal:
+        return None
+
+    if order_id in {
+        signal.get("entry_order_id"),
+        signal.get("parent_order_id"),
+    }:
+        return "ENTRY"
+
+    if order_id == signal.get("target_order_id"):
+        return "EXIT"
+
+    if order_id == signal.get("stop_order_id"):
+        return "EXIT"
+
+    return None
+
+
+def persist_commission(
+    order_id,
+    commission,
+):
+    signal = find_signal_by_order_id(
+        order_id
+    )
+
+    if not signal:
+        return
+
+    leg = classify_order_leg(
+        signal,
+        order_id,
+    )
+
+    if leg not in {
+        "ENTRY",
+        "EXIT",
+    }:
+        return
+
+    signal_id = signal[
+        "signal_id"
+    ]
+
+    conn = db_connect()
+
+    try:
+        if leg == "ENTRY":
+            conn.execute(
+                """
+                UPDATE signals
+                SET
+                    entry_commission =
+                        COALESCE(
+                            entry_commission,
+                            0
+                        )
+                        + ?,
+
+                    total_commission =
+                        COALESCE(
+                            total_commission,
+                            0
+                        )
+                        + ?,
+
+                    updated_at = ?
+                WHERE signal_id = ?
+                """,
+                (
+                    commission,
+                    commission,
+                    datetime.now(
+                        timezone.utc
+                    ).isoformat(),
+                    signal_id,
+                ),
+            )
+
+        else:
+            conn.execute(
+                """
+                UPDATE signals
+                SET
+                    exit_commission =
+                        COALESCE(
+                            exit_commission,
+                            0
+                        )
+                        + ?,
+
+                    total_commission =
+                        COALESCE(
+                            total_commission,
+                            0
+                        )
+                        + ?,
+
+                    updated_at = ?
+                WHERE signal_id = ?
+                """,
+                (
+                    commission,
+                    commission,
+                    datetime.now(
+                        timezone.utc
+                    ).isoformat(),
+                    signal_id,
+                ),
+            )
+
+        conn.commit()
+
+    finally:
+        conn.close()
+
+    record_event(
+        db_file=
+            DB_FILE,
+
+        signal_id=
+            signal_id,
+
+        event_type=
+            "IBKR_COMMISSION",
+
+        source=
+            "worker",
+
+        message=(
+            f"{leg} commission "
+            f"${commission:.6f}"
+        ),
+
+        payload={
+            "order_id":
+                order_id,
+
+            "leg":
+                leg,
+
+            "commission":
+                commission,
+        },
+    )
+
+
 def connect_ibkr():
     ib = IBApp()
 
@@ -1172,12 +1703,46 @@ def connect_ibkr():
     return ib
 
 
+def load_position_state(
+    ib,
+):
+    ib.positions = {}
+    ib.positions_by_contract = {}
+    ib.position_identity_errors = []
+
+    ib.positions_done.clear()
+
+    ib.reqPositions()
+
+    if not ib.positions_done.wait(
+        timeout=5,
+    ):
+        raise RuntimeError(
+            "Position request timeout"
+        )
+
+    return {
+        symbol: dict(position)
+        for symbol, position
+        in ib.positions.items()
+    }
+
+
 def load_order_state(
     ib,
 ):
     ib.open_orders = []
 
     ib.completed_orders = []
+
+    # Never reuse fill/remaining data from an older snapshot.
+    ib.order_fill_state = {}
+
+    ib.order_snapshot_started_at = (
+        time.monotonic()
+    )
+
+    ib.order_snapshot_completed_at = None
 
     ib.open_orders_done.clear()
 
@@ -1206,6 +1771,10 @@ def load_order_state(
         raise RuntimeError(
             "Completed-order request timeout"
         )
+
+    ib.order_snapshot_completed_at = (
+        time.monotonic()
+    )
 
 
 def valid_perm_id(
@@ -1878,6 +2447,99 @@ def reconcile_signal(
 
     if not entry:
 
+        # A filled entry can disappear from the broker's current
+        # order history while the resulting position is still a
+        # valid managed position. Do not downgrade OPEN_POSITION
+        # merely because the historical parent order is absent.
+        if (
+            signal.get("status") == "OPEN_POSITION"
+            and
+            float(signal.get("filled_quantity") or 0) > 0
+        ):
+            record_event(
+                db_file=DB_FILE,
+                signal_id=signal_id,
+                event_type="RECONCILE_OPEN_POSITION_ENTRY_ABSENT",
+                source="worker",
+                message=(
+                    "OPEN_POSITION retained because entry was "
+                    "previously filled; historical entry order "
+                    "is not present in current broker snapshot"
+                ),
+                payload={
+                    "filled_quantity":
+                        signal.get("filled_quantity"),
+                    "entry_fill_price":
+                        signal.get("entry_fill_price"),
+                    "parent_order_id":
+                        signal.get("parent_order_id"),
+                    "parent_perm_id":
+                        signal.get("parent_perm_id"),
+                },
+                event_key=(
+                    f"open-position-entry-absent:{signal_id}"
+                ),
+            )
+
+            return
+
+        if (
+            signal.get(
+                "status"
+            )
+            == "PROCESSING"
+            and
+            signal.get(
+                "parent_order_id"
+            )
+            is None
+        ):
+            print(
+                "RECONCILE SKIP | "
+                f"{signal_id} | "
+                "PROCESSING before order allocation",
+                flush=True,
+            )
+
+            record_event(
+                db_file=
+                    DB_FILE,
+
+                signal_id=
+                    signal_id,
+
+                event_type=
+                    "RECONCILE_PRE_SUBMIT_SKIP",
+
+                source=
+                    "worker",
+
+                message=(
+                    "Skipped reconciliation while "
+                    "signal is PROCESSING before "
+                    "broker order allocation"
+                ),
+
+                payload={
+                    "status":
+                        signal.get(
+                            "status"
+                        ),
+
+                    "parent_order_id":
+                        signal.get(
+                            "parent_order_id"
+                        ),
+                },
+
+                event_key=(
+                    f"reconcile-pre-submit:"
+                    f"{signal_id}"
+                ),
+            )
+
+            return
+
         if (
             signal[
                 "status"
@@ -2101,6 +2763,34 @@ def reconcile_signal(
         return
 
 
+    # A completed parent order with status Filled represents
+    # the entry fill. If the trade is already OPEN_POSITION,
+    # FILLED is not a valid lifecycle regression.
+    if (
+        broker_status == "Filled"
+        and
+        signal.get("status") == "OPEN_POSITION"
+    ):
+        record_event(
+            db_file=DB_FILE,
+            signal_id=signal_id,
+            event_type="RECONCILE_ENTRY_ALREADY_FILLED",
+            source="worker",
+            message=(
+                "Entry order is Filled and signal is already "
+                "OPEN_POSITION; preserving OPEN_POSITION"
+            ),
+            payload=entry,
+            event_key=(
+                f"entry-already-filled:"
+                f"{signal_id}:"
+                f"{entry.get('perm_id')}"
+            ),
+        )
+
+        return
+
+
     new_status, event_type = (
         classify_completed(
             entry
@@ -2132,6 +2822,7 @@ def reconcile_signal(
 
 def reconcile_orders():
     ib = None
+    had_errors = False
 
 
     try:
@@ -2168,6 +2859,7 @@ def reconcile_orders():
                 )
 
             except Exception as exc:
+                had_errors = True
 
                 print(
                     f"RECONCILE SIGNAL ERROR | "
@@ -2199,7 +2891,7 @@ def reconcile_orders():
                 )
 
 
-        return True
+        return not had_errors
 
 
     except Exception as exc:
@@ -2752,6 +3444,114 @@ def process_cancel(
                 pass
 
 
+def resolve_market_rule_id(
+    details,
+):
+    exchanges = [
+        item.strip().upper()
+
+        for item
+        in str(
+            getattr(
+                details,
+                "validExchanges",
+                "",
+            )
+            or ""
+        ).split(",")
+    ]
+
+    rule_ids = [
+        item.strip()
+
+        for item
+        in str(
+            getattr(
+                details,
+                "marketRuleIds",
+                "",
+            )
+            or ""
+        ).split(",")
+    ]
+
+    if (
+        len(exchanges)
+        ==
+        len(rule_ids)
+    ):
+        for exchange, rule_id in zip(
+            exchanges,
+            rule_ids,
+        ):
+            if (
+                exchange == "SMART"
+                and
+                rule_id.isdigit()
+                and
+                int(rule_id) > 0
+            ):
+                return int(
+                    rule_id
+                )
+
+    for rule_id in rule_ids:
+        if (
+            rule_id.isdigit()
+            and
+            int(rule_id) > 0
+        ):
+            return int(
+                rule_id
+            )
+
+    return None
+
+
+def market_increment_for_price(
+    price,
+    increments,
+    fallback,
+):
+    price = float(
+        price
+    )
+
+    selected = None
+
+    for item in sorted(
+        increments or [],
+        key=lambda x: x[
+            "low_edge"
+        ],
+    ):
+        if (
+            price
+            >=
+            float(
+                item[
+                    "low_edge"
+                ]
+            )
+        ):
+            selected = float(
+                item[
+                    "increment"
+                ]
+            )
+
+    if (
+        selected is None
+        or
+        selected <= 0
+    ):
+        selected = float(
+            fallback
+        )
+
+    return selected
+
+
 def check_market_session(
     ib,
     symbol,
@@ -2941,7 +3741,463 @@ def check_market_session(
     )
 
 
+    result[
+        "min_tick"
+    ] = float(
+        getattr(
+            selected,
+            "minTick",
+            0.01,
+        )
+        or 0.01
+    )
+
+
+    market_rule_id = (
+        resolve_market_rule_id(
+            selected
+        )
+    )
+
+    market_rule = []
+
+    if market_rule_id is not None:
+
+        event = threading.Event()
+
+        ib.market_rule_events[
+            market_rule_id
+        ] = event
+
+        ib.reqMarketRule(
+            market_rule_id
+        )
+
+        if event.wait(
+            timeout=5
+        ):
+            market_rule = (
+                ib.market_rule_data.get(
+                    market_rule_id,
+                    [],
+                )
+            )
+
+    result[
+        "market_rule_id"
+    ] = market_rule_id
+
+    result[
+        "market_rule"
+    ] = market_rule
+
+
     return result
+
+
+def round_price_to_tick(
+    price,
+    min_tick,
+):
+    price_dec = Decimal(
+        str(price)
+    )
+
+    tick_dec = Decimal(
+        str(min_tick)
+    )
+
+    if tick_dec <= 0:
+        raise ValueError(
+            f"Invalid min_tick={min_tick}"
+        )
+
+    ticks = (
+        price_dec
+        /
+        tick_dec
+    ).quantize(
+        Decimal("1"),
+        rounding=ROUND_HALF_UP,
+    )
+
+    return float(
+        ticks
+        *
+        tick_dec
+    )
+
+
+def normalize_price_to_market_rule(
+    price,
+    market_rule,
+    fallback_tick,
+    rounding,
+):
+    price = float(price)
+
+    increment = market_increment_for_price(
+        price,
+        market_rule,
+        fallback_tick,
+    )
+
+    for _ in range(3):
+
+        price_dec = Decimal(
+            str(price)
+        )
+
+        increment_dec = Decimal(
+            str(increment)
+        )
+
+        ticks = (
+            price_dec
+            /
+            increment_dec
+        ).quantize(
+            Decimal("1"),
+            rounding=rounding,
+        )
+
+        normalized = float(
+            ticks
+            *
+            increment_dec
+        )
+
+        new_increment = (
+            market_increment_for_price(
+                normalized,
+                market_rule,
+                fallback_tick,
+            )
+        )
+
+        if new_increment == increment:
+            return (
+                normalized,
+                increment,
+            )
+
+        price = normalized
+        increment = new_increment
+
+    return (
+        normalized,
+        increment,
+    )
+
+
+def build_stop_limit_price(
+    action,
+    stop_trigger,
+    market_rule,
+    fallback_tick,
+    offset_pct=0.0075,
+    min_ticks=2,
+):
+    action = normalize_action(
+        action
+    )
+
+    stop_trigger = float(
+        stop_trigger
+    )
+
+    market_rule = (
+        market_rule
+        or []
+    )
+
+    trigger_tick = (
+        market_increment_for_price(
+            stop_trigger,
+            market_rule,
+            fallback_tick,
+        )
+    )
+
+    offset = max(
+        stop_trigger
+        *
+        float(offset_pct),
+
+        trigger_tick
+        *
+        int(min_ticks),
+    )
+
+    if action == "BUY":
+        # LONG position -> SELL stop-limit.
+        # Limit must be below trigger.
+        raw_limit = (
+            stop_trigger
+            -
+            offset
+        )
+
+        rounding = (
+            ROUND_FLOOR
+        )
+
+    else:
+        # SHORT position -> BUY stop-limit.
+        # Limit must be above trigger.
+        raw_limit = (
+            stop_trigger
+            +
+            offset
+        )
+
+        rounding = (
+            ROUND_CEILING
+        )
+
+    if raw_limit <= 0:
+        raise ValueError(
+            f"Invalid stop-limit price "
+            f"{raw_limit}"
+        )
+
+    stop_limit, stop_limit_tick = (
+        normalize_price_to_market_rule(
+            raw_limit,
+            market_rule,
+            fallback_tick,
+            rounding,
+        )
+    )
+
+    if action == "BUY":
+        if stop_limit >= stop_trigger:
+            stop_limit = (
+                stop_trigger
+                -
+                trigger_tick
+            )
+
+            stop_limit, stop_limit_tick = (
+                normalize_price_to_market_rule(
+                    stop_limit,
+                    market_rule,
+                    fallback_tick,
+                    ROUND_FLOOR,
+                )
+            )
+
+    else:
+        if stop_limit <= stop_trigger:
+            stop_limit = (
+                stop_trigger
+                +
+                trigger_tick
+            )
+
+            stop_limit, stop_limit_tick = (
+                normalize_price_to_market_rule(
+                    stop_limit,
+                    market_rule,
+                    fallback_tick,
+                    ROUND_CEILING,
+                )
+            )
+
+    return (
+        stop_limit,
+        stop_limit_tick,
+    )
+
+
+def normalize_bracket_prices(
+    action,
+    entry,
+    target,
+    stop,
+    min_tick,
+    market_rule=None,
+):
+    action = normalize_action(
+        action
+    )
+
+    market_rule = (
+        market_rule
+        or []
+    )
+
+    fallback_tick = float(
+        min_tick
+    )
+
+    if action == "BUY":
+
+        entry, entry_tick = (
+            normalize_price_to_market_rule(
+                entry,
+                market_rule,
+                fallback_tick,
+                ROUND_FLOOR,
+            )
+        )
+
+        target, target_tick = (
+            normalize_price_to_market_rule(
+                target,
+                market_rule,
+                fallback_tick,
+                ROUND_CEILING,
+            )
+        )
+
+        stop, stop_tick = (
+            normalize_price_to_market_rule(
+                stop,
+                market_rule,
+                fallback_tick,
+                ROUND_CEILING,
+            )
+        )
+
+        if stop >= entry:
+            stop = (
+                entry
+                -
+                market_increment_for_price(
+                    entry,
+                    market_rule,
+                    fallback_tick,
+                )
+            )
+
+            stop, stop_tick = (
+                normalize_price_to_market_rule(
+                    stop,
+                    market_rule,
+                    fallback_tick,
+                    ROUND_FLOOR,
+                )
+            )
+
+        if target <= entry:
+            target = (
+                entry
+                +
+                market_increment_for_price(
+                    entry,
+                    market_rule,
+                    fallback_tick,
+                )
+            )
+
+            target, target_tick = (
+                normalize_price_to_market_rule(
+                    target,
+                    market_rule,
+                    fallback_tick,
+                    ROUND_CEILING,
+                )
+            )
+
+    else:
+
+        entry, entry_tick = (
+            normalize_price_to_market_rule(
+                entry,
+                market_rule,
+                fallback_tick,
+                ROUND_CEILING,
+            )
+        )
+
+        target, target_tick = (
+            normalize_price_to_market_rule(
+                target,
+                market_rule,
+                fallback_tick,
+                ROUND_FLOOR,
+            )
+        )
+
+        stop, stop_tick = (
+            normalize_price_to_market_rule(
+                stop,
+                market_rule,
+                fallback_tick,
+                ROUND_FLOOR,
+            )
+        )
+
+        if stop <= entry:
+            stop = (
+                entry
+                +
+                market_increment_for_price(
+                    entry,
+                    market_rule,
+                    fallback_tick,
+                )
+            )
+
+            stop, stop_tick = (
+                normalize_price_to_market_rule(
+                    stop,
+                    market_rule,
+                    fallback_tick,
+                    ROUND_CEILING,
+                )
+            )
+
+        if target >= entry:
+            target = (
+                entry
+                -
+                market_increment_for_price(
+                    entry,
+                    market_rule,
+                    fallback_tick,
+                )
+            )
+
+            target, target_tick = (
+                normalize_price_to_market_rule(
+                    target,
+                    market_rule,
+                    fallback_tick,
+                    ROUND_FLOOR,
+                )
+            )
+
+    validate_price_structure(
+        action=action,
+        entry=entry,
+        stop=stop,
+        target=target,
+    )
+
+    return {
+        "entry":
+            entry,
+
+        "target":
+            target,
+
+        "stop":
+            stop,
+
+        "entry_tick":
+            entry_tick,
+
+        "target_tick":
+            target_tick,
+
+        "stop_tick":
+            stop_tick,
+
+        "min_tick":
+            fallback_tick,
+    }
 
 
 def create_bracket(
@@ -2952,6 +4208,7 @@ def create_bracket(
     entry,
     target,
     stop,
+    stop_limit,
 ):
     try:
         price_structure = (
@@ -3080,7 +4337,7 @@ def create_bracket(
     )
 
     take_profit.outsideRth = (
-        False
+        ALLOW_OUTSIDE_RTH
     )
 
     take_profit.transmit = (
@@ -3109,7 +4366,9 @@ def create_bracket(
     )
 
     stop_loss.orderType = (
-        "STP"
+        "STP LMT"
+        if ALLOW_OUTSIDE_RTH
+        else "STP"
     )
 
     stop_loss.totalQuantity = (
@@ -3120,6 +4379,11 @@ def create_bracket(
         stop
     )
 
+    if ALLOW_OUTSIDE_RTH:
+        stop_loss.lmtPrice = (
+            stop_limit
+        )
+
     stop_loss.parentId = (
         parent_id
     )
@@ -3129,7 +4393,7 @@ def create_bracket(
     )
 
     stop_loss.outsideRth = (
-        False
+        ALLOW_OUTSIDE_RTH
     )
 
     stop_loss.transmit = (
@@ -3151,6 +4415,923 @@ def create_bracket(
     )
 
 
+def get_safe_parent_order_id(
+    ib_next_order_id,
+):
+    if ib_next_order_id is None:
+        return None
+
+    conn = db_connect()
+
+    try:
+        row = conn.execute(
+            """
+            SELECT MAX(order_id)
+            FROM (
+                SELECT parent_order_id AS order_id
+                FROM signals
+
+                UNION ALL
+
+                SELECT entry_order_id
+                FROM signals
+
+                UNION ALL
+
+                SELECT target_order_id
+                FROM signals
+
+                UNION ALL
+
+                SELECT stop_order_id
+                FROM signals
+            )
+            WHERE order_id IS NOT NULL
+            """
+        ).fetchone()
+
+    finally:
+        conn.close()
+
+    db_max = (
+        int(row[0])
+        if row
+        and row[0] is not None
+        else 0
+    )
+
+    safe_id = max(
+        int(ib_next_order_id),
+        db_max + 1,
+    )
+
+    print(
+        "ORDER ID ALLOCATION | "
+        f"ib_next={ib_next_order_id} | "
+        f"db_max={db_max} | "
+        f"selected={safe_id}",
+        flush=True,
+    )
+
+    return safe_id
+
+
+
+# ============================================================
+# IBKR SYMBOL QUARANTINE
+# ============================================================
+
+IBKR_SYMBOL_QUARANTINE_SECONDS = 24 * 60 * 60
+
+IBKR_SYMBOL_QUARANTINE_FILE = (
+    Path.home()
+    / ".cache"
+    / "tradingmax"
+    / "ibkr_symbol_quarantine.json"
+)
+
+
+def quarantine_ibkr_symbol(symbol, reason):
+    symbol = str(symbol or "").strip().upper()
+
+    if not symbol:
+        return
+
+    now = time.time()
+
+    data = {}
+
+    try:
+        if IBKR_SYMBOL_QUARANTINE_FILE.exists():
+            loaded = json.loads(
+                IBKR_SYMBOL_QUARANTINE_FILE.read_text(
+                    encoding="utf-8"
+                )
+            )
+
+            if isinstance(loaded, dict):
+                data = loaded
+
+    except Exception:
+        data = {}
+
+    data[symbol] = {
+        "symbol": symbol,
+        "created_at": now,
+        "expires_at": now + IBKR_SYMBOL_QUARANTINE_SECONDS,
+        "reason": str(reason or "")[:1000],
+    }
+
+    IBKR_SYMBOL_QUARANTINE_FILE.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    tmp = IBKR_SYMBOL_QUARANTINE_FILE.with_suffix(".tmp")
+
+    tmp.write_text(
+        json.dumps(
+            data,
+            indent=2,
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+
+    tmp.replace(
+        IBKR_SYMBOL_QUARANTINE_FILE
+    )
+
+    print(
+        "IBKR SYMBOL QUARANTINE | "
+        f"{symbol} | "
+        f"hours=24 | "
+        "reason=SMALL_CAP_COMPLIANCE",
+        flush=True,
+    )
+
+def recover_rejected_bracket(
+    ib,
+    signal,
+    parent_id,
+):
+    signal_id = signal[
+        "signal_id"
+    ]
+
+    # Give IBKR callbacks a brief moment to settle before
+    # querying authoritative broker state.
+    time.sleep(
+        0.5
+    )
+
+    try:
+        load_order_state(
+            ib
+        )
+
+    except Exception as exc:
+        record_event(
+            db_file=DB_FILE,
+            signal_id=signal_id,
+            event_type=
+                "BRACKET_RECOVERY_STATE_FAILED",
+            source="worker",
+            message=str(exc),
+            payload={
+                "parent_order_id":
+                    parent_id,
+            },
+        )
+
+        transition(
+            signal_id,
+            "UNKNOWN",
+            "BRACKET_RECOVERY_STATE_FAILED",
+            message=str(exc),
+            fields={
+                "parent_order_id":
+                    parent_id,
+            },
+        )
+
+        return {
+            "result":
+                "UNKNOWN",
+
+            "reason":
+                "STATE_LOAD_FAILED",
+        }
+
+
+    try:
+        positions = load_position_state(
+            ib
+        )
+
+    except Exception as exc:
+        record_event(
+            db_file=DB_FILE,
+            signal_id=signal_id,
+            event_type=
+                "BRACKET_RECOVERY_POSITION_STATE_FAILED",
+            source="worker",
+            message=str(exc),
+            payload={
+                "parent_order_id":
+                    parent_id,
+            },
+        )
+
+        transition(
+            signal_id,
+            "UNKNOWN",
+            "BRACKET_RECOVERY_POSITION_STATE_FAILED",
+            message=str(exc),
+            fields={
+                "parent_order_id":
+                    parent_id,
+            },
+        )
+
+        return {
+            "result":
+                "UNKNOWN",
+
+            "reason":
+                "POSITION_STATE_LOAD_FAILED",
+        }
+
+
+    entry = find_entry_order(
+        ib,
+        signal,
+    )
+
+    target = find_child_order(
+        ib,
+        signal,
+        "TP",
+        entry,
+    )
+
+    stop = find_child_order(
+        ib,
+        signal,
+        "SL",
+        entry,
+    )
+
+
+    active_statuses = {
+        "PendingSubmit",
+        "ApiPending",
+        "PreSubmitted",
+        "Submitted",
+        "PendingCancel",
+    }
+
+
+    def is_active(
+        order,
+    ):
+        if not order:
+            return False
+
+        status = (
+            order.get(
+                "status",
+                "",
+            )
+            or ""
+        ).strip()
+
+        return (
+            order in ib.open_orders
+            and
+            status in active_statuses
+        )
+
+
+    entry_status = (
+        (
+            entry.get(
+                "status",
+                "",
+            )
+            or ""
+        ).strip()
+
+        if entry
+
+        else ""
+    )
+
+    entry_filled = (
+        entry is not None
+        and
+        entry_status == "Filled"
+    )
+
+    target_active = (
+        is_active(
+            target
+        )
+    )
+
+    stop_active = (
+        is_active(
+            stop
+        )
+    )
+
+
+    symbol = str(
+        signal.get(
+            "symbol",
+            ""
+        )
+        or ""
+    ).strip().upper()
+
+    # Resolve broker exposure by account and contract.
+    # Never infer FLAT from a symbol-only lookup.
+
+    recovery_entry_con_id = safe_con_id(
+        entry.get("con_id", 0)
+        if entry
+        else 0
+    )
+
+    position_resolution = resolve_recovery_position(
+        account=IB_ACCOUNT,
+        symbol=symbol,
+        entry_con_id=recovery_entry_con_id,
+        legacy_positions=positions,
+        positions_by_contract=ib.positions_by_contract,
+        identity_errors=ib.position_identity_errors,
+    )
+
+    # Fail closed. Neither UNKNOWN nor FLAT authorizes
+    # automatic cancellation during bracket recovery.
+    if position_resolution["status"] != "VERIFIED":
+        reason = position_resolution["reason"]
+
+        record_event(
+            db_file=DB_FILE,
+            signal_id=signal_id,
+            event_type="RECOVERY_POSITION_NOT_VERIFIED",
+            source="worker",
+            message=reason,
+            payload={
+                "parent_order_id": parent_id,
+                "position_resolution": position_resolution,
+            },
+        )
+
+        transition(
+            signal_id,
+            "UNKNOWN",
+            "RECOVERY_POSITION_NOT_VERIFIED",
+            message=reason,
+            fields={
+                "parent_order_id": parent_id,
+            },
+        )
+
+        return {
+            "result": "UNKNOWN",
+            "reason": reason,
+            "position_resolution": position_resolution,
+        }
+
+    position_quantity = float(
+        position_resolution["quantity"]
+    )
+
+    exposure_quantity = abs(position_quantity)
+
+    entry_action = normalize_action(
+        signal.get(
+            "action"
+        )
+    )
+
+    expected_position_sign = (
+        1
+        if entry_action == "BUY"
+        else -1
+    )
+
+    position_direction_matches = (
+        exposure_quantity == 0
+        or
+        (
+            position_quantity
+            *
+            expected_position_sign
+        )
+        > 0
+    )
+
+    stop_quantity = (
+        float(
+            stop.get(
+                "total_quantity",
+                0,
+            )
+            or 0
+        )
+
+        if stop
+
+        else 0.0
+    )
+
+    stop_covers_exposure = (
+        stop_active
+        and
+        exposure_quantity > 0
+        and
+        stop_quantity + 1e-9
+        >=
+        exposure_quantity
+    )
+
+
+    # --------------------------------------------------
+    # AUTHORITATIVE PROTECTION VERIFICATION
+    # --------------------------------------------------
+
+    entry_con_id = safe_con_id(
+        entry.get(
+            "con_id",
+            0,
+        )
+        if entry
+        else 0
+    )
+
+    contract_position = (
+        ib.positions_by_contract.get(
+            (
+                IB_ACCOUNT,
+                entry_con_id,
+            )
+        )
+        if entry_con_id > 0
+        else None
+    )
+
+    stop_order_id = (
+        valid_order_id(
+            stop.get(
+                "order_id"
+            )
+        )
+        if stop
+        else None
+    )
+
+    stop_fill_state = (
+        ib.order_fill_state.get(
+            stop_order_id
+        )
+        if stop_order_id is not None
+        else None
+    )
+
+    protection = None
+
+    if exposure_quantity > 0 and not stop_active:
+        protection = {
+            "protected": False,
+            "stage": "BROKER_ORDER_STATE",
+            "reason": "NO_ACTIVE_STOP",
+        }
+
+    elif exposure_quantity > 0:
+        protection = evaluate_live_protection(
+            position=
+                contract_position,
+
+            entry_action=
+                entry_action,
+
+            stop_order=
+                stop,
+
+            stop_fill_state=
+                stop_fill_state,
+
+            snapshot_started_at=
+                ib.order_snapshot_started_at,
+
+            snapshot_completed_at=
+                ib.order_snapshot_completed_at,
+        )
+
+
+    payload = {
+        "parent_order_id":
+            parent_id,
+
+        "entry_status":
+            entry_status,
+
+        "entry_filled":
+            entry_filled,
+
+        "target_active":
+            target_active,
+
+        "stop_active":
+            stop_active,
+
+        "symbol":
+            symbol,
+
+        "position_quantity":
+            position_quantity,
+
+        "exposure_quantity":
+            exposure_quantity,
+
+        "position_direction_matches":
+            position_direction_matches,
+
+        "stop_quantity":
+            stop_quantity,
+
+        "stop_covers_exposure":
+            stop_covers_exposure,
+
+        "entry_con_id":
+            entry_con_id,
+
+        "contract_position":
+            contract_position,
+
+        "stop_fill_state":
+            stop_fill_state,
+
+        "protection":
+            protection,
+
+        "reject_messages":
+            list(
+                ib.reject_messages
+            ),
+
+        "entry":
+            entry,
+
+        "target":
+            target,
+
+        "stop":
+            stop,
+    }
+
+
+    print(
+        "BRACKET RECOVERY | "
+        f"{signal_id} | "
+        f"entry_status={entry_status or 'NOT_FOUND'} | "
+        f"entry_filled={entry_filled} | "
+        f"position={position_quantity} | "
+        f"target_active={target_active} | "
+        f"stop_active={stop_active} | "
+        f"stop_qty={stop_quantity} | "
+        f"stop_covers={stop_covers_exposure}",
+        flush=True,
+    )
+
+
+    # --------------------------------------------------
+    # CASE 1:
+    # Entry was NOT filled.
+    #
+    # Safe action:
+    # cancel any surviving orders belonging to this
+    # bracket. There is no position to protect.
+    # --------------------------------------------------
+
+    if exposure_quantity <= 0:
+
+        cancel_ids = set()
+
+        stored_ids = {
+            valid_order_id(
+                signal.get(
+                    "parent_order_id"
+                )
+            ),
+
+            valid_order_id(
+                signal.get(
+                    "entry_order_id"
+                )
+            ),
+
+            valid_order_id(
+                signal.get(
+                    "target_order_id"
+                )
+            ),
+
+            valid_order_id(
+                signal.get(
+                    "stop_order_id"
+                )
+            ),
+
+            valid_order_id(
+                parent_id
+            ),
+
+            valid_order_id(
+                parent_id + 1
+            ),
+
+            valid_order_id(
+                parent_id + 2
+            ),
+        }
+
+        stored_ids.discard(
+            None
+        )
+
+
+        stored_refs = {
+            signal.get(
+                "entry_order_ref"
+            ),
+
+            signal.get(
+                "target_order_ref"
+            ),
+
+            signal.get(
+                "stop_order_ref"
+            ),
+        }
+
+        stored_refs.discard(
+            None
+        )
+
+        stored_refs.discard(
+            ""
+        )
+
+
+        for order in ib.open_orders:
+
+            order_id = (
+                valid_order_id(
+                    order.get(
+                        "order_id"
+                    )
+                )
+            )
+
+            order_ref = (
+                order.get(
+                    "order_ref"
+                )
+                or ""
+            )
+
+            if (
+                order_id in stored_ids
+                or
+                order_ref in stored_refs
+            ):
+                cancel_ids.add(
+                    order_id
+                )
+
+
+        cancel_ids.discard(
+            None
+        )
+
+        if cancel_ids:
+
+            ib.cancel_target_ids = set(
+                cancel_ids
+            )
+
+            for order_id in sorted(
+                cancel_ids
+            ):
+                print(
+                    "BRACKET RECOVERY CANCEL | "
+                    f"{signal_id} | "
+                    f"orderId={order_id}",
+                    flush=True,
+                )
+
+                ib.cancelOrder(
+                    order_id,
+                    OrderCancel(),
+                )
+
+                time.sleep(
+                    0.15
+                )
+
+
+
+        # Cancellation requests are not cancellation
+        # confirmations. Never release LIVE_ONE_SHOT
+        # until authoritative reconciliation completes.
+
+        record_event(
+            db_file=DB_FILE,
+            signal_id=signal_id,
+            event_type="BRACKET_CANCEL_PENDING_VERIFICATION",
+            source="worker",
+            message=(
+                "Bracket rejected. Cancellation requested "
+                "where applicable. Broker confirmation "
+                "and fresh position reconciliation required."
+            ),
+            payload={
+                **payload,
+                "cancel_ids": sorted(cancel_ids),
+            },
+        )
+
+        transition(
+            signal_id,
+            "UNKNOWN",
+            "BRACKET_CANCEL_PENDING_VERIFICATION",
+            message=(
+                "Broker cancellation and position "
+                "state are not yet verified"
+            ),
+            payload={
+                **payload,
+                "cancel_ids": sorted(cancel_ids),
+            },
+            fields={
+                "parent_order_id": parent_id,
+            },
+        )
+
+        return {
+            "result": "UNKNOWN",
+            "reason": "CANCELLATION_UNVERIFIED",
+            "cancel_ids": sorted(cancel_ids),
+        }
+
+
+    # --------------------------------------------------
+    # CASE 2:
+    # Entry filled and STOP is alive.
+    #
+    # This is what happened to QSI.
+    # Do NOT cancel the stop.
+    # --------------------------------------------------
+
+    if (
+        protection is not None
+        and
+        protection.get(
+            "protected"
+        )
+    ):
+
+        record_event(
+            db_file=DB_FILE,
+            signal_id=signal_id,
+            event_type=
+                "PARTIAL_BRACKET_PROTECTED",
+            source="worker",
+            message=(
+                "Entry filled after bracket rejection; "
+                "protective stop remains active"
+            ),
+            payload=payload,
+        )
+
+
+        transition(
+            signal_id,
+            "UNKNOWN",
+            "PARTIAL_BRACKET_PROTECTED",
+            message=(
+                "Entry is filled and protective stop "
+                "remains active; reconciliation required"
+            ),
+            payload=payload,
+            fields={
+                "parent_order_id":
+                    parent_id,
+            },
+        )
+
+
+        print(
+            "BRACKET RECOVERY PROTECTED | "
+            f"{signal_id} | "
+            "ENTRY FILLED | STOP ACTIVE | "
+            "STOP LEFT IN PLACE",
+            flush=True,
+        )
+
+        return {
+            "result":
+                "PROTECTED",
+
+            "reason":
+                "STOP_ACTIVE",
+
+            "target_active":
+                target_active,
+        }
+
+
+    # --------------------------------------------------
+    # CASE 3:
+    # Live exposure exists but protection is not valid.
+    # Classify the exact safety failure.
+    # --------------------------------------------------
+
+    if protection is None:
+        unsafe_reason = (
+            "PROTECTION_NOT_EVALUATED"
+        )
+
+        unsafe_message = (
+            "CRITICAL: live broker exposure "
+            "protection was not evaluated"
+        )
+
+    else:
+        unsafe_reason = (
+            protection.get(
+                "reason"
+            )
+            or
+            "PROTECTION_STATE_UNKNOWN"
+        )
+
+        unsafe_message = (
+            "CRITICAL: live broker exposure "
+            "failed authoritative protection "
+            f"verification: {unsafe_reason}"
+        )
+
+
+    record_event(
+        db_file=DB_FILE,
+        signal_id=signal_id,
+        event_type=
+            "UNPROTECTED_LIVE_POSITION",
+        source="worker",
+        message=
+            unsafe_message,
+        payload={
+            **payload,
+
+            "unsafe_reason":
+                unsafe_reason,
+        },
+    )
+
+
+    transition(
+        signal_id,
+        "UNKNOWN",
+        "UNPROTECTED_LIVE_POSITION",
+        message=
+            unsafe_message,
+        payload={
+            **payload,
+
+            "unsafe_reason":
+                unsafe_reason,
+        },
+        fields={
+            "parent_order_id":
+                parent_id,
+        },
+    )
+
+
+    print(
+        "CRITICAL BRACKET RECOVERY | "
+        f"{signal_id} | "
+        f"reason={unsafe_reason} | "
+        f"position={position_quantity} | "
+        f"stop_active={stop_active} | "
+        f"stop_qty={stop_quantity}",
+        flush=True,
+    )
+
+
+    return {
+        "result":
+            "UNPROTECTED",
+
+        "reason":
+            unsafe_reason,
+
+        "target_active":
+            target_active,
+
+        "position_quantity":
+            position_quantity,
+
+        "stop_quantity":
+            stop_quantity,
+    }
+
+
 def bracket_is_accepted(
     ib,
 ):
@@ -3168,14 +5349,41 @@ def bracket_is_accepted(
         return False
 
 
-    return (
+    accepted_statuses = {
+        "PendingSubmit",
+        "ApiPending",
+        "PreSubmitted",
+        "Submitted",
+        "Filled",
+    }
+
+
+    for order_id in ib.expected_order_ids:
+
+        status = (
+            ib.order_statuses.get(
+                order_id,
+                ""
+            )
+            or ""
+        ).strip()
+
+        if status not in accepted_statuses:
+            return False
+
+
+    if (
         ib.parent_status
-        in {
+        not in {
             "PreSubmitted",
             "Submitted",
             "Filled",
         }
-    )
+    ):
+        return False
+
+
+    return True
 
 
 def process_signal(
@@ -3236,6 +5444,43 @@ def process_signal(
         )
 
         return
+
+
+    update_signal_metadata(
+        db_file=DB_FILE,
+        signal_id=signal_id,
+        source="worker",
+        event_type="BROKER_OWNERSHIP_ASSIGNED",
+
+        fields={
+            "broker_account":
+                IB_ACCOUNT,
+
+            "broker_port":
+                IB_PORT,
+        },
+
+        message=(
+            f"Signal assigned to broker "
+            f"account={IB_ACCOUNT} "
+            f"port={IB_PORT}"
+        ),
+
+        event_key=(
+            f"broker-ownership:"
+            f"{signal_id}:"
+            f"{IB_ACCOUNT}:"
+            f"{IB_PORT}"
+        ),
+    )
+
+    signal["broker_account"] = (
+        IB_ACCOUNT
+    )
+
+    signal["broker_port"] = (
+        IB_PORT
+    )
 
 
     print(
@@ -3366,52 +5611,78 @@ def process_signal(
         ib = connect_ibkr()
 
 
-        if REQUIRE_LIQUID_SESSION:
 
-            try:
-                session = (
-                    check_market_session(
-                        ib,
-                        symbol,
-                    )
+        try:
+            session = (
+                check_market_session(
+                    ib,
+                    symbol,
                 )
+            )
 
-            except Exception as exc:
+        except Exception as exc:
 
-                transition(
-                    signal_id,
-                    "BLOCKED",
-                    "MARKET_SESSION_UNKNOWN",
+            transition(
+                signal_id,
+                "BLOCKED",
+                "MARKET_SESSION_UNKNOWN",
 
-                    message=
-                        str(
-                            exc
-                        ),
-                )
+                message=
+                    str(
+                        exc
+                    ),
+            )
 
-                return
+            return
 
 
-            record_event(
-                db_file=
-                    DB_FILE,
+        record_event(
+            db_file=
+                DB_FILE,
 
-                signal_id=
-                    signal_id,
+            signal_id=
+                signal_id,
 
-                event_type=(
-                    "MARKET_SESSION_OPEN"
+            event_type=(
+                "MARKET_SESSION_OPEN"
 
-                    if session[
-                        "is_open"
-                    ]
+                if session[
+                    "is_open"
+                ]
 
-                    else
-                    "MARKET_SESSION_CLOSED"
-                ),
+                else
+                "MARKET_SESSION_CLOSED"
+            ),
 
-                source=
-                    "worker",
+            source=
+                "worker",
+
+            message=
+                session[
+                    "reason"
+                ],
+
+            payload=
+                session,
+
+            event_key=(
+                f"market-session:"
+                f"{signal_id}"
+            ),
+        )
+
+
+        if (
+            REQUIRE_LIQUID_SESSION
+            and not session[
+                "is_open"
+            ]
+        ):
+
+            transition(
+                signal_id,
+                "BLOCKED",
+                "MARKET_CLOSED_BLOCK",
 
                 message=
                     session[
@@ -3420,33 +5691,9 @@ def process_signal(
 
                 payload=
                     session,
-
-                event_key=(
-                    f"market-session:"
-                    f"{signal_id}"
-                ),
             )
 
-
-            if not session[
-                "is_open"
-            ]:
-
-                transition(
-                    signal_id,
-                    "BLOCKED",
-                    "MARKET_CLOSED_BLOCK",
-
-                    message=
-                        session[
-                            "reason"
-                        ],
-
-                    payload=
-                        session,
-                )
-
-                return
+            return
 
 
         ib.positions = {}
@@ -3944,7 +6191,9 @@ def process_signal(
 
 
         parent_id = (
-            ib.next_order_id
+            get_safe_parent_order_id(
+                ib.next_order_id
+            )
         )
 
 
@@ -3976,6 +6225,97 @@ def process_signal(
         )
 
 
+        min_tick = (
+            session.get(
+                "min_tick",
+                0.01,
+            )
+        )
+
+        normalized_prices = (
+            normalize_bracket_prices(
+                action=
+                    action,
+
+                entry=
+                    signal[
+                        "entry"
+                    ],
+
+                target=
+                    signal[
+                        "target"
+                    ],
+
+                stop=
+                    signal[
+                        "stop"
+                    ],
+
+                min_tick=
+                    min_tick,
+
+                market_rule=
+                    session.get(
+                        "market_rule",
+                        [],
+                    ),
+            )
+        )
+
+        (
+            stop_limit_price,
+            stop_limit_tick,
+        ) = (
+            build_stop_limit_price(
+                action=
+                    action,
+
+                stop_trigger=
+                    normalized_prices[
+                        "stop"
+                    ],
+
+                market_rule=
+                    session.get(
+                        "market_rule",
+                        [],
+                    ),
+
+                fallback_tick=
+                    min_tick,
+            )
+        )
+
+
+        print(
+            "STOP LIMIT NORMALIZATION | "
+            f"{symbol} | "
+            f"action={action} | "
+            f"trigger={normalized_prices['stop']} | "
+            f"limit={stop_limit_price} | "
+            f"tick={stop_limit_tick}",
+            flush=True,
+        )
+
+
+        print(
+            "PRICE NORMALIZATION | "
+            f"{symbol} | "
+            f"minTick={min_tick} | "
+            f"marketRule={session.get('market_rule_id')} | "
+            f"entry={signal['entry']}"
+            f"->{normalized_prices['entry']}"
+            f"(tick={normalized_prices['entry_tick']}) | "
+            f"target={signal['target']}"
+            f"->{normalized_prices['target']}"
+            f"(tick={normalized_prices['target_tick']}) | "
+            f"stop={signal['stop']}"
+            f"->{normalized_prices['stop']}"
+            f"(tick={normalized_prices['stop_tick']})",
+            flush=True,
+        )
+
         orders, refs = create_bracket(
             signal_id,
             parent_id,
@@ -3983,15 +6323,16 @@ def process_signal(
                 "quantity"
             ],
             action,
-            signal[
+            normalized_prices[
                 "entry"
             ],
-            signal[
+            normalized_prices[
                 "target"
             ],
-            signal[
+            normalized_prices[
                 "stop"
             ],
+            stop_limit_price,
         )
 
 
@@ -4191,20 +6532,55 @@ def process_signal(
             .is_set()
         ):
 
-            transition(
-                signal_id,
-                "ERROR",
-                "ORDER_REJECTED",
+            record_event(
+                db_file=
+                    DB_FILE,
+
+                signal_id=
+                    signal_id,
+
+                event_type=
+                    "BRACKET_REJECTION_DETECTED",
+
+                source=
+                    "worker",
 
                 message=
                     "; ".join(
                         ib.reject_messages
                     ),
 
-                fields={
+                payload={
                     "parent_order_id":
                         parent_id,
+
+                    "statuses":
+                        dict(
+                            ib.order_statuses
+                        ),
                 },
+            )
+
+            reject_text = "; ".join(
+                ib.reject_messages
+            )
+
+            if (
+                "No Opening Trades: Small Cap"
+                in reject_text
+                and
+                "Compliance Restriction"
+                in reject_text
+            ):
+                quarantine_ibkr_symbol(
+                    signal.get("symbol"),
+                    reject_text,
+                )
+
+            recover_rejected_bracket(
+                ib,
+                signal,
+                parent_id,
             )
 
             return
@@ -4432,34 +6808,6 @@ def main():
     while True:
 
         try:
-            cancel_request = (
-                get_next_cancel_request()
-            )
-
-
-            if cancel_request:
-
-                process_cancel(
-                    cancel_request
-                )
-
-                continue
-
-
-            signal = (
-                get_next_signal()
-            )
-
-
-            if signal:
-
-                process_signal(
-                    signal
-                )
-
-                continue
-
-
             if (
                 time.monotonic()
                 -
@@ -4487,6 +6835,34 @@ def main():
                 last_reconcile = (
                     time.monotonic()
                 )
+
+
+            cancel_request = (
+                get_next_cancel_request()
+            )
+
+
+            if cancel_request:
+
+                process_cancel(
+                    cancel_request
+                )
+
+                continue
+
+
+            signal = (
+                get_next_signal()
+            )
+
+
+            if signal:
+
+                process_signal(
+                    signal
+                )
+
+                continue
 
 
             time.sleep(

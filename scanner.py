@@ -1,3 +1,4 @@
+import os
 from ibapi.client import EClient
 from ibapi.wrapper import EWrapper
 from ibapi.scanner import ScannerSubscription
@@ -12,8 +13,17 @@ from datetime import datetime, timezone
 # CONFIG
 # ============================================================
 
-HOST = "127.0.0.1"
-PORT = 7496
+HOST = os.getenv(
+    "IB_HOST",
+    "127.0.0.1",
+)
+
+PORT = int(
+    os.getenv(
+        "IB_PORT",
+        "7496",
+    )
+)
 
 # Dedicated clients:
 #
@@ -24,12 +34,12 @@ PORT = 7496
 CLIENT_ID = 72
 
 
-MIN_PRICE = 1.0
-MAX_PRICE = 30.0
+MIN_PRICE = 0.50
+MAX_PRICE = 50.00
 
-MIN_VOLUME = 500_000
+MIN_VOLUME = 100_000
 
-ROWS_PER_SCAN = 25
+ROWS_PER_SCAN = 35
 
 SCANNER_TIMEOUT_SECONDS = 15
 
@@ -38,26 +48,7 @@ CONTRACT_DETAILS_TIMEOUT_SECONDS = 5
 CONTRACT_DETAILS_REQUEST_START = 80000
 
 
-SCAN_DEFINITIONS = [
-    {
-        "name": "GAINERS",
-        "scan_code": "TOP_PERC_GAIN",
-        "bias": "LONG",
-        "req_id": 7001,
-    },
-    {
-        "name": "LOSERS",
-        "scan_code": "TOP_PERC_LOSE",
-        "bias": "SHORT",
-        "req_id": 7002,
-    },
-    {
-        "name": "MOST_ACTIVE",
-        "scan_code": "MOST_ACTIVE",
-        "bias": "NEUTRAL",
-        "req_id": 7003,
-    },
-]
+SCAN_DEFINITIONS = [{'name': 'GAINERS', 'scan_code': 'TOP_PERC_GAIN', 'bias': 'LONG', 'req_id': 7001}, {'name': 'LOSERS', 'scan_code': 'TOP_PERC_LOSE', 'bias': 'SHORT', 'req_id': 7002}, {'name': 'MOST_ACTIVE', 'scan_code': 'MOST_ACTIVE', 'bias': 'NEUTRAL', 'req_id': 7003}, {'name': 'HOT_VOLUME', 'scan_code': 'HOT_BY_VOLUME', 'req_id': 7004, 'bias': 'NEUTRAL'}, {'name': 'VOLUME_RATE', 'scan_code': 'TOP_VOLUME_RATE', 'req_id': 7005, 'bias': 'NEUTRAL'}, {'name': 'GAP_UP', 'scan_code': 'HIGH_OPEN_GAP', 'bias': 'LONG', 'req_id': 7006}, {'name': 'GAP_DOWN', 'scan_code': 'LOW_OPEN_GAP', 'bias': 'SHORT', 'req_id': 7007}]
 
 
 # ============================================================

@@ -34,6 +34,9 @@ def get_active_live_signals():
 
                 AND execution_mode = 'LIVE'
 
+                AND broker_account = ?
+                AND broker_port = ?
+
                 AND status IN (
                     'PROCESSING',
                     'SUBMITTED',
@@ -51,7 +54,11 @@ def get_active_live_signals():
                 )
 
             ORDER BY created_at ASC
-            """
+            """,
+            (
+                core.IB_ACCOUNT,
+                core.IB_PORT,
+            ),
         ).fetchall()
 
         return [

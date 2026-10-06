@@ -12,6 +12,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import strategy_engine
+import scalp_strategy
+
+from strategy_status import (
+    publish_scanner_universe,
+    mark_phase,
+    record_analysis,
+    record_bridge_mode,
+    record_error,
+)
 
 
 # ============================================================
@@ -229,12 +238,13 @@ def resolve_bridge_mode():
             "DRY_RUN",
             "TEST",
             "PRELIVE",
+            "LIVE",
         }:
             raise RuntimeError(
                 "Invalid BRIDGE_MODE="
                 f"{RAW_BRIDGE_MODE}; "
-                "expected DRY_RUN, TEST "
-                "or PRELIVE"
+                "expected DRY_RUN, TEST, "
+                "PRELIVE or LIVE"
             )
 
         return RAW_BRIDGE_MODE
@@ -369,24 +379,19 @@ def now_iso():
 # SIGNAL ID
 # ============================================================
 
-def build_signal_id(
-    candidate,
-):
-    symbol = (
+
+def build_signal_id(candidate):
+    symbol = str(
         candidate[
             "symbol"
         ]
-        .strip()
-        .upper()
-    )
+    ).strip().upper()
 
-    action = (
+    action = str(
         candidate[
             "action"
         ]
-        .strip()
-        .upper()
-    )
+    ).strip().upper()
 
     entry = float(
         candidate[
@@ -406,6 +411,33 @@ def build_signal_id(
         ]
     )
 
+    strategy = str(
+        candidate.get(
+            "strategy",
+            STRATEGY_NAME,
+        )
+    ).strip()
+
+    timeframe = str(
+        candidate.get(
+            "timeframe",
+            TIMEFRAME,
+        )
+    ).strip()
+
+    bucket_seconds = (
+        60
+        if (
+            timeframe == "1m"
+            or
+            strategy.startswith(
+                "scalp_"
+            )
+        )
+        else
+        300
+    )
+
     now_ts = int(
         time.time()
     )
@@ -413,14 +445,14 @@ def build_signal_id(
     bucket = (
         now_ts
         //
-        300
+        bucket_seconds
         *
-        300
+        bucket_seconds
     )
 
     raw = (
-        f"{STRATEGY_NAME}|"
-        f"{TIMEFRAME}|"
+        f"{strategy}|"
+        f"{timeframe}|"
         f"{symbol}|"
         f"{action}|"
         f"{bucket}|"
@@ -446,12 +478,21 @@ def build_signal_id(
             tz=timezone.utc,
         )
         .strftime(
-            "%Y%m%dT%H%M"
+            "%Y%m%dT%H%M%S"
         )
     )
 
+    prefix = (
+        "scalp"
+        if strategy.startswith(
+            "scalp_"
+        )
+        else
+        "tmx"
+    )
+
     return (
-        f"tmx-"
+        f"{prefix}-"
         f"{timestamp}-"
         f"{symbol}-"
         f"{action}-"
@@ -459,9 +500,11 @@ def build_signal_id(
     )
 
 
+
 # ============================================================
 # PAYLOAD
 # ============================================================
+
 
 def build_payload(
     candidate,
@@ -477,6 +520,20 @@ def build_payload(
         )
     )
 
+    strategy = str(
+        candidate.get(
+            "strategy",
+            STRATEGY_NAME,
+        )
+    ).strip()
+
+    timeframe = str(
+        candidate.get(
+            "timeframe",
+            TIMEFRAME,
+        )
+    ).strip()
+
     return {
         "secret":
             secret,
@@ -485,10 +542,10 @@ def build_payload(
             signal_id,
 
         "strategy":
-            STRATEGY_NAME,
+            strategy,
 
         "timeframe":
-            TIMEFRAME,
+            timeframe,
 
         "signal_time":
             signal_time,
@@ -537,6 +594,7 @@ def build_payload(
                 4,
             ),
     }
+
 
 
 # ============================================================
@@ -658,17 +716,8 @@ def validate_candidate(
             )
 
 
-def downstream_action_supported(
-    action,
-):
-    #
-    # API + worker are still LONG-only.
-    #
-    return (
-        action
-        ==
-        "BUY"
-    )
+def downstream_action_supported(action):
+    return str(action).strip().upper() in {"BUY", "SELL"}
 
 
 # ============================================================
@@ -704,11 +753,18 @@ def signal_already_sent(
 def symbol_action_in_cooldown(
     symbol,
     action,
+    cooldown_seconds=None,
 ):
     cutoff = (
         time.time()
         -
-        COOLDOWN_SECONDS
+        (
+            COOLDOWN_SECONDS
+            if cooldown_seconds is None
+            else int(
+                cooldown_seconds
+            )
+        )
     )
 
     conn = db_connect()
@@ -1154,6 +1210,101 @@ def enforce_prelive_api():
     return health
 
 
+def enforce_live_api():
+    health = (
+        get_api_health()
+    )
+
+    mode = (
+        str(
+            health.get(
+                "mode"
+            )
+            or
+            ""
+        )
+        .strip()
+        .upper()
+    )
+
+    live_trading = (
+        health.get(
+            "live_trading"
+        )
+        is True
+    )
+
+    test_mode = (
+        health.get(
+            "test_mode"
+        )
+    )
+
+    live_ready = (
+        health.get(
+            "live_ready"
+        )
+        is True
+    )
+
+    kill_switch = (
+        health.get(
+            "kill_switch"
+        )
+        is True
+    )
+
+    blockers = (
+        health.get(
+            "blockers"
+        )
+        or
+        []
+    )
+
+    print(
+        "API HEALTH | "
+        f"mode={mode} | "
+        f"live_trading={live_trading} | "
+        f"test_mode={test_mode} | "
+        f"live_ready={live_ready} | "
+        f"kill_switch={kill_switch}"
+    )
+
+    if mode != "LIVE":
+        raise RuntimeError(
+            "Bridge LIVE refuses POST: "
+            "gateway mode is not LIVE"
+        )
+
+    if not live_trading:
+        raise RuntimeError(
+            "Bridge LIVE refuses POST: "
+            "LIVE_TRADING is not enabled"
+        )
+
+    if test_mode is not False:
+        raise RuntimeError(
+            "Bridge LIVE refuses POST: "
+            "gateway test_mode must be false"
+        )
+
+    if kill_switch:
+        raise RuntimeError(
+            "Bridge LIVE refuses POST: "
+            "kill switch is enabled"
+        )
+
+    if not live_ready:
+        raise RuntimeError(
+            "Bridge LIVE refuses POST: "
+            "LIVE safety is not ready | "
+            f"blockers={blockers}"
+        )
+
+    return health
+
+
 def enforce_mode_api():
     if BRIDGE_MODE == "TEST":
         return (
@@ -1163,6 +1314,11 @@ def enforce_mode_api():
     if BRIDGE_MODE == "PRELIVE":
         return (
             enforce_prelive_api()
+        )
+
+    if BRIDGE_MODE == "LIVE":
+        return (
+            enforce_live_api()
         )
 
     raise RuntimeError(
@@ -1418,6 +1574,19 @@ def process_candidate(
     ) = symbol_action_in_cooldown(
         symbol,
         action,
+        (
+            75
+            if str(
+                candidate.get(
+                    "strategy",
+                    "",
+                )
+            ).startswith(
+                "scalp_"
+            )
+            else
+            COOLDOWN_SECONDS
+        ),
     )
 
     if cooldown_active:
@@ -1594,59 +1763,132 @@ def process_candidate(
 # RUN STRATEGY
 # ============================================================
 
+
 def collect_strategy_results():
+    mode_file = (
+        Path.home()
+        /
+        ".cache"
+        /
+        "tradingmax"
+        /
+        "strategy_mode.txt"
+    )
+
+    mode = (
+        os.getenv(
+            "STRATEGY_MODE",
+            "AUTO",
+        )
+        .strip()
+        .upper()
+    )
+
+    if mode_file.exists():
+        try:
+            configured = (
+                mode_file
+                .read_text(
+                    encoding="utf-8"
+                )
+                .strip()
+                .upper()
+            )
+
+            if configured:
+                mode = configured
+
+        except Exception as exc:
+            print(
+                "STRATEGY MODE WARNING | "
+                f"{type(exc).__name__}: "
+                f"{exc}",
+                flush=True,
+            )
+
+    valid_modes = {
+        "MOMENTUM",
+        "SCALP",
+        "AUTO",
+        "BOTH",
+    }
+
+    if mode not in valid_modes:
+        print(
+            "STRATEGY MODE INVALID | "
+            f"{mode} -> AUTO",
+            flush=True,
+        )
+
+        mode = "AUTO"
+
     print()
     print(
         "=============================================================="
     )
-
     print(
-        "TRADINGMAX SIGNAL BRIDGE"
+        "TRADINGMAX MULTI-STRATEGY BRIDGE"
     )
-
     print(
         "=============================================================="
     )
-
     print(
-        f"BRIDGE_MODE       = "
-        f"{BRIDGE_MODE}"
+        f"STRATEGY_MODE     = {mode}"
     )
-
     print(
         f"BRIDGE_DRY_RUN    = "
         f"{BRIDGE_DRY_RUN}"
     )
-
     print(
         f"BRIDGE_ALLOW_POST = "
         f"{BRIDGE_ALLOW_POST}"
     )
-
     print(
-        f"COOLDOWN_SECONDS  = "
-        f"{COOLDOWN_SECONDS}"
+        f"MOMENTUM_COOLDOWN = "
+        f"{COOLDOWN_SECONDS}s"
     )
-
     print(
-        f"API               = "
-        f"{API_BASE_URL}"
+        "SCALP_COOLDOWN    = 75s"
     )
-
     print()
+
+    try:
+        record_bridge_mode(
+            BRIDGE_DRY_RUN,
+            BRIDGE_ALLOW_POST,
+        )
+    except Exception:
+        pass
+
+    try:
+        mark_phase(
+            "SCANNING",
+            analyzed=0,
+            qualified=0,
+            qualified_candidates=[],
+            last_error=None,
+        )
+    except Exception:
+        pass
 
     candidates = (
         strategy_engine
         .get_candidates()
     )
 
-    print()
     print(
-        f"Strategy candidates: "
-        f"{len(candidates)}"
+        "MULTI STRATEGY | "
+        f"candidates={len(candidates)}"
     )
 
     if not candidates:
+        try:
+            record_analysis(
+                []
+            )
+        except Exception:
+            pass
+
         return []
 
     app = (
@@ -1655,7 +1897,6 @@ def collect_strategy_results():
     )
 
     results = []
-
     mapping = None
 
     try:
@@ -1673,21 +1914,6 @@ def collect_strategy_results():
         for index, candidate in enumerate(
             candidates
         ):
-            history_req_id = (
-                20000
-                +
-                index
-            )
-
-            bars = (
-                strategy_engine
-                .request_history(
-                    app,
-                    candidate,
-                    history_req_id,
-                )
-            )
-
             quote_req_id = (
                 mapping[
                     candidate[
@@ -1703,34 +1929,152 @@ def collect_strategy_results():
                 )
             )
 
-            print(
-                "BRIDGE ANALYZE | "
-                f"{candidate['symbol']} | "
-                f"type="
-                f"{candidate.get('instrument_type')} | "
-                f"bars={len(bars)} | "
-                f"bid={quote.get('bid')} | "
-                f"ask={quote.get('ask')} | "
-                f"last={quote.get('last')} | "
-                f"dataType="
-                f"{quote.get('market_data_type')}"
-            )
+            momentum_result = None
+            scalp_result = None
 
-            result = (
-                strategy_engine.analyze(
-                    candidate,
-                    bars,
-                    quote,
+            if mode in {
+                "MOMENTUM",
+                "AUTO",
+                "BOTH",
+            }:
+                momentum_bars = (
+                    strategy_engine
+                    .request_history(
+                        app,
+                        candidate,
+                        20000
+                        +
+                        index,
+                    )
                 )
-            )
 
-            if result is not None:
-                results.append(
-                    result
+                momentum_result = (
+                    strategy_engine
+                    .analyze(
+                        candidate,
+                        momentum_bars,
+                        quote,
+                    )
                 )
+
+                if (
+                    momentum_result
+                    is not None
+                ):
+                    momentum_result = dict(
+                        momentum_result
+                    )
+
+                    momentum_result.setdefault(
+                        "strategy",
+                        "tradingmax_multi_v1",
+                    )
+
+                    momentum_result.setdefault(
+                        "timeframe",
+                        "5m",
+                    )
+
+            if mode in {
+                "SCALP",
+                "AUTO",
+                "BOTH",
+            }:
+                scalp_bars = (
+                    scalp_strategy
+                    .request_history(
+                        app,
+                        candidate,
+                        40000
+                        +
+                        index,
+                    )
+                )
+
+                scalp_result = (
+                    scalp_strategy
+                    .analyze(
+                        candidate,
+                        scalp_bars,
+                        quote,
+                    )
+                )
+
+            if mode == "MOMENTUM":
+                if momentum_result is not None:
+                    results.append(
+                        momentum_result
+                    )
+
+            elif mode == "SCALP":
+                if scalp_result is not None:
+                    results.append(
+                        scalp_result
+                    )
+
+            elif mode == "BOTH":
+                if momentum_result is not None:
+                    results.append(
+                        momentum_result
+                    )
+
+                if scalp_result is not None:
+                    results.append(
+                        scalp_result
+                    )
+
+            else:
+                #
+                # AUTO:
+                # Prefer a real qualified scalp setup.
+                # Otherwise let the existing momentum
+                # strategy remain authoritative.
+                #
+                if (
+                    scalp_result is not None
+                    and
+                    scalp_result.get(
+                        "qualified"
+                    )
+                ):
+                    print(
+                        "AUTO SELECT | "
+                        f"{candidate['symbol']} | "
+                        "SCALP | "
+                        f"score="
+                        f"{scalp_result.get('scalp_score')}",
+                        flush=True,
+                    )
+
+                    results.append(
+                        scalp_result
+                    )
+
+                elif (
+                    momentum_result
+                    is not None
+                ):
+                    print(
+                        "AUTO SELECT | "
+                        f"{candidate['symbol']} | "
+                        "MOMENTUM",
+                        flush=True,
+                    )
+
+                    results.append(
+                        momentum_result
+                    )
+
+                elif (
+                    scalp_result
+                    is not None
+                ):
+                    results.append(
+                        scalp_result
+                    )
 
             time.sleep(
-                0.20
+                0.15
             )
 
     finally:
@@ -1747,7 +2091,15 @@ def collect_strategy_results():
                 1
             )
 
+    try:
+        record_analysis(
+            results
+        )
+    except Exception:
+        pass
+
     return results
+
 
 
 # ============================================================
@@ -1967,6 +2319,48 @@ def main():
         collect_strategy_results()
     )
 
+    for result in results:
+        support_conditions = (
+            result.get(
+                "support_conditions",
+                [],
+            )
+            or
+            []
+        )
+
+        passed_support = [
+            name
+            for name, passed
+            in support_conditions
+            if passed
+        ]
+
+        failed_support = [
+            name
+            for name, passed
+            in support_conditions
+            if not passed
+        ]
+
+        print(
+            "QUAL CHECK | "
+            f"{result.get('symbol', '?'):<8} | "
+            f"action={result.get('action')} | "
+            f"qualified={result.get('qualified')} | "
+            f"hard={result.get('hard_failures', [])} | "
+            f"support={result.get('support')}/"
+            f"{result.get('support_total')} | "
+            f"passed={passed_support} | "
+            f"failed={failed_support} | "
+            f"entry={result.get('entry')} | "
+            f"prev_high={result.get('previous_high')} | "
+            f"prev_low={result.get('previous_low')} | "
+            f"spread={result.get('spread_pct')} | "
+            f"distance={result.get('trigger_distance_pct')}",
+            flush=True,
+        )
+
     qualified = [
         result
         for result
@@ -1975,6 +2369,93 @@ def main():
             "qualified"
         )
     ]
+
+    near_trigger = []
+
+    for result in results:
+        try:
+            distance = float(
+                result.get(
+                    "trigger_distance_pct"
+                )
+            )
+        except (
+            TypeError,
+            ValueError,
+        ):
+            continue
+
+        hard_failures = set(
+            result.get(
+                "hard_failures",
+                [],
+            )
+            or
+            []
+        )
+
+        structural_failures = (
+            hard_failures
+            -
+            {
+                "BREAKOUT",
+                "BREAKDOWN",
+            }
+        )
+
+        if (
+            0.0
+            <
+            distance
+            <=
+            1.0
+            and
+            not structural_failures
+            and
+            int(
+                result.get(
+                    "support",
+                    0,
+                )
+                or
+                0
+            )
+            >=
+            3
+        ):
+            near_trigger.append(
+                result
+            )
+
+    near_trigger.sort(
+        key=lambda item: float(
+            item.get(
+                "trigger_distance_pct",
+                999.0,
+            )
+        )
+    )
+
+    print()
+    print(
+        "NEAR TRIGGER : "
+        f"{len(near_trigger)}"
+    )
+
+    for result in near_trigger:
+        print(
+            "NEAR TRIGGER | "
+            f"{result.get('symbol', '?'):<8} | "
+            f"action={result.get('action')} | "
+            f"support={result.get('support')}/"
+            f"{result.get('support_total')} | "
+            f"distance="
+            f"{float(result.get('trigger_distance_pct')):.3f}% | "
+            f"entry={result.get('entry')} | "
+            f"trigger="
+            f"{result.get('previous_high') if result.get('action') == 'BUY' else result.get('previous_low')}",
+            flush=True,
+        )
 
     print()
     print(
@@ -2069,6 +2550,17 @@ if __name__ == "__main__":
         )
 
     except Exception as exc:
+        try:
+            record_error(
+                exc
+            )
+        except Exception as status_exc:
+            print(
+                "STRATEGY STATUS ERROR | "
+                f"{type(status_exc).__name__}: "
+                f"{status_exc}"
+            )
+
         print(
             "SIGNAL BRIDGE FAILED | "
             f"{type(exc).__name__}: "

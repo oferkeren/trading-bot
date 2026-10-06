@@ -9,6 +9,8 @@ from ibapi.client import EClient
 from ibapi.wrapper import EWrapper
 from ibapi.execution import ExecutionFilter
 
+from protection_guard import evaluate_live_protection
+
 from signal_contract import (
     normalize_action,
     trade_direction,
@@ -173,6 +175,12 @@ def init_db():
 
         "monitor_message":
             "TEXT",
+
+        "broker_account":
+            "TEXT",
+
+        "broker_port":
+            "INTEGER",
     }
 
 
@@ -409,6 +417,9 @@ class MonitorApp(
 
         self.executions = []
         self.errors = []
+        self.stop_status_updates = {}
+        self.snapshot_started_at = None
+        self.snapshot_completed_at = None
 
 
     def nextValidId(
@@ -465,6 +476,8 @@ class MonitorApp(
         ] = {
             "quantity":
                 quantity,
+            "account": account,
+            "con_id": int(contract.conId),
 
             "avg_cost":
                 float(
@@ -496,6 +509,8 @@ class MonitorApp(
         self.open_orders.append({
             "order_id":
                 orderId,
+            "account": order.account,
+            "con_id": int(contract.conId),
 
             "perm_id":
                 getattr(
@@ -532,6 +547,21 @@ class MonitorApp(
                 or "",
         })
 
+
+    def orderStatus(
+        self, orderId, status, filled, remaining,
+        avgFillPrice, permId, parentId, lastFillPrice,
+        clientId, whyHeld, mktCapPrice=0.0,
+    ):
+        self.stop_status_updates[
+            (int(orderId), int(permId))
+        ] = {
+            "order_id": int(orderId),
+            "perm_id": int(permId),
+            "status": status,
+            "remaining": remaining,
+            "received_at": time.monotonic(),
+        }
 
     def openOrderEnd(
         self
@@ -724,6 +754,7 @@ def collect_ibkr_state():
             )
 
 
+        app.snapshot_started_at = time.monotonic()
         app.reqPositions()
 
 
@@ -781,6 +812,9 @@ def collect_ibkr_state():
                 "Executions timeout"
             )
 
+
+        time.sleep(0.25)
+        app.snapshot_completed_at = time.monotonic()
 
         return app
 
@@ -2200,6 +2234,82 @@ def reconcile_signal(
         return
 
 
+    live_position = app.positions.get(symbol)
+
+    if live_position and (
+        entry_fill
+        or signal.get("status") in {
+            "OPEN_POSITION",
+            "FILLED",
+        }
+    ):
+        open_stop = next(
+            (
+                order
+                for order in app.open_orders
+                if stop_order is not None
+                and order.get("order_id")
+                    == stop_order.get("order_id")
+                and order.get("perm_id")
+                    == stop_order.get("perm_id")
+                and order.get("order_ref")
+                    == stop_order.get("order_ref")
+            ),
+            None,
+        )
+
+        fill_state = None
+
+        if open_stop:
+            fill_state = app.stop_status_updates.get(
+                (
+                    int(open_stop["order_id"]),
+                    int(open_stop["perm_id"]),
+                )
+            )
+
+        verdict = evaluate_live_protection(
+            position=live_position,
+            entry_action=action,
+            stop_order=open_stop,
+            stop_fill_state=fill_state,
+            snapshot_started_at=app.snapshot_started_at,
+            snapshot_completed_at=app.snapshot_completed_at,
+        )
+
+        if not verdict["protected"]:
+            reason = verdict["reason"]
+
+            print(
+                "CRITICAL MONITOR STOP UNVERIFIED | "
+                f"{signal_id} | {reason}",
+                flush=True,
+            )
+
+            transition(
+                signal_id,
+                "UNKNOWN",
+                "MONITOR_STOP_UNVERIFIED",
+                message=(
+                    "Broker exposure without verified "
+                    f"protection: {reason}"
+                ),
+                payload={
+                    "protection": verdict,
+                },
+                fields={
+                    "monitor_message":
+                        f"STOP UNVERIFIED: {reason}",
+                },
+                event_key=(
+                    f"monitor-stop-unverified:"
+                    f"{signal_id}:{reason}:"
+                    f"{int(time.time() // 60)}"
+                ),
+            )
+
+            return
+
     if (
         entry_fill
         and
@@ -3230,6 +3340,67 @@ def reconcile_signal(
                 )
             )
 
+
+        return
+
+
+    if (
+        signal.get("status")
+        == "OPEN_POSITION"
+
+        and
+
+        float(
+            signal.get(
+                "filled_quantity"
+            )
+            or 0
+        )
+        > 0
+    ):
+        record_event(
+            db_file=DB_FILE,
+            signal_id=signal_id,
+
+            event_type=
+                "MONITOR_OPEN_POSITION_ENTRY_ABSENT",
+
+            source="monitor",
+
+            message=(
+                "OPEN_POSITION retained because "
+                "a prior entry fill is recorded "
+                "while the historical entry order "
+                "is absent from this broker snapshot"
+            ),
+
+            payload={
+                "broker_account":
+                    signal.get(
+                        "broker_account"
+                    ),
+
+                "broker_port":
+                    signal.get(
+                        "broker_port"
+                    ),
+
+                "filled_quantity":
+                    signal.get(
+                        "filled_quantity"
+                    ),
+
+                "entry_fill_price":
+                    signal.get(
+                        "entry_fill_price"
+                    ),
+            },
+
+            event_key=(
+                f"monitor-open-position-entry-absent:"
+                f"{signal_id}"
+            ),
+        )
 
         return
 

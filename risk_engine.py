@@ -137,6 +137,19 @@ def calculate_position_size(
         )
 
 
+    action = str(
+        action
+    ).strip().upper()
+
+    if action not in {
+        "BUY",
+        "SELL",
+    }:
+        raise RiskError(
+            f"Unsupported action: {action!r}"
+        )
+
+
     if action == "BUY":
 
         if stop >= entry:

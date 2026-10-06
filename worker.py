@@ -184,11 +184,13 @@ def get_active_live_signal(
         in ACTIVE_LIVE_STATUSES
     )
 
-    params = list(
-        sorted(
+    params = [
+        core.IB_ACCOUNT,
+        core.IB_PORT,
+        *sorted(
             ACTIVE_LIVE_STATUSES
-        )
-    )
+        ),
+    ]
 
     sql = f"""
         SELECT
@@ -208,31 +210,27 @@ def get_active_live_signal(
         WHERE
             execution_mode = 'LIVE'
 
+            AND broker_account = ?
+            AND broker_port = ?
+
             AND status IN (
                 {placeholders}
             )
     """
 
-
     if exclude_signal_id:
-        sql += (
-            """
+        sql += """
             AND signal_id <> ?
-            """
-        )
+        """
 
         params.append(
             exclude_signal_id
         )
 
-
-    sql += (
-        """
+    sql += """
         ORDER BY created_at ASC
         LIMIT 1
-        """
-    )
-
+    """
 
     conn = core.db_connect()
 
@@ -251,6 +249,7 @@ def get_active_live_signal(
 
     finally:
         conn.close()
+
 
 
 # ============================================================
@@ -529,15 +528,26 @@ def process_signal_mode_aware(
             return
 
 
-        if action != "BUY":
+        # Explicit directional authorization.
+        # SHORT remains disabled unless deliberately enabled.
+        live_shorts_enabled = parse_bool(
+            os.getenv("LIVE_SHORTS_ENABLED"),
+            False,
+        )
+
+        if action not in {"BUY", "SELL"} or (
+            action == "SELL"
+            and not live_shorts_enabled
+        ):
             safe_transition(
                 signal_id,
                 "BLOCKED",
                 "LIVE_ACTION_BLOCK",
-
                 message=(
-                    "LIVE execution currently "
-                    "supports BUY only"
+                    "LIVE action not authorized: "
+                    f"{action}; "
+                    f"LIVE_SHORTS_ENABLED="
+                    f"{live_shorts_enabled}"
                 ),
             )
 
@@ -694,6 +704,9 @@ def get_reconcile_candidates_live_only():
 
                 AND execution_mode = 'LIVE'
 
+                AND broker_account = ?
+                AND broker_port = ?
+
                 AND status IN (
                     'PROCESSING',
                     'SUBMITTED',
@@ -711,21 +724,22 @@ def get_reconcile_candidates_live_only():
                 )
 
             ORDER BY created_at ASC
-            """
+            """,
+            (
+                core.IB_ACCOUNT,
+                core.IB_PORT,
+            ),
         ).fetchall()
 
-
         return [
-            dict(
-                row
-            )
-
+            dict(row)
             for row
             in rows
         ]
 
     finally:
         conn.close()
+
 
 
 # ============================================================
@@ -744,7 +758,6 @@ def recover_stuck_live_work_only():
         )
     ).isoformat()
 
-
     conn = core.db_connect()
 
     try:
@@ -759,6 +772,9 @@ def recover_stuck_live_work_only():
             WHERE
                 execution_mode = 'LIVE'
 
+                AND broker_account = ?
+                AND broker_port = ?
+
                 AND status IN (
                     'PROCESSING',
                     'CANCELLING'
@@ -767,6 +783,8 @@ def recover_stuck_live_work_only():
                 AND updated_at < ?
             """,
             (
+                core.IB_ACCOUNT,
+                core.IB_PORT,
                 cutoff,
             ),
         ).fetchall()
@@ -774,20 +792,15 @@ def recover_stuck_live_work_only():
     finally:
         conn.close()
 
-
     for row in rows:
 
         if (
-            row[
-                "status"
-            ]
+            row["status"]
             ==
             "PROCESSING"
         ):
             safe_transition(
-                row[
-                    "signal_id"
-                ],
+                row["signal_id"],
                 "UNKNOWN",
                 "WORKER_RECOVERY",
 
@@ -799,9 +812,7 @@ def recover_stuck_live_work_only():
 
         else:
             safe_transition(
-                row[
-                    "signal_id"
-                ],
+                row["signal_id"],
                 "CANCEL_UNKNOWN",
                 "CANCEL_RECOVERY",
 
@@ -810,6 +821,7 @@ def recover_stuck_live_work_only():
                     "LIVE cancellation was active"
                 ),
             )
+
 
 
 # ============================================================

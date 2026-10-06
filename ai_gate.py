@@ -1,5 +1,9 @@
 import os
 import time
+import json
+import re
+import tempfile
+from pathlib import Path
 
 from ai_market_intelligence import (
     CandidateContext,
@@ -66,6 +70,78 @@ AI_NEWS_CACHE_SECONDS = int(
         "300",
     )
 )
+
+
+# Rate-limit circuit breaker; shared between bridge subprocesses.
+# Disabled by default until the operator deliberately enables fallback.
+AI_RATE_LIMIT_SKIP_ENABLED = os.getenv(
+    "AI_RATE_LIMIT_SKIP_ENABLED", "false"
+).strip().lower() in {"true", "1", "yes", "on"}
+AI_RATE_LIMIT_STATE_PATH = Path(__file__).resolve().parent / ".ai_rate_limit_state.json"
+AI_RATE_LIMIT_DEFAULT_COOLDOWN = 600
+AI_RATE_LIMIT_MAX_COOLDOWN = 1800
+
+
+def _rate_limit_error(exc):
+    """Only provider 429 / explicit rate limit errors qualify for fallback."""
+    if getattr(exc, "status_code", None) == 429:
+        return True
+    response = getattr(exc, "response", None)
+    if getattr(response, "status_code", None) == 429:
+        return True
+    name = type(exc).__name__.lower()
+    return "ratelimit" in name or "rate_limit" in name
+
+
+def _retry_seconds(exc):
+    # Provider text example: 'Please try again in 7m28.4s'.
+    message = str(exc)
+    match = re.search(r"try again in\s+(?:(\d+)m)?(?:(\d+(?:\.\d+)?)s)?", message, re.I)
+    seconds = AI_RATE_LIMIT_DEFAULT_COOLDOWN
+    if match and (match.group(1) or match.group(2)):
+        seconds = int(match.group(1) or 0) * 60 + float(match.group(2) or 0)
+    else:
+        response = getattr(exc, "response", None)
+        headers = getattr(response, "headers", {}) or {}
+        retry_after = headers.get("retry-after", headers.get("Retry-After", ""))
+        try:
+            seconds = float(retry_after)
+        except (ValueError, TypeError):
+            pass
+    return max(30, min(AI_RATE_LIMIT_MAX_COOLDOWN, int(seconds + 1)))
+
+
+def _cooldown_remaining():
+    try:
+        until = float(json.loads(AI_RATE_LIMIT_STATE_PATH.read_text()).get("until", 0))
+        return max(0, int(until - time.time() + 0.999))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return 0
+
+
+def _open_circuit(seconds):
+    until = time.time() + seconds
+    fd, tmp = tempfile.mkstemp(dir=str(AI_RATE_LIMIT_STATE_PATH.parent), prefix=".ai_rl_")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump({"until": until}, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, AI_RATE_LIMIT_STATE_PATH)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def _rate_limit_skip(candidate, seconds):
+    # A resource error is NOT an AI approval; the bridge revalidates risk.
+    print(f"AI RATE LIMIT SKIP | {candidate.get('symbol')} | cooldown={seconds}s", flush=True)
+    return {
+        "status": "SKIP", "reason": "AI_RATE_LIMIT",
+        "position_multiplier": 0.0, "ai": None, "market": None,
+        "news_count": 0, "cooldown_seconds": seconds,
+    }
 
 
 # ============================================================
@@ -634,6 +710,11 @@ def evaluate_trade_candidate(
         )
 
 
+    if AI_RATE_LIMIT_SKIP_ENABLED:
+        remaining = _cooldown_remaining()
+        if remaining:
+            return _rate_limit_skip(candidate, remaining)
+
     try:
         market, market_details = (
             get_market_context()
@@ -663,11 +744,18 @@ def evaluate_trade_candidate(
         )
 
 
-        result = (
-            evaluate_candidate(
-                context
+        try:
+            result = (
+                evaluate_candidate(
+                    context
+                )
             )
-        )
+        except Exception as exc:
+            if AI_RATE_LIMIT_SKIP_ENABLED and _rate_limit_error(exc):
+                seconds = _retry_seconds(exc)
+                _open_circuit(seconds)
+                return _rate_limit_skip(candidate, seconds)
+            raise
 
 
         result = (
@@ -738,6 +826,40 @@ def evaluate_trade_candidate(
             f"{exc}",
             flush=True,
         )
+
+        error_text = str(exc).lower()
+
+        if "news request timeout" in error_text:
+            print(
+                "AI NEWS TIMEOUT FAIL-OPEN | "
+                f"{symbol}",
+                flush=True,
+            )
+
+            return {
+                "status":
+                    "PASS",
+
+                "reason":
+                    "NEWS_TIMEOUT_FAIL_OPEN",
+
+                "error_type":
+                    type(
+                        exc
+                    ).__name__,
+
+                "position_multiplier":
+                    1.0,
+
+                "ai":
+                    None,
+
+                "market":
+                    None,
+
+                "news_count":
+                    0,
+            }
 
 
         if AI_GATE_FAIL_CLOSED:

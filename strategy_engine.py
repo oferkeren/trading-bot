@@ -1,3 +1,4 @@
+import os
 from ibapi.client import EClient
 from ibapi.wrapper import EWrapper
 from ibapi.contract import Contract
@@ -13,16 +14,24 @@ from zoneinfo import ZoneInfo
 import scanner
 
 
-HOST = "127.0.0.1"
-PORT = 7496
+HOST = os.getenv(
+    "IB_HOST",
+    "127.0.0.1",
+)
+
+PORT = int(
+    os.getenv(
+        "IB_PORT",
+        "7496",
+    )
+)
 CLIENT_ID = 73
 
-MAX_CANDIDATES = 20
-CORE_FRACTION = 0.70
-
-HOT_POOL_SIZE = 12
-HOT_CORE_TARGET = 8
-HOT_ROTATE_TARGET = 4
+MAX_CANDIDATES = 30
+CORE_FRACTION = 0.60
+HOT_POOL_SIZE = 16
+HOT_CORE_TARGET = 11
+HOT_ROTATE_TARGET = 5
 
 MAX_QUOTE_AGE_SECONDS = 15.0
 
@@ -83,6 +92,17 @@ RTH_END = datetime_time(
     16,
     0,
 )
+
+EXTENDED_START = datetime_time(
+    hour=4,
+    minute=0,
+)
+
+EXTENDED_END = datetime_time(
+    hour=20,
+    minute=0,
+)
+
 
 
 INSTRUMENT_PROFILES = {
@@ -457,12 +477,140 @@ def effective_candidate_score(
     )
 
 
+
+# ============================================================
+# IBKR SYMBOL QUARANTINE
+# ============================================================
+
+IBKR_SYMBOL_QUARANTINE_FILE = (
+    Path.home()
+    / ".cache"
+    / "tradingmax"
+    / "ibkr_symbol_quarantine.json"
+)
+
+
+def load_ibkr_symbol_quarantine():
+    now = time.time()
+
+    if not IBKR_SYMBOL_QUARANTINE_FILE.exists():
+        return {}
+
+    try:
+        data = json.loads(
+            IBKR_SYMBOL_QUARANTINE_FILE.read_text(
+                encoding="utf-8"
+            )
+        )
+
+        if not isinstance(data, dict):
+            return {}
+
+        active = {}
+        changed = False
+
+        for symbol, item in data.items():
+            if not isinstance(item, dict):
+                changed = True
+                continue
+
+            expires_at = float(
+                item.get("expires_at", 0)
+                or 0
+            )
+
+            if expires_at > now:
+                active[
+                    str(symbol).strip().upper()
+                ] = item
+            else:
+                changed = True
+
+        if changed:
+            IBKR_SYMBOL_QUARANTINE_FILE.parent.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+
+            tmp = (
+                IBKR_SYMBOL_QUARANTINE_FILE
+                .with_suffix(".tmp")
+            )
+
+            tmp.write_text(
+                json.dumps(
+                    active,
+                    indent=2,
+                    sort_keys=True,
+                ),
+                encoding="utf-8",
+            )
+
+            tmp.replace(
+                IBKR_SYMBOL_QUARANTINE_FILE
+            )
+
+        return active
+
+    except Exception as exc:
+        print(
+            "IBKR QUARANTINE WARNING | "
+            f"{type(exc).__name__}: {exc}"
+        )
+
+        return {}
+
 def select_rotating_candidates(
     directional,
 ):
 
     if not directional:
 
+        return []
+
+
+    quarantine = load_ibkr_symbol_quarantine()
+
+    if quarantine:
+        filtered = []
+
+        for candidate in directional:
+            symbol = str(
+                candidate.get(
+                    "symbol",
+                    "",
+                )
+            ).strip().upper()
+
+            if symbol in quarantine:
+                remaining = max(
+                    0,
+                    int(
+                        quarantine[
+                            symbol
+                        ].get(
+                            "expires_at",
+                            0,
+                        )
+                        - time.time()
+                    ),
+                )
+
+                print(
+                    "QUARANTINE SKIP | "
+                    f"{symbol} | "
+                    f"remaining={remaining}s"
+                )
+
+                continue
+
+            filtered.append(
+                candidate
+            )
+
+        directional = filtered
+
+    if not directional:
         return []
 
 
@@ -1834,6 +1982,70 @@ def is_regular_trading_hours_now():
     )
 
 
+def is_extended_trading_hours_now():
+
+    now = (
+        datetime.now(
+            NEW_YORK
+        )
+    )
+
+    if now.weekday() >= 5:
+
+        return False
+
+    return (
+        EXTENDED_START
+        <=
+        now.time()
+        <
+        EXTENDED_END
+    )
+
+
+def is_extended_session_bar(
+    bar,
+):
+
+    dt = (
+        bar_time_et(
+            bar
+        )
+    )
+
+    if (
+        dt is None
+        or
+        dt.weekday() >= 5
+    ):
+
+        return False
+
+    return (
+        EXTENDED_START
+        <=
+        dt.time()
+        <
+        EXTENDED_END
+    )
+
+
+def extended_session_bars(
+    bars,
+):
+
+    return [
+        bar
+
+        for bar
+        in bars
+
+        if is_extended_session_bar(
+            bar
+        )
+    ]
+
+
 def is_regular_session_bar(
     bar,
 ):
@@ -1992,7 +2204,7 @@ def session_vwap(
             continue
 
 
-        if is_regular_session_bar(
+        if is_extended_session_bar(
             bar
         ):
 
@@ -2013,7 +2225,7 @@ def session_vwap(
         calculate_vwap(
             regular_bars
         ),
-        "RTH",
+        "EXTENDED",
     )
 
 
@@ -3218,7 +3430,7 @@ def analyze(
 ):
 
     rth_bars = (
-        regular_session_bars(
+        extended_session_bars(
             bars
         )
     )
@@ -3331,7 +3543,7 @@ def analyze(
 
 
     session_ok = (
-        is_regular_trading_hours_now()
+        is_extended_trading_hours_now()
     )
 
 
@@ -3962,6 +4174,19 @@ def get_candidates():
             )
         )
 
+        # Publish the ORIGINAL IBKR Top Gainers scan.
+        # This does not change strategy selection.
+        from strategy_status import record_top_gainers
+
+        record_top_gainers(
+            [
+                row
+                for row in scan_app.rows
+                if row.get("scan_name") == "GAINERS"
+            ]
+        )
+
+
 
     finally:
 
@@ -3992,11 +4217,39 @@ def get_candidates():
     ]
 
 
-    return (
-        select_rotating_candidates(
+    selected = (
+select_rotating_candidates(
             directional
         )
     )
+
+    try:
+        import strategy_status
+
+        scanner_cycle = int(
+            time.time()
+        )
+
+        strategy_status.publish_scanner_universe(
+            scanner_cycle,
+            selected,
+        )
+
+        print(
+            "SCANNER SNAPSHOT | "
+            f"cycle={scanner_cycle} | "
+            f"symbols={len(selected)}",
+            flush=True,
+        )
+
+    except Exception as exc:
+        print(
+            "SCANNER SNAPSHOT ERROR | "
+            f"{type(exc).__name__}: {exc}",
+            flush=True,
+        )
+
+    return selected
 
 
 def start_live(

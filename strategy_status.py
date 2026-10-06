@@ -131,6 +131,9 @@ def normalize_candidate(
 ):
 
     return {
+        "scans":
+            candidate.get("scans") or [],
+
         "symbol":
             candidate.get(
                 "symbol"
@@ -571,6 +574,50 @@ def record_universe(
     )
 
 
+
+def record_top_gainers(rows):
+    """Publish original IBKR Top Gainers without filtering."""
+
+    normalized = []
+
+    seen = set()
+
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+
+        symbol = str(
+            row.get("symbol") or ""
+        ).upper().strip()
+
+        if not symbol or symbol in seen:
+            continue
+
+        seen.add(symbol)
+
+        normalized.append({
+            "symbol": symbol,
+            "rank": row.get("rank"),
+            "instrument_type":
+                row.get("instrument_type"),
+            "primary_exchange":
+                row.get("primary_exchange"),
+            "con_id": row.get("con_id"),
+        })
+
+    normalized.sort(
+        key=lambda item:
+            item["rank"]
+            if isinstance(item["rank"], int)
+            else 9999
+    )
+
+    return write_snapshot(
+        top_gainers=normalized,
+        top_gainers_updated_at=now_iso(),
+    )
+
+
 def record_hot_pool(
     ranked_candidates,
     selected,
@@ -747,4 +794,23 @@ if __name__ == "__main__":
             indent=2,
             sort_keys=True,
         )
+    )
+
+
+
+def publish_scanner_universe(cycle, candidates):
+    normalized = [
+        normalize_candidate(item)
+        for item in candidates
+    ]
+
+    return write_snapshot(
+        scanner_cycle=int(cycle),
+        scanner_updated_at=now_iso(),
+        scanner_universe=len(normalized),
+        scanner_candidates=normalized,
+        candidates=[],
+        hot_pool=0,
+        hot_core=0,
+        hot_rotate=0,
     )

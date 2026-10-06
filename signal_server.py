@@ -8,10 +8,12 @@ from pathlib import Path
 
 from fastapi import Depends
 from fastapi.responses import FileResponse
+from pydantic import BaseModel
 
 from microcap_readiness_store import read_readiness
 from signal_server_core import *
 from strategy_status import read_snapshot
+from exposure_guard import load_active_managed_allocation
 
 
 DASHBOARD_SERVICES = [
@@ -2089,6 +2091,149 @@ def dashboard_summary(
         )
     )
 
+    try:
+        managed_exposure = load_active_managed_allocation(
+            db_file=DB_FILE,
+        )
+        managed_exposure_error = None
+
+    except Exception as exc:
+        managed_exposure = {
+            "allocated_usd": None,
+            "position_count": None,
+            "positions": [],
+        }
+
+        managed_exposure_error = (
+            f"{type(exc).__name__}: {exc}"
+        )
+
+
+    max_position_usd = float(
+        os.getenv(
+            "MAX_POSITION_USD",
+            "100",
+        )
+    )
+
+    max_total_managed_exposure_usd = float(
+        os.getenv(
+            "MAX_TOTAL_MANAGED_EXPOSURE_USD",
+            "300",
+        )
+    )
+
+    canary_buy_only = (
+        os.getenv(
+            "CANARY_BUY_ONLY",
+            "true",
+        )
+        .strip()
+        .lower()
+        ==
+        "true"
+    )
+
+
+    last_guard_event = None
+
+    guard_conn = None
+
+    try:
+        guard_conn = sqlite3.connect(
+            DB_FILE
+        )
+
+        guard_conn.row_factory = (
+            sqlite3.Row
+        )
+
+        guard_row = guard_conn.execute(
+            """
+            SELECT
+                event_id,
+                signal_id,
+                event_type,
+                source,
+                message,
+                payload_json,
+                created_at
+            FROM trade_events
+            WHERE
+                event_type LIKE 'CANARY_%'
+                AND (
+                    signal_id IS NULL
+                    OR signal_id NOT LIKE 'TEST-%'
+                )
+            ORDER BY event_id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+
+        if guard_row is not None:
+            last_guard_event = {
+                "event_id":
+                    guard_row[
+                        "event_id"
+                    ],
+
+                "signal_id":
+                    guard_row[
+                        "signal_id"
+                    ],
+
+                "event_type":
+                    guard_row[
+                        "event_type"
+                    ],
+
+                "source":
+                    guard_row[
+                        "source"
+                    ],
+
+                "message":
+                    guard_row[
+                        "message"
+                    ],
+
+                "payload_json":
+                    guard_row[
+                        "payload_json"
+                    ],
+
+                "created_at":
+                    guard_row[
+                        "created_at"
+                    ],
+            }
+
+    except Exception as exc:
+        last_guard_event = {
+            "event_type":
+                "CANARY_EVENT_READ_ERROR",
+
+            "message":
+                f"{type(exc).__name__}: {exc}",
+
+            "signal_id":
+                None,
+
+            "source":
+                "dashboard",
+
+            "created_at":
+                None,
+
+            "payload_json":
+                None,
+        }
+
+    finally:
+        if guard_conn is not None:
+            guard_conn.close()
+
+
     return {
         "system": {
             "live_trading":
@@ -2206,6 +2351,46 @@ def dashboard_summary(
                 safety.get(
                     "pending_cancel_count"
                 ),
+        },
+
+
+        "live_safety": {
+            "trading_ready":
+                safety.get(
+                    "live_ready",
+                    False,
+                ),
+
+            "tws_connected":
+                runtime.get(
+                    "tws_connected",
+                    False,
+                ),
+
+            "canary_buy_only":
+                canary_buy_only,
+
+            "max_position_usd":
+                max_position_usd,
+
+            "max_total_managed_exposure_usd":
+                max_total_managed_exposure_usd,
+
+            "current_managed_exposure_usd":
+                managed_exposure.get(
+                    "allocated_usd"
+                ),
+
+            "managed_position_count":
+                managed_exposure.get(
+                    "position_count"
+                ),
+
+            "exposure_guard_error":
+                managed_exposure_error,
+
+            "last_guard_event":
+                last_guard_event,
         },
 
 
@@ -2337,3 +2522,148 @@ def dashboard_summary(
                 0,
         },
     }
+
+
+# ============================================================
+# TRADING MODE
+# ============================================================
+
+@app.get("/trading-mode")
+def trading_mode(
+    user=Depends(
+        dashboard_auth
+    ),
+):
+    result = subprocess.run(
+        [
+            "systemctl",
+            "show",
+            "trading-worker.service",
+            "-p",
+            "Environment",
+            "--value",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+
+    env = {}
+
+    for token in result.stdout.split():
+        if "=" not in token:
+            continue
+
+        key, value = token.split(
+            "=",
+            1,
+        )
+
+        env[key] = value
+
+    account = env.get(
+        "IB_ACCOUNT",
+        "",
+    )
+
+    port = env.get(
+        "IB_PORT",
+        "",
+    )
+
+    paper = (
+        account == "DUQ569670"
+        and
+        port == "7497"
+    )
+
+    return {
+        "mode":
+            "PAPER"
+            if paper
+            else
+            "LIVE",
+
+        "account":
+            account,
+
+        "port":
+            port,
+    }
+
+
+# ============================================================
+# PAPER / LIVE MODE
+# ============================================================
+
+class TradingModeRequest(BaseModel):
+    mode: str
+
+
+def _mode_command(mode):
+
+    result = subprocess.run(
+        [
+            "sudo",
+            "/usr/local/sbin/tradingmax-switch-mode",
+            mode,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+    if result.returncode != 0:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                result.stderr.strip()
+                or
+                result.stdout.strip()
+                or
+                "Mode switch failed"
+            ),
+        )
+
+    import json
+
+    return json.loads(
+        result.stdout.strip()
+    )
+
+
+@app.get("/trading-mode")
+def trading_mode_status(
+    user=Depends(dashboard_auth),
+):
+    return _mode_command(
+        "STATUS"
+    )
+
+
+@app.post("/trading-mode")
+def trading_mode_change(
+    request: TradingModeRequest,
+    user=Depends(dashboard_auth),
+):
+
+    mode = (
+        request.mode
+        or ""
+    ).strip().upper()
+
+    if mode not in {
+        "PAPER",
+        "LIVE",
+    }:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid trading mode",
+        )
+
+    return _mode_command(
+        mode
+    )
+
