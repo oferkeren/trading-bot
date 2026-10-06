@@ -13,6 +13,35 @@ function fakeNode(tag) {
   };
 }
 
+function fakeTimers() {
+  let now = 0;
+  let nextId = 1;
+  const timers = [];
+  return {
+    setTimeout(handler, delay) {
+      const timer = { id: nextId++, handler, delay, due: now + delay, cleared: false, type: "timeout" };
+      timers.push(timer);
+      return timer.id;
+    },
+    clearTimeout(id) {
+      const timer = timers.find(item => item.id === id);
+      if (timer) { timer.cleared = true; }
+    },
+    setInterval(handler, delay) {
+      const timer = { id: nextId++, handler, delay, due: now + delay, cleared: false, type: "interval" };
+      timers.push(timer);
+      return timer.id;
+    },
+    tick(ms) {
+      now += ms;
+      timers
+        .filter(timer => !timer.cleared && timer.type === "timeout" && timer.due <= now)
+        .forEach(timer => { timer.cleared = true; timer.handler(); });
+    },
+    intervals() { return timers.filter(timer => timer.type === "interval"); },
+  };
+}
+
 function fakeDoc() {
   const nodes = {};
   return {
@@ -81,6 +110,7 @@ function testPositionsAndOrders() {
     total_count: 2, total_market_value: 345, total_position_unrealized_pnl: 45,
     managed_unprotected_count: 1,
   };
+  portfolio.snapshot_updated_at = new Date().toISOString();
   app.renderPositions(doc, portfolio);
   assert.equal(doc.nodes.posManagedCount.textContent, "1");
   assert.equal(doc.nodes.posTotalCount.textContent, "2");
@@ -99,10 +129,30 @@ function testPositionsAndOrders() {
   assert.deepEqual(cells(doc.nodes.orderRows.children[0]),
     ["SORA", "SELL", "100", "STP", "2.10", "Submitted", "42", "tm-1"]);
 
-  app.renderPositions(doc, {});
+  app.renderPositions(doc, { snapshot_updated_at: new Date().toISOString() });
   assert.equal(cells(doc.nodes.managedRows.children[0])[0], "No managed positions");
-  app.renderOrders(doc, {});
+  app.renderOrders(doc, { snapshot_updated_at: new Date().toISOString() });
   assert.equal(cells(doc.nodes.orderRows.children[0])[0], "No open orders");
+
+  const stalePortfolio = {
+    snapshot_updated_at: new Date(Date.now() - 61000).toISOString(),
+    managed_positions: [{ symbol: "SORA", ownership: "MANAGED", protection_complete: true }],
+    open_orders: [],
+    managed_unprotected_count: 0,
+  };
+  app.renderPositions(doc, stalePortfolio);
+  assert.equal(doc.nodes.posUnprotected.textContent, "STALE");
+  assert.doesNotMatch(doc.nodes.posUnprotected.className, /ok/);
+  assert.equal(cells(doc.nodes.managedRows.children[0]).at(-1), "STALE");
+  app.renderOrders(doc, stalePortfolio);
+  assert.equal(doc.nodes.ordersCount.textContent, "STALE");
+  assert.equal(cells(doc.nodes.orderRows.children[0])[0], "STALE");
+
+  const missingTimestamp = { managed_positions: [], open_orders: [], managed_unprotected_count: 0 };
+  app.renderPositions(doc, missingTimestamp);
+  assert.equal(doc.nodes.posUnprotected.textContent, "UNAVAILABLE");
+  app.renderOrders(doc, missingTimestamp);
+  assert.equal(cells(doc.nodes.orderRows.children[0])[0], "UNAVAILABLE");
 }
 
 function testHealth() {
@@ -124,21 +174,32 @@ function testHealth() {
   assert.equal(doc.nodes.safetyKillReason.textContent, "manual");
   app.renderHealth(doc, {}, {});
   assert.deepEqual(doc.nodes.safetyBlockers.children.map(item => item.textContent), ["No safety blockers"]);
+  app.renderHealth(doc, {}, null);
+  assert.deepEqual(doc.nodes.safetyBlockers.children.map(item => item.textContent), ["UNAVAILABLE"]);
+  assert.equal(doc.nodes.safetyKillReason.textContent, "UNAVAILABLE");
 }
 
 function harness(routes, confirms = []) {
   const doc = fakeDoc();
   const calls = [];
+  const timers = fakeTimers();
   const fetchImpl = async (url, options = {}) => {
-    calls.push({ url, method: options.method || "GET", body: options.body });
+    calls.push({ url, method: options.method || "GET", body: options.body, signal: options.signal });
     const route = routes[url];
+    if (typeof route === "function") {
+      return route(url, options);
+    }
     if (route instanceof Error) { throw route; }
     return response(route === undefined ? {} : route);
   };
-  const win = { location: { hash: "" }, addEventListener() {}, setInterval() {},
-    confirm: () => (confirms.length ? confirms.shift() : true) };
+  const win = {
+    location: { hash: "" }, addEventListener() {},
+    setInterval: timers.setInterval, setTimeout: timers.setTimeout, clearTimeout: timers.clearTimeout,
+    confirm: () => (confirms.length ? confirms.shift() : true),
+    Date, AbortController,
+  };
   const panel = { loadMicrocapResearch: async () => {} };
-  return { doc, calls, instance: app.createApp({ doc, fetchImpl, win, panel }) };
+  return { doc, calls, timers, win, instance: app.createApp({ doc, fetchImpl, win, panel }) };
 }
 
 async function testKillSwitchFlow() {
@@ -193,6 +254,67 @@ async function testTabsAndUnavailable() {
   assert.equal(doc.nodes.posTotalCount.textContent, "UNAVAILABLE");
 }
 
+async function testHealthFetchFailureClearsSafety() {
+  const first = harness({
+    "/dashboard-components": { total: 0, healthy: 0, critical_failures: 0, components: [] },
+  });
+  first.instance.selectTab("health");
+  first.instance.state.summary = { system: { kill_switch_reason: "manual" }, safety: { blockers: ["MAX_POSITIONS"] } };
+  await first.instance.refreshActive();
+  assert.deepEqual(first.doc.nodes.safetyBlockers.children.map(item => item.textContent), ["MAX_POSITIONS"]);
+  assert.equal(first.doc.nodes.safetyKillReason.textContent, "manual");
+
+  const failed = harness({ "/dashboard-components": new Error("down") });
+  failed.instance.selectTab("health");
+  failed.instance.state.summary = first.instance.state.summary;
+  await failed.instance.refreshActive();
+  assert.deepEqual(failed.doc.nodes.safetyBlockers.children.map(item => item.textContent), ["UNAVAILABLE"]);
+  assert.equal(failed.doc.nodes.safetyKillReason.textContent, "UNAVAILABLE");
+}
+
+async function testRefreshTopDoesNotRetryModeEveryFiveSeconds() {
+  const { calls, instance } = harness({
+    "/dashboard-summary": {}, "/status": {}, "/trading-mode": new Error("down"),
+  });
+  await instance.refreshTop();
+  assert.equal(calls.filter(call => call.url === "/trading-mode").length, 0);
+}
+
+async function testModeIntervalIsGuarded() {
+  let resolveMode;
+  const { calls, timers, instance } = harness({
+    "/dashboard-summary": {}, "/status": {},
+    "/trading-mode": () => new Promise(resolve => { resolveMode = resolve; }),
+  });
+  instance.start();
+  const modeTimer = timers.intervals().find(timer => timer.delay === 30000);
+  assert.ok(modeTimer);
+  modeTimer.handler();
+  modeTimer.handler();
+  assert.equal(calls.filter(call => call.url === "/trading-mode").length, 1);
+  resolveMode(response({ mode: "PAPER" }));
+  await Promise.resolve();
+}
+
+async function testFetchTimeoutUnblocksPolling() {
+  const { doc, calls, timers, win, instance } = harness({
+    "/dashboard-portfolio": (url, options) => new Promise((resolve, reject) => {
+      options.signal.addEventListener("abort", () => reject(new Error("aborted")));
+    }),
+  });
+  win.location.hash = "#positions";
+  instance.start();
+  assert.equal(calls.filter(call => call.url === "/dashboard-portfolio").length, 1);
+  const activeTimer = timers.intervals().find(timer => timer.delay === 5000);
+  activeTimer.handler();
+  assert.equal(calls.filter(call => call.url === "/dashboard-portfolio").length, 1);
+  timers.tick(8000);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(doc.nodes.posTotalCount.textContent, "UNAVAILABLE");
+  activeTimer.handler();
+  assert.equal(calls.filter(call => call.url === "/dashboard-portfolio").length, 2);
+}
+
 function testNoUnsafeHtmlSinks() {
   const source = fs.readFileSync(require.resolve("./dashboard_app.js"), "utf8");
   assert.doesNotMatch(source, /innerHTML|outerHTML|insertAdjacentHTML|document\.write|https?:\/\//);
@@ -207,6 +329,10 @@ function testNoUnsafeHtmlSinks() {
   await testKillSwitchWorksWhenDataFails();
   await testModeSwitchNeedsBothConfirmations();
   await testTabsAndUnavailable();
+  await testHealthFetchFailureClearsSafety();
+  await testRefreshTopDoesNotRetryModeEveryFiveSeconds();
+  await testModeIntervalIsGuarded();
+  await testFetchTimeoutUnblocksPolling();
   testNoUnsafeHtmlSinks();
   console.log("dashboard_app tests passed");
 })().catch(error => {

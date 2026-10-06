@@ -137,6 +137,18 @@
     ids.forEach(id => setText(doc, id, "UNAVAILABLE", "muted"));
   }
 
+  function snapshotState(portfolio) {
+    const stamp = object(portfolio).snapshot_updated_at;
+    if (typeof stamp !== "string") {
+      return "unavailable";
+    }
+    const parsed = Date.parse(stamp);
+    if (!Number.isFinite(parsed)) {
+      return "unavailable";
+    }
+    return Date.now() - parsed > IBKR_MAX_AGE_SECONDS * 1000 ? "stale" : "current";
+  }
+
   function renderTopBar(doc, { summary, status, mode }) {
     const label = modeLabel(mode);
     setText(doc, "modeBadge", label === "UNKNOWN" ? "MODE ?" : label,
@@ -174,36 +186,46 @@
 
   function renderPositions(doc, portfolio) {
     const data = object(portfolio);
+    const snap = snapshotState(data);
     const managed = list(data.managed_positions);
     const legacy = list(data.legacy_positions);
     const unprotected = data.managed_unprotected_count;
-    setText(doc, "posManagedCount", String(managed.length));
-    setText(doc, "posTotalCount", Number.isInteger(data.total_count)
-      ? String(data.total_count) : String(managed.length + legacy.length));
-    setText(doc, "posMarketValue", num(data.total_market_value));
-    setText(doc, "posUnrealized", signed(data.total_position_unrealized_pnl),
-      "kpi-value " + pnlClass(data.total_position_unrealized_pnl));
-    setText(doc, "posUnprotected", plain(unprotected),
-      "kpi-value " + (Number.isInteger(unprotected) && unprotected > 0 ? "bad" : "ok"));
+    if (snap !== "current") {
+      const label = snap === "stale" ? "STALE" : "UNAVAILABLE";
+      POSITION_IDS.forEach(id => setText(doc, id, label, "kpi-value muted"));
+    } else {
+      setText(doc, "posManagedCount", String(managed.length));
+      setText(doc, "posTotalCount", Number.isInteger(data.total_count)
+        ? String(data.total_count) : String(managed.length + legacy.length));
+      setText(doc, "posMarketValue", num(data.total_market_value));
+      setText(doc, "posUnrealized", signed(data.total_position_unrealized_pnl),
+        "kpi-value " + pnlClass(data.total_position_unrealized_pnl));
+      setText(doc, "posUnprotected", plain(unprotected),
+        "kpi-value " + (Number.isInteger(unprotected) && unprotected > 0 ? "bad" : "ok"));
+    }
     fillRows(doc, "managedRows", managed.map(p => [
       [str(p.symbol), "symbol"], [str(p.side)], [plain(p.quantity), "num"],
       [num(p.avg_cost), "num"], [num(p.market_price), "num"], [num(p.market_value), "num"],
-      [signed(p.unrealized_pnl), "num " + pnlClass(p.unrealized_pnl)], protection(p),
-    ]), "No managed positions", 8);
+      [signed(p.unrealized_pnl), "num " + pnlClass(p.unrealized_pnl)],
+      snap === "current" ? protection(p) : [snap === "stale" ? "STALE" : "UNAVAILABLE", "warn"],
+    ]), snap === "current" ? "No managed positions" : snap === "stale" ? "STALE" : "UNAVAILABLE", 8);
     fillRows(doc, "brokerRows", [...managed, ...legacy].map(p => [
       [str(p.symbol), "symbol"], [str(String(p.ownership || "").toUpperCase())], [str(p.side)],
       [plain(p.quantity), "num"], [num(p.avg_cost), "num"], [num(p.market_price), "num"],
       [num(p.market_value), "num"], [signed(p.unrealized_pnl), "num " + pnlClass(p.unrealized_pnl)],
-    ]), "No broker positions", 8);
+    ]), snap === "current" ? "No broker positions" : snap === "stale" ? "STALE" : "UNAVAILABLE", 8);
   }
 
   function renderOrders(doc, portfolio) {
-    const orders = list(object(portfolio).open_orders);
-    setText(doc, "ordersCount", String(orders.length));
+    const data = object(portfolio);
+    const snap = snapshotState(data);
+    const orders = list(data.open_orders);
+    setText(doc, "ordersCount", snap === "current" ? String(orders.length)
+      : snap === "stale" ? "STALE" : "UNAVAILABLE", snap === "current" ? undefined : "muted");
     fillRows(doc, "orderRows", orders.map(o => [
       [str(o.symbol), "symbol"], [str(o.action)], [plain(o.quantity), "num"], [str(o.order_type)],
       [num(o.price), "num"], [str(o.status)], [plain(o.order_id), "num"], [str(o.order_ref)],
-    ]), "No open orders", 8);
+    ]), snap === "current" ? "No open orders" : snap === "stale" ? "STALE" : "UNAVAILABLE", 8);
   }
 
   function componentStatus(component) {
@@ -230,20 +252,40 @@
         ? Math.floor(c.age_seconds) + "s ago" : "-", "num"],
       [str(c.detail), "detail"],
     ]), "No runtime component data", 5);
-    const data = object(summary);
-    const blockers = Array.isArray(object(data.safety).blockers)
-      ? data.safety.blockers.filter(item => typeof item === "string" && item.length) : [];
-    fillList(doc, "safetyBlockers", blockers, "No safety blockers");
-    setText(doc, "safetyKillReason", str(object(data.system).kill_switch_reason));
+    if (!summary) {
+      fillList(doc, "safetyBlockers", ["UNAVAILABLE"], "UNAVAILABLE");
+      setText(doc, "safetyKillReason", "UNAVAILABLE");
+    } else {
+      const data = object(summary);
+      const blockers = Array.isArray(object(data.safety).blockers)
+        ? data.safety.blockers.filter(item => typeof item === "string" && item.length) : [];
+      fillList(doc, "safetyBlockers", blockers, "No safety blockers");
+      setText(doc, "safetyKillReason", str(object(data.system).kill_switch_reason));
+    }
   }
 
-  async function fetchJson(fetchImpl, url, options) {
-    const reply = await fetchImpl(url, Object.assign(
-      { credentials: "same-origin", cache: "no-store" }, options || {}));
-    if (!reply || reply.ok !== true) {
-      throw new Error("HTTP_ERROR");
+  async function fetchJson(fetchImpl, url, options, timerSource) {
+    const timers = timerSource || root;
+    const controller = typeof (timers || {}).AbortController === "function"
+      ? new timers.AbortController()
+      : typeof AbortController === "function" ? new AbortController() : null;
+    const request = Object.assign({ credentials: "same-origin", cache: "no-store" }, options || {});
+    let timeoutId = null;
+    if (controller) {
+      request.signal = controller.signal;
+      timeoutId = timers.setTimeout(() => { controller.abort(); }, 8000);
     }
-    return reply.json();
+    try {
+      const reply = await fetchImpl(url, request);
+      if (!reply || reply.ok !== true) {
+        throw new Error("HTTP_ERROR");
+      }
+      return reply.json();
+    } finally {
+      if (timeoutId !== null) {
+        timers.clearTimeout(timeoutId);
+      }
+    }
   }
 
   function createApp({ doc, fetchImpl, win, panel }) {
@@ -278,7 +320,7 @@
 
     async function loadMode() {
       try {
-        state.mode = await fetchJson(fetchImpl, "/trading-mode");
+        state.mode = await fetchJson(fetchImpl, "/trading-mode", undefined, win);
       } catch (error) {
         state.mode = null;
       }
@@ -287,10 +329,8 @@
 
     async function refreshTop() {
       const [summary, status] = await Promise.allSettled([
-        fetchJson(fetchImpl, "/dashboard-summary"), fetchJson(fetchImpl, "/status")]);
-      if (state.mode === null) {
-        await loadMode();
-      }
+        fetchJson(fetchImpl, "/dashboard-summary", undefined, win),
+        fetchJson(fetchImpl, "/status", undefined, win)]);
       state.summary = summary.status === "fulfilled" ? summary.value : null;
       state.killOn = renderTopBar(doc, {
         summary: state.summary,
@@ -302,7 +342,7 @@
     async function refreshActive() {
       if (state.tab === "positions" || state.tab === "orders") {
         try {
-          const portfolio = await fetchJson(fetchImpl, "/dashboard-portfolio");
+          const portfolio = await fetchJson(fetchImpl, "/dashboard-portfolio", undefined, win);
           renderPositions(doc, portfolio);
           renderOrders(doc, portfolio);
         } catch (error) {
@@ -313,10 +353,13 @@
         }
       } else if (state.tab === "health") {
         try {
-          renderHealth(doc, await fetchJson(fetchImpl, "/dashboard-components"), state.summary);
+          renderHealth(doc, await fetchJson(fetchImpl, "/dashboard-components", undefined, win),
+            state.summary);
         } catch (error) {
           markUnavailable(doc, ["healthSummary"]);
           fillRows(doc, "componentRows", [], "UNAVAILABLE", 5);
+          fillList(doc, "safetyBlockers", ["UNAVAILABLE"], "UNAVAILABLE");
+          setText(doc, "safetyKillReason", "UNAVAILABLE");
         }
         renderModePanel(doc, state.mode);
       }
@@ -375,7 +418,7 @@
         await fetchJson(fetchImpl, "/control/kill-switch", {
           method: "POST", headers: { "Content-Type": "application/json" },
           body: JSON.stringify(body),
-        });
+        }, win);
         closeKill();
         await refreshTop();
       } catch (error) {
@@ -407,7 +450,7 @@
         await fetchJson(fetchImpl, "/trading-mode", {
           method: "POST", headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ mode }),
-        });
+        }, win);
         setText(doc, "modeMessage", mode + " enabled");
       } catch (error) {
         setText(doc, "modeMessage", "Mode switch failed");
@@ -434,16 +477,17 @@
       const pollTop = guarded("top", refreshTop);
       const pollActive = guarded("active", refreshActive);
       const pollResearch = guarded("research", refreshResearch);
+      const pollMode = guarded("mode", loadMode);
       win.addEventListener("hashchange", () => {
         selectTab(win.location.hash);
         pollActive();
       });
       selectTab(win.location.hash);
-      loadMode().then(pollTop);
+      pollMode().then(pollTop);
       pollActive();
       pollResearch();
       win.setInterval(() => { pollTop(); pollActive(); }, POLL_MS);
-      win.setInterval(loadMode, MODE_POLL_MS);
+      win.setInterval(pollMode, MODE_POLL_MS);
       win.setInterval(pollResearch, RESEARCH_POLL_MS);
     }
 
