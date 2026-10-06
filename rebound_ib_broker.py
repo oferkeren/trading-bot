@@ -67,8 +67,26 @@ class IBReboundBroker:
             if item.get("status") in _ACTIVE_STATUSES:
                 return "ACTIVE"
         if self._broker_position_flat(signal):
+            if self._active_exit_orders(signal):
+                return "MISSING"
             return "FLAT"
         return "MISSING"
+
+    def _active_exit_orders(self, signal):
+        active = []
+        seen = set()
+        for role in ("TP", "SL"):
+            for item in self._child_order_candidates(signal, role, open_only=True):
+                if item.get("status") not in _ACTIVE_STATUSES:
+                    continue
+                marker = id(item)
+                if marker not in seen:
+                    seen.add(marker)
+                    active.append(item)
+        flatten = self._active_flatten_order(signal)
+        if flatten is not None and id(flatten) not in seen:
+            active.append(flatten)
+        return active
 
     def _child_order_candidates(self, signal, role, open_only=False):
         orders = list(self.ib.open_orders)
@@ -207,6 +225,8 @@ class IBReboundBroker:
             return "EXITED_AT_BROKER"
         if state == "FLAT":
             return "FLAT"
+        if self._broker_position_flat(signal):
+            return self._flatten_without_stop(signal, None)
         bars = self.bars_since(signal["symbol"],
                                datetime.now(timezone.utc) - timedelta(days=1))
         if not bars:
@@ -225,19 +245,21 @@ class IBReboundBroker:
 
     def _flatten_without_stop(self, signal, last):
         self.wc.load_order_state(self.ib)
-        active_flatten = self._active_flatten_order(signal)
-        if active_flatten is not None:
-            self._replace_flatten_order(active_flatten, last)
-            return "FLATTEN_WORKING"
-        self._cancel_active_bracket_children(signal)
         positions = self.wc.load_position_state(self.ib)
         symbol = str(signal["symbol"]).strip().upper()
         position = positions.get(symbol) or {}
         quantity = float(position.get("quantity") or 0)
         if quantity == 0:
+            if self._cancel_active_bracket_children(signal):
+                return "CANCEL_REQUESTED"
             return "FLAT"
         if quantity < 0:
             raise RuntimeError(f"{symbol}: broker position is not long ({quantity})")
+        active_flatten = self._active_flatten_order(signal)
+        if active_flatten is not None:
+            self._replace_flatten_order(active_flatten, last)
+            return "FLATTEN_WORKING"
+        self._cancel_active_bracket_children(signal)
         rule, tick = self._rules(symbol)
         limit, _ = self.wc.normalize_price_to_market_rule(last * CLOSE_LIMIT_DOWN, rule, tick,
                                                           ROUND_FLOOR)
@@ -295,23 +317,15 @@ class IBReboundBroker:
             raise RuntimeError("; ".join(self.ib.reject_messages) or "flatten modify rejected")
 
     def _cancel_active_bracket_children(self, signal):
-        parent_ids = {
-            self._as_int(signal.get("entry_order_id")),
-            self._as_int(signal.get("parent_order_id")),
-        }
-        parent_ids.discard(None)
-        child_ids = {
-            self._as_int(signal.get("target_order_id")),
-            self._as_int(signal.get("stop_order_id")),
-        }
-        child_ids.discard(None)
-        for item in self.ib.open_orders:
+        cancelled = 0
+        seen = set()
+        for item in self._active_exit_orders(signal):
             order_id = self._as_int(item.get("order_id"))
-            parent_id = self._as_int(item.get("parent_id"))
-            if item.get("status") not in _ACTIVE_STATUSES:
-                continue
-            if order_id in child_ids or (parent_id in parent_ids and order_id not in parent_ids):
+            if order_id is not None and order_id not in seen:
                 self.ib.cancelOrder(order_id, OrderCancel())
+                seen.add(order_id)
+                cancelled += 1
+        return cancelled
 
     @staticmethod
     def _as_int(value):

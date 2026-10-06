@@ -227,12 +227,49 @@ class BrokerTests(unittest.TestCase):
         order = ib.placed[0][2]
         self.assertEqual((order.orderId, order.action, order.orderType), (12, "SELL", "STP LMT"))
 
-    def test_missing_stop_with_flat_broker_position_is_exited_like(self):
+    def test_missing_stop_with_flat_broker_position_cancels_active_target_before_flat(self):
         ib = FakeIB()
         ib.open_orders[2]["status"] = "Cancelled"
         ib.positions = {}
         result = rib.IBReboundBroker(ib, fake_wc()).close(SIGNAL, "MAX_HOLD")
+        self.assertEqual(result, "CANCEL_REQUESTED")
+        self.assertEqual(ib.cancelled, [11])
+        self.assertEqual(ib.placed, [])
+
+    def test_flat_broker_position_without_active_children_is_flat(self):
+        ib = FakeIB()
+        ib.open_orders[1]["status"] = "Cancelled"
+        ib.open_orders[2]["status"] = "Cancelled"
+        ib.positions = {}
+
+        result = rib.IBReboundBroker(ib, fake_wc()).close(SIGNAL, "MAX_HOLD")
+
         self.assertEqual(result, "FLAT")
+        self.assertEqual(ib.cancelled, [])
+        self.assertEqual(ib.placed, [])
+
+    def test_protection_state_reports_missing_when_flat_with_active_target(self):
+        ib = FakeIB()
+        ib.open_orders[2]["status"] = "Cancelled"
+        ib.positions = {}
+
+        self.assertEqual(rib.IBReboundBroker(ib, fake_wc()).protection_state(SIGNAL), "MISSING")
+
+    def test_flat_broker_position_cancels_active_flatten_before_flat(self):
+        ib = FakeIB()
+        ib.open_orders[1]["status"] = "Cancelled"
+        ib.open_orders[2]["status"] = "Cancelled"
+        ib.open_orders.append(
+            {"account": "DU1", "con_id": 0, "order_id": 99, "perm_id": 0,
+             "symbol": "ABC", "status": "Submitted", "parent_id": 0, "action": "SELL",
+             "order_type": "LMT", "total_quantity": 500.0, "order_ref": "rebound-flatten-s1"}
+        )
+        ib.positions = {}
+        broker = rib.IBReboundBroker(ib, fake_wc())
+
+        self.assertEqual(broker.protection_state(SIGNAL), "MISSING")
+        self.assertEqual(broker.close(SIGNAL, "MAX_HOLD"), "CANCEL_REQUESTED")
+        self.assertEqual(ib.cancelled, [99])
         self.assertEqual(ib.placed, [])
 
     def test_protection_state_reports_flat_only_when_no_child_filled(self):

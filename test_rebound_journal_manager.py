@@ -282,6 +282,41 @@ class ManagerTests(Base):
         self.assertFalse(manager.has_work(self.db, T0 + timedelta(minutes=1)))
         self.assertFalse(journal.is_busy(self.db))
 
+    def test_real_broker_flat_with_active_target_cancels_before_closed(self):
+        add_signal(self.db)
+        ib = FakeIB()
+        ib.open_orders[1]["order_ref"] = "TM:s1:TP"
+        ib.open_orders[2]["status"] = "Cancelled"
+        ib.positions = {}
+        broker = rib.IBReboundBroker(ib, fake_wc())
+        first = T0 + timedelta(minutes=1)
+
+        manager.tick(self.db, broker, first)
+
+        self.assertEqual(position(self.db, "s1")["state"], "CLOSING")
+        self.assertEqual(position(self.db, "s1")["close_reason"], "UNPROTECTED")
+        self.assertEqual(ib.cancelled, [11])
+        self.assertEqual([row for row in journal_rows(self.db) if row["event"] == "EXIT"], [])
+        self.assertTrue(journal.is_busy(self.db))
+
+        manager.tick(self.db, broker, first + timedelta(seconds=10))
+
+        self.assertEqual(ib.cancelled, [11])
+        self.assertEqual(position(self.db, "s1")["state"], "CLOSING")
+        self.assertTrue(journal.is_busy(self.db))
+
+        ib.open_orders[1]["status"] = "Cancelled"
+        manager.tick(self.db, broker, first + timedelta(seconds=61))
+
+        self.assertEqual(position(self.db, "s1")["state"], "CLOSED")
+        self.assertEqual(position(self.db, "s1")["close_reason"], "FLAT_AT_BROKER")
+        self.assertEqual(ib.cancelled, [11])
+        self.assertEqual([row for row in journal_rows(self.db) if row["event"] == "EXIT"],
+                         [{"event": "EXIT", "reason": "FLAT_AT_BROKER",
+                           "detail": {"status": "OPEN_POSITION", "exit_price": None,
+                                      "pnl": None, "exit_reason": "FLAT_AT_BROKER"}}])
+        self.assertFalse(journal.is_busy(self.db))
+
     def test_real_broker_flatten_fill_retry_marks_closed_and_clears_work(self):
         add_signal(self.db)
         ib = FakeIB(bars=[{"timestamp": 4102444800, "close": 2.00, "high": 2.0}])
