@@ -75,6 +75,41 @@ class AccountUpdatePnlFallbackTests(unittest.TestCase):
         )
         self.assertEqual(warnings, [])
 
+    def test_leaves_daily_pnl_none_when_positions_exist_despite_account_update_values(self):
+        app = status_collector.StatusApp()
+        app.positions.append({
+            "symbol": "SORA",
+            "quantity": 10.0,
+        })
+        warnings = []
+
+        with patch.object(status_collector, "IB_ACCOUNT", "DUQ569670"):
+            app.updateAccountValue(
+                "$LEDGER-RealizedPnL",
+                "-10.00",
+                "BASE",
+                "DUQ569670",
+            )
+            app.updateAccountValue(
+                "$LEDGER-UnrealizedPnL",
+                "100.00",
+                "BASE",
+                "DUQ569670",
+            )
+
+            derived = status_collector.apply_account_update_pnl_fallback(
+                app,
+                warnings,
+            )
+
+        self.assertFalse(derived)
+        self.assertIsNone(app.daily_pnl)
+        self.assertNotIn(
+            "Account daily P/L derived from account updates",
+            warnings,
+        )
+        self.assertEqual(warnings, [])
+
 
 if __name__ == "__main__":
     unittest.main()

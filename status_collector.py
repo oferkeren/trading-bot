@@ -299,6 +299,9 @@ def apply_account_update_pnl_fallback(
     if app.daily_pnl is not None:
         return False
 
+    if app.positions:
+        return False
+
     realized = select_account_update_pnl_value(
         app,
         "RealizedPnL"
@@ -1589,7 +1592,11 @@ def collect_snapshot():
                 )
 
 
-        if app.daily_pnl is None:
+        if (
+            app.daily_pnl is None
+            and
+            not app.positions
+        ):
             app.account_updates_done.clear()
             app.account_update_pnl_values = {}
 
