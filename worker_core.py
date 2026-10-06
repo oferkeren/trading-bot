@@ -5,6 +5,7 @@ from protection_guard import evaluate_live_protection
 import math
 from decimal import Decimal, ROUND_HALF_UP, ROUND_FLOOR, ROUND_CEILING
 import os
+import sys
 import re
 import sqlite3
 import threading
@@ -757,6 +758,9 @@ class IBApp(
 
         self.cancelled_ids = set()
 
+        self.historical_bars = {}
+        self.historical_events = {}
+
 
     def nextValidId(
         self,
@@ -947,6 +951,26 @@ class IBApp(
                 self.parent_status = (
                     orderState.status
                 )
+
+
+    def historicalData(self, reqId, bar):
+        try:
+            timestamp = int(str(bar.date))
+        except (TypeError, ValueError):
+            timestamp = None
+        self.historical_bars.setdefault(reqId, []).append({
+            "timestamp": timestamp,
+            "open": float(bar.open),
+            "high": float(bar.high),
+            "low": float(bar.low),
+            "close": float(bar.close),
+            "volume": float(bar.volume or 0),
+        })
+
+    def historicalDataEnd(self, reqId, start, end):
+        event = self.historical_events.get(reqId)
+        if event is not None:
+            event.set()
 
 
     def openOrderEnd(
@@ -6727,6 +6751,31 @@ def startup_sync():
         )
 
 
+REBOUND_MANAGER_INTERVAL_SECONDS = float(
+    os.getenv("REBOUND_MANAGER_INTERVAL_SECONDS", "10")
+)
+
+
+def run_rebound_manager():
+    """Ratchet/close open microcap_rebound_v1 positions (paper account only)."""
+    import rebound_stop_manager
+
+    if not rebound_stop_manager.has_work(DB_FILE):
+        return
+    if not (str(IB_PORT) == "7497" and str(IB_ACCOUNT).upper().startswith("DU")):
+        print("REBOUND MANAGER SKIP | not the paper account", flush=True)
+        return
+    import rebound_ib_broker
+
+    ib = connect_ibkr()
+    try:
+        rebound_stop_manager.tick(
+            DB_FILE, rebound_ib_broker.IBReboundBroker(ib, sys.modules[__name__])
+        )
+    finally:
+        ib.disconnect()
+
+
 def main():
     init_db()
 
@@ -6803,6 +6852,7 @@ def main():
     last_reconcile = (
         time.monotonic()
     )
+    last_rebound = 0.0
 
 
     while True:
@@ -6835,6 +6885,20 @@ def main():
                 last_reconcile = (
                     time.monotonic()
                 )
+
+
+            if (
+                time.monotonic() - last_rebound
+                >= REBOUND_MANAGER_INTERVAL_SECONDS
+            ):
+                last_rebound = time.monotonic()
+                try:
+                    run_rebound_manager()
+                except Exception as exc:
+                    print(
+                        f"REBOUND MANAGER ERROR | {type(exc).__name__}: {exc}",
+                        flush=True,
+                    )
 
 
             cancel_request = (
