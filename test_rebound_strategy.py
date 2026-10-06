@@ -166,6 +166,78 @@ class AnalyzeTests(unittest.TestCase):
                          "SKIP_BARS_STALE")
 
 
+EARLY = datetime(2026, 10, 6, 5, 0, tzinfo=NY)
+# Two fast ~5% spike-and-fade cycles (each spike within 5 bars), then a 50% dip and trigger.
+EARLY_CLOSES = [1.00, 1.00, 1.00, 1.025, 1.05, 1.04, 1.03, 1.025,
+                1.045, 1.075, 1.06, 1.05, 1.05, 1.05, 1.05]
+EARLY_TRIGGER = 1.06
+
+
+class ProfileTests(unittest.TestCase):
+    def at(self, hour, minute):
+        return datetime(2026, 10, 6, hour, minute, tzinfo=NY)
+
+    def test_profile_boundaries(self):
+        self.assertIsNone(rs.profile_for(self.at(3, 59)))
+        self.assertEqual(rs.profile_for(self.at(4, 0)).session, "EARLY_PRE")
+        self.assertEqual(rs.profile_for(self.at(6, 59)).session, "EARLY_PRE")
+        self.assertEqual(rs.profile_for(self.at(7, 0)).session, "PRE")
+        self.assertEqual(rs.profile_for(self.at(9, 29)).session, "PRE")
+        self.assertEqual(rs.profile_for(self.at(9, 30)).session, "RTH")
+        self.assertEqual(rs.profile_for(self.at(16, 0)).session, "POST")
+        self.assertEqual(rs.profile_for(self.at(19, 29)).session, "POST")
+        self.assertIsNone(rs.profile_for(self.at(19, 30)))
+
+    def test_profile_parameters(self):
+        early = rs.profile_for(self.at(5, 0))
+        self.assertEqual((early.spike_min_pct, early.spike_max_bars, early.max_spread_pct),
+                         (4.0, 5, 3.0))
+        self.assertEqual(rs.profile_for(self.at(8, 0)).max_spread_pct, 1.5)
+        rth = rs.profile_for(self.at(10, 0))
+        self.assertEqual((rth.spike_min_pct, rth.spike_max_bars, rth.max_spread_pct),
+                         (8.0, 15, 0.8))
+        self.assertEqual(rs.profile_for(self.at(17, 0)).max_spread_pct, 1.5)
+
+    def test_detect_cycles_uses_profile(self):
+        bars = make_bars(EARLY_CLOSES, start=EARLY)
+        clean = rs._clean_bars(bars, now_after(bars))
+        self.assertEqual(len(rs.detect_cycles(clean, rs.profile_for(EARLY))), 2)
+        self.assertEqual(rs.detect_cycles(clean), [])  # default profile = 8%/15 bars
+
+
+class EarlyPremarketAnalyzeTests(unittest.TestCase):
+    def run_at(self, start, q):
+        bars = make_bars(EARLY_CLOSES + [EARLY_TRIGGER], start=start)
+        return rs.analyze({"symbol": "abcd"}, bars, q, now_after(bars), PAPER)
+
+    def test_fast_small_cycles_qualify_early(self):
+        result = self.run_at(EARLY, quote(1.061, 1.059))
+        self.assertTrue(result["qualified"], result)
+        self.assertEqual(result["rebound"]["cycles"], 2)
+        self.assertEqual(result["rebound"]["session"], "EARLY_PRE")
+        self.assertEqual(result["stop"], round(1.05 * 0.995, 4))
+
+    def test_same_bars_in_regular_hours_are_not_cycles(self):
+        result = self.run_at(datetime(2026, 10, 6, 10, 0, tzinfo=NY), quote(1.061, 1.059))
+        self.assertEqual(result["skip_reason"], "SKIP_CYCLES")
+        self.assertEqual(result["rebound"]["session"], "RTH")
+
+    def test_early_spread_limit_is_three_percent(self):
+        wide = quote(1.061, 1.035)  # ~2.5%
+        self.assertTrue(self.run_at(EARLY, wide)["qualified"])
+        late = self.run_at(datetime(2026, 10, 6, 8, 0, tzinfo=NY), wide)
+        self.assertEqual(late["skip_reason"], "SKIP_SPREAD")
+        self.assertEqual(late["rebound"]["session"], "PRE")
+        too_wide = self.run_at(EARLY, quote(1.061, 1.025))  # ~3.5%
+        self.assertEqual(too_wide["skip_reason"], "SKIP_SPREAD")
+
+    def test_existing_regular_hours_signal_is_tagged(self):
+        bars = make_bars(TWO_CYCLES + [TRIGGER])
+        result = rs.analyze({"symbol": "abcd"}, bars, quote(), now_after(bars), PAPER)
+        self.assertTrue(result["qualified"], result)
+        self.assertEqual(result["rebound"]["session"], "RTH")
+
+
 class NewsVerdictTests(unittest.TestCase):
     def ai(self, **overrides):
         value = {"status": "PASS", "news_count": 2,
