@@ -609,11 +609,15 @@ def process_rebound_candidate(candidate, secret, db_file=None):
         return skip(reason, news)
     try:
         entry = float(candidate["entry"])
+        stop = float(candidate["stop"])
     except (KeyError, TypeError, ValueError):
         return skip("SKIP_SIZE")
-    if not math.isfinite(entry) or entry <= 0:
+    if not (math.isfinite(entry) and math.isfinite(stop)) or entry <= 0 or stop >= entry:
         return skip("SKIP_SIZE")
-    quantity = math.floor(rebound_strategy.MAX_POSITION_USD / entry)
+    quantity = min(
+        math.floor(rebound_strategy.MAX_POSITION_USD / entry),
+        math.floor(rebound_strategy.MAX_RISK_USD / (entry - stop)),
+    )
     if quantity < 1:
         return skip("SKIP_SIZE")
     final_candidate = dict(candidate)

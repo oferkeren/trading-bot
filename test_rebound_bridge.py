@@ -78,6 +78,23 @@ class ProcessReboundCandidateTests(unittest.TestCase):
         self.post.assert_not_called()
         self.assertEqual(self.journal(), [("SKIP", "SKIP_SIZE")])
 
+    def test_wide_stop_sizes_down_by_risk(self):
+        candidate = {**CANDIDATE, "entry": 2.0, "stop": 1.88}
+        with patch.object(ai_signal_bridge.ai_gate, "evaluate_trade_candidate",
+                          MagicMock(return_value=STRONG)):
+            ai_signal_bridge.process_rebound_candidate(candidate, "s", db_file=self.db)
+        posted_candidate = self.post.call_args.args[0]
+        self.assertEqual(posted_candidate["_ai_final_quantity"], 458)
+        self.assertLessEqual(458 * 0.12, 55.0)
+
+    def test_stop_not_below_entry_skips_size(self):
+        candidate = {**CANDIDATE, "entry": 2.0, "stop": 2.0}
+        with patch.object(ai_signal_bridge.ai_gate, "evaluate_trade_candidate",
+                          MagicMock(return_value=STRONG)):
+            outcome = ai_signal_bridge.process_rebound_candidate(candidate, "s", db_file=self.db)
+        self.assertEqual(outcome["reason"], "SKIP_SIZE")
+        self.post.assert_not_called()
+
     def test_weak_news_is_skipped(self):
         weak = {**STRONG, "ai": {"news_score": 0.2, "event_type": "CONTRACT"}}
         outcome = self.run_with(MagicMock(return_value=weak))

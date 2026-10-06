@@ -38,7 +38,7 @@ The paper results are an experiment, not calibration. A separate later spec cove
 - The current dip low must be above the previous completed cycle's fade low (a higher low; otherwise `SKIP_LOWER_LOW`).
 - **Trigger:** the last *closed* 1-minute bar is green, closes above the previous bar's high, and has volume at least the average of the prior 5 bars (`SKIP_NO_TRIGGER`).
 - **Spread limit:** `(ask − bid) / mid` must be ≤ 0.8% in regular hours and ≤ 1.5% in extended hours (`SKIP_SPREAD`).
-- **Order:** a limit buy at the ask, sized at `floor(MAX_POSITION_USD / ask)` shares with `MAX_POSITION_USD = 1000` (`SKIP_SIZE` if that comes to 0).
+- **Order:** a limit buy at the ask, sized at `min(floor(MAX_POSITION_USD / ask), floor(MAX_RISK_USD / (entry - stop)))` shares with `MAX_POSITION_USD = 1000` and `MAX_RISK_USD = 55` (`SKIP_SIZE` if that comes to 0 or the stop is not below entry).
 - **Time:** no new entries outside 04:00–19:30 ET (`SKIP_SESSION`).
 - **Position limit:** no entry while any `microcap_rebound_v1` position or open entry order exists (`SKIP_BUSY`).
 
