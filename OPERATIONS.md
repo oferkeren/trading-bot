@@ -912,7 +912,7 @@ All paths are absolute and outside the repository. Load the private environment 
 
    Exit codes: 0 = ok; 2 = invalid input or `ENVIRONMENT_INCOMPLETE`; 3 = `PROVIDER_ERROR` or `NO_SAMPLES_SELECTED`.
 
-2. Run every sample through the existing IBKR, source and SEC CLIs. This takes about 25 s or more per sample. TWS paper on port 7497 must be up.
+2. Create the output directory first (`mkdir -m 700 /external/batch/runs`; the runner refuses a missing directory with `INPUT_INVALID`). Then run every sample through the existing IBKR, source and SEC CLIs. This takes about 25 s or more per sample. TWS paper on port 7497 must be up.
 
    ```bash
    ./venv/bin/python microcap_batch_run.py --manifest /external/batch/batch-manifest.json --out-dir /external/batch/runs [--resume]
