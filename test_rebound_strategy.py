@@ -154,6 +154,17 @@ class AnalyzeTests(unittest.TestCase):
         result = self.run_case(bars=yesterday + bars)
         self.assertTrue(result["qualified"], result)
 
+    def test_stale_last_closed_bar_is_rejected(self):
+        bars = make_bars(TWO_CYCLES + [TRIGGER])
+        stale_now = datetime.fromtimestamp(bars[-1]["timestamp"] + 30 * 60, timezone.utc)
+        self.assertEqual(self.skip(self.run_case(bars=bars, now=stale_now)), "SKIP_BARS_STALE")
+
+    def test_gap_between_prior_and_trigger_is_rejected(self):
+        bars = make_bars(TWO_CYCLES + [TRIGGER])
+        bars[-1]["timestamp"] = bars[-2]["timestamp"] + 3 * rs.BAR_SECONDS
+        self.assertEqual(self.skip(self.run_case(bars=bars, now=now_after(bars))),
+                         "SKIP_BARS_STALE")
+
 
 class NewsVerdictTests(unittest.TestCase):
     def ai(self, **overrides):

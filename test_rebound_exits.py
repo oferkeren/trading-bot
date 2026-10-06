@@ -24,6 +24,33 @@ class NextActionTests(unittest.TestCase):
     def test_trails_one_r_below_high(self):
         self.assertEqual(act(2.25, current=2.02), {"action": "MOVE_STOP", "stop": 2.15})
 
+    def test_trail_hit_closes_when_new_stop_is_above_market(self):
+        try:
+            result = next_action(entry=2.00, initial_stop=1.90, current_stop=1.90,
+                                 high_since_entry=2.25, opened_at=OPEN,
+                                 now=OPEN + timedelta(minutes=1), last_price=2.12)
+        except TypeError as exc:
+            self.fail(f"next_action should accept last_price: {exc}")
+        self.assertEqual(result, {"action": "CLOSE", "reason": "TRAIL_HIT"})
+
+    def test_stop_breached_closes_even_without_stop_move(self):
+        try:
+            result = next_action(entry=2.00, initial_stop=1.90, current_stop=2.15,
+                                 high_since_entry=2.12, opened_at=OPEN,
+                                 now=OPEN + timedelta(minutes=1), last_price=2.14)
+        except TypeError as exc:
+            self.fail(f"next_action should accept last_price: {exc}")
+        self.assertEqual(result, {"action": "CLOSE", "reason": "STOP_BREACHED"})
+
+    def test_missing_last_price_keeps_move_stop_behavior(self):
+        try:
+            result = next_action(entry=2.00, initial_stop=1.90, current_stop=2.02,
+                                 high_since_entry=2.25, opened_at=OPEN,
+                                 now=OPEN + timedelta(minutes=1), last_price=None)
+        except TypeError as exc:
+            self.fail(f"next_action should accept last_price: {exc}")
+        self.assertEqual(result, {"action": "MOVE_STOP", "stop": 2.15})
+
     def test_never_moves_down(self):
         self.assertEqual(act(2.12, current=2.15), {"action": "HOLD"})
 

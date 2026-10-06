@@ -7,8 +7,9 @@ broker must provide:
 Not affected by the kill switch: it only raises stops and closes positions.
 """
 
+import math
 from datetime import datetime, timedelta, timezone
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import rebound_exits
 import rebound_journal as journal
@@ -24,10 +25,12 @@ def parse_ib_time(value):
     text = str(value).strip()
     try:
         if text[:8].isdigit() and len(text) >= 17:
-            return datetime.strptime(text[:17], "%Y%m%d %H:%M:%S").replace(tzinfo=_EASTERN)
+            suffix = text[17:].strip()
+            zone = ZoneInfo(suffix) if suffix else _EASTERN
+            return datetime.strptime(text[:17], "%Y%m%d %H:%M:%S").replace(tzinfo=zone)
         parsed = datetime.fromisoformat(text)
         return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
-    except ValueError:
+    except (ValueError, ZoneInfoNotFoundError):
         return None
 
 
@@ -112,9 +115,16 @@ def _manage(db_file, conn, broker, signal, now):
         return
     opened = datetime.fromisoformat(position["opened_at"])
     high = position["high_since_entry"]
+    last_price = None
     try:
         bars = broker.bars_since(symbol, opened)
         high = max([high] + [float(b["high"]) for b in bars if b.get("high") is not None])
+        if bars:
+            close = bars[-1].get("close")
+            if not isinstance(close, bool) and isinstance(close, (int, float)):
+                close = float(close)
+                if math.isfinite(close):
+                    last_price = close
     except Exception as exc:
         journal.record(db_file, "ERROR", symbol=symbol, signal_id=sid, reason="BARS_FAILED",
                        detail={"error": repr(exc)}, now=now)
@@ -123,9 +133,18 @@ def _manage(db_file, conn, broker, signal, now):
     decision = rebound_exits.next_action(
         entry=position["entry"], initial_stop=position["initial_stop"],
         current_stop=position["current_stop"], high_since_entry=high,
-        opened_at=opened, now=now)
+        opened_at=opened, now=now, last_price=last_price)
     if decision["action"] == "MOVE_STOP":
-        broker.modify_stop(signal, decision["stop"])
+        try:
+            broker.modify_stop(signal, decision["stop"])
+        except Exception as exc:
+            journal.record(db_file, "ERROR", symbol=symbol, signal_id=sid,
+                           reason="STOP_MODIFY_FAILED", detail={"error": repr(exc)}, now=now)
+            broker.close(signal, "STOP_MODIFY_FAILED")
+            _update(conn, sid, now, state="CLOSING", close_reason="STOP_MODIFY_FAILED")
+            journal.record(db_file, "CLOSE_REQUEST", symbol=symbol, signal_id=sid,
+                           reason="STOP_MODIFY_FAILED", detail={"high": high}, now=now)
+            return
         _update(conn, sid, now, current_stop=decision["stop"])
         journal.record(db_file, "STOP_MOVE", symbol=symbol, signal_id=sid,
                        detail={"from": position["current_stop"], "to": decision["stop"], "high": high},

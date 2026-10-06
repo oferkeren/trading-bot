@@ -182,6 +182,8 @@ def analyze(candidate, bars, quote, now, env=None):
         return _skip(symbol, "SKIP_BARS_INVALID")
     if len(clean) < 7:
         return _skip(symbol, "SKIP_BARS_INSUFFICIENT", bars=len(clean))
+    if clean[-1]["timestamp"] < now.timestamp() - 2 * BAR_SECONDS:
+        return _skip(symbol, "SKIP_BARS_STALE")
     cycles = detect_cycles(clean)
     if len(cycles) < MIN_CYCLES:
         return _skip(symbol, "SKIP_CYCLES", cycles=len(cycles))
@@ -202,6 +204,8 @@ def analyze(candidate, bars, quote, now, env=None):
         return _skip(symbol, "SKIP_LOWER_LOW", previous_fade_low=previous_fade_low,
                      **diagnostics)
     trigger, prior = clean[-1], clean[-2]
+    if trigger["timestamp"] - prior["timestamp"] != BAR_SECONDS:
+        return _skip(symbol, "SKIP_BARS_STALE")
     average_volume = sum(bar["volume"] for bar in clean[-6:-1]) / 5
     if not (trigger["close"] > trigger["open"] and trigger["close"] > prior["high"]
             and trigger["volume"] >= average_volume):

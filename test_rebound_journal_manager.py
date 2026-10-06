@@ -45,7 +45,15 @@ class FakeBroker:
     def bars_since(self, symbol, since):
         if self.fail_bars:
             raise RuntimeError("no data")
-        return [{"high": h} for h in self.highs]
+        bars = []
+        for item in self.highs:
+            if isinstance(item, dict):
+                bars.append(dict(item))
+            elif isinstance(item, tuple):
+                bars.append({"high": item[0], "close": item[1]})
+            else:
+                bars.append({"high": item})
+        return bars
 
     def modify_stop(self, signal, trigger):
         self.calls.append(("modify_stop", signal["signal_id"], trigger))
@@ -57,6 +65,13 @@ class FakeBroker:
 def events(path):
     with sqlite3.connect(path) as conn:
         return [r[0] for r in conn.execute("SELECT event FROM rebound_journal ORDER BY id")]
+
+
+def position(path, sid):
+    with sqlite3.connect(path) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT * FROM rebound_positions WHERE signal_id=?", (sid,)).fetchone()
+        return dict(row) if row else None
 
 
 class Base(unittest.TestCase):
@@ -118,6 +133,12 @@ class ManagerTests(Base):
         self.assertEqual(len(broker.calls), 1)
         self.assertEqual(events(self.db), ["ENTRY", "STOP_MOVE"])
 
+    def test_trail_above_last_price_requests_close(self):
+        add_signal(self.db)
+        broker = FakeBroker(highs=[{"high": 2.25, "close": 2.12}])
+        manager.tick(self.db, broker, T0 + timedelta(minutes=1))
+        self.assertEqual(broker.calls, [("close", "s1", "TRAIL_HIT")])
+
     def test_max_hold_close_and_retry(self):
         add_signal(self.db)
         broker = FakeBroker()
@@ -157,8 +178,21 @@ class ManagerTests(Base):
             original(signal, trigger)
         broker.modify_stop = flaky
         manager.tick(self.db, broker, T0 + timedelta(minutes=1))
-        self.assertEqual(broker.calls, [("modify_stop", "b", 2.15)])
+        self.assertEqual(broker.calls, [("close", "a", "STOP_MODIFY_FAILED"),
+                                        ("modify_stop", "b", 2.15)])
         self.assertIn("ERROR", events(self.db))
+
+    def test_stop_modify_failure_sets_position_closing(self):
+        add_signal(self.db, "a")
+        broker = FakeBroker(highs=[2.25])
+
+        def fail_modify(signal, trigger):
+            raise RuntimeError("ib down")
+        broker.modify_stop = fail_modify
+        manager.tick(self.db, broker, T0 + timedelta(minutes=1))
+        self.assertEqual(broker.calls, [("close", "a", "STOP_MODIFY_FAILED")])
+        self.assertEqual(position(self.db, "a")["state"], "CLOSING")
+        self.assertEqual(position(self.db, "a")["close_reason"], "STOP_MODIFY_FAILED")
 
     def test_ignores_other_strategies(self):
         add_signal(self.db, strategy="scalp_pingpong_v1")
@@ -181,6 +215,9 @@ class ManagerTests(Base):
 
     def test_parse_ib_time(self):
         self.assertEqual(manager.parse_ib_time("20261006 10:00:00 US/Eastern"), T0)
+        self.assertEqual(manager.parse_ib_time("20261006 17:00:00 Asia/Jerusalem"),
+                         datetime(2026, 10, 6, 10, 0, tzinfo=NY))
+        self.assertIsNone(manager.parse_ib_time("20261006 17:00:00 Bogus/Zone"))
         self.assertIsNone(manager.parse_ib_time("garbage"))
 
 
