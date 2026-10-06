@@ -30,14 +30,17 @@ class FakeIB:
         self.next_order_id = 99
         self.cancelled = []
         self.positions = {"ABC": {"quantity": 500.0, "avg_cost": 2.0}}
+        self.completed_orders = []
         self.open_orders = [
-            {"order_id": 10, "status": "Filled", "action": "BUY", "order_type": "LMT",
-             "total_quantity": 500.0, "parent_id": 0, "order_ref": "ref-entry", "symbol": "ABC"},
-            {"order_id": 11, "status": "Submitted", "action": "SELL", "order_type": "LMT",
-             "total_quantity": 500.0, "parent_id": 10, "order_ref": "ref-tp", "symbol": "ABC"},
-            {"order_id": 12, "status": "PreSubmitted", "action": "SELL",
-             "order_type": "STP LMT", "total_quantity": 500.0, "parent_id": 10,
-             "order_ref": "ref-sl", "symbol": "ABC"}]
+            {"account": "DU1", "con_id": 0, "order_id": 10, "perm_id": 0, "symbol": "ABC",
+             "status": "Filled", "parent_id": 0, "action": "BUY", "order_type": "LMT",
+             "total_quantity": 500.0, "order_ref": "ref-entry"},
+            {"account": "DU1", "con_id": 0, "order_id": 11, "perm_id": 0, "symbol": "ABC",
+             "status": "Submitted", "parent_id": 10, "action": "SELL", "order_type": "LMT",
+             "total_quantity": 500.0, "order_ref": "ref-tp"},
+            {"account": "DU1", "con_id": 0, "order_id": 12, "perm_id": 0, "symbol": "ABC",
+             "status": "PreSubmitted", "parent_id": 10, "action": "SELL",
+             "order_type": "STP LMT", "total_quantity": 500.0, "order_ref": "ref-sl"}]
 
     def reqHistoricalData(self, req_id, *args):
         self.historical_bars[req_id] = list(self.bars)
@@ -97,16 +100,26 @@ class BrokerTests(unittest.TestCase):
         self.assertIs(type(order.lmtPrice), float)
         self.assertEqual((order.auxPrice, order.lmtPrice), (3.04, 2.91))
 
-    def test_stop_active_reports_stop_child_state(self):
+    def test_protection_state_reports_active_exit_and_missing(self):
         ib = FakeIB()
         broker = rib.IBReboundBroker(ib, fake_wc())
-        self.assertTrue(broker.stop_active(SIGNAL))
+        self.assertEqual(broker.protection_state(SIGNAL), "ACTIVE")
         ib.open_orders[2]["status"] = "Filled"
-        self.assertFalse(broker.stop_active(SIGNAL))
+        self.assertEqual(broker.protection_state(SIGNAL), "EXITED")
+        ib.open_orders[1]["status"] = "Cancelled"
+        ib.open_orders[2]["status"] = "Cancelled"
+        ib.completed_orders = [
+            {"account": "DU1", "con_id": 0, "order_id": 11, "perm_id": 0, "symbol": "ABC",
+             "status": "Filled", "parent_id": 10, "action": "SELL", "order_type": "LMT",
+             "total_quantity": 500.0, "order_ref": "ref-tp"}]
+        self.assertEqual(broker.protection_state(SIGNAL), "EXITED")
+        ib.completed_orders = []
+        ib.open_orders[1]["status"] = "Submitted"
+        self.assertEqual(broker.protection_state(SIGNAL), "MISSING")
 
     def test_close_missing_stop_flattens_long_broker_position(self):
         ib = FakeIB(bars=[{"timestamp": 4102444800, "close": 2.00, "high": 2.0}])
-        ib.open_orders[2]["status"] = "Filled"
+        ib.open_orders[2]["status"] = "Cancelled"
         result = rib.IBReboundBroker(ib, fake_wc()).close(SIGNAL, "MAX_HOLD")
         self.assertEqual(result, "FLATTEN_SENT")
         self.assertEqual(ib.cancelled, [11])
@@ -118,9 +131,47 @@ class BrokerTests(unittest.TestCase):
         self.assertEqual((order.tif, order.outsideRth, order.account, order.orderRef),
                          ("DAY", True, "DU1", "rebound-flatten-s1"))
 
+    def test_close_replaces_active_flatten_without_new_order_id_or_quantity(self):
+        ib = FakeIB(bars=[{"timestamp": 4102444800, "close": 2.00, "high": 2.0},
+                          {"timestamp": 4102444800, "close": 2.20, "high": 2.2}])
+        ib.open_orders[2]["status"] = "Cancelled"
+        broker = rib.IBReboundBroker(ib, fake_wc())
+        self.assertEqual(broker.close(SIGNAL, "MAX_HOLD"), "FLATTEN_SENT")
+        first_order_id = ib.placed[-1][0]
+        ib.open_orders.append(
+            {"account": "DU1", "con_id": 0, "order_id": first_order_id, "perm_id": 0,
+             "symbol": "ABC", "status": "Submitted", "parent_id": 0, "action": "SELL",
+             "order_type": "LMT", "total_quantity": 500.0, "order_ref": "rebound-flatten-s1"}
+        )
+
+        self.assertEqual(broker.close(SIGNAL, "MAX_HOLD"), "FLATTEN_WORKING")
+
+        placed_ids = [order_id for order_id, _, order in ib.placed if order.action == "SELL"]
+        latest_quantity_by_id = {
+            order_id: order.totalQuantity
+            for order_id, _, order in ib.placed
+            if order.action == "SELL"
+        }
+        self.assertEqual(placed_ids, [first_order_id, first_order_id])
+        self.assertEqual(sum(latest_quantity_by_id.values()), 500.0)
+        self.assertEqual(ib.next_order_id, first_order_id + 1)
+        self.assertEqual(ib.placed[-1][2].lmtPrice, 2.13)
+
+    def test_close_returns_exited_at_broker_when_child_already_filled(self):
+        ib = FakeIB(bars=[{"timestamp": 4102444800, "close": 2.00, "high": 2.0}])
+        ib.open_orders[2]["status"] = "Cancelled"
+        ib.completed_orders = [
+            {"account": "DU1", "con_id": 0, "order_id": 12, "perm_id": 0, "symbol": "ABC",
+             "status": "Filled", "parent_id": 10, "action": "SELL", "order_type": "STP LMT",
+             "total_quantity": 500.0, "order_ref": "ref-sl"}]
+        result = rib.IBReboundBroker(ib, fake_wc()).close(SIGNAL, "MAX_HOLD")
+        self.assertEqual(result, "EXITED_AT_BROKER")
+        self.assertEqual(ib.placed, [])
+        self.assertEqual(ib.cancelled, [])
+
     def test_close_missing_stop_returns_flat_without_long_position(self):
         ib = FakeIB(bars=[{"timestamp": 4102444800, "close": 2.00, "high": 2.0}])
-        ib.open_orders[2]["status"] = "Filled"
+        ib.open_orders[2]["status"] = "Cancelled"
         ib.positions = {}
         result = rib.IBReboundBroker(ib, fake_wc()).close(SIGNAL, "MAX_HOLD")
         self.assertEqual(result, "FLAT")
@@ -128,7 +179,7 @@ class BrokerTests(unittest.TestCase):
 
     def test_missing_stop_and_reject_raise(self):
         ib = FakeIB()
-        ib.open_orders[2]["status"] = "Filled"
+        ib.open_orders[2]["status"] = "Cancelled"
         with self.assertRaises(LookupError):
             rib.IBReboundBroker(ib, fake_wc()).modify_stop(SIGNAL, 2.1)
         with self.assertRaises(RuntimeError):

@@ -4,10 +4,12 @@ broker must provide:
   bars_since(symbol, since) -> list of bar dicts with "high"
   modify_stop(signal, trigger) -> None
   close(signal, reason) -> None
+  protection_state(signal) -> "ACTIVE" | "EXITED" | "MISSING"
 Not affected by the kill switch: it only raises stops and closes positions.
 """
 
 import math
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -21,6 +23,7 @@ _EASTERN = ZoneInfo("America/New_York")
 CANCELABLE_ENTRY_STATUSES = frozenset(
     status for status in ACTIVE_STATES
     if "CANCEL_REQUESTED" in ALLOWED_TRANSITIONS.get(status, set())
+    and status not in {"CANCEL_UNKNOWN", "UNKNOWN"}
 )
 
 
@@ -68,22 +71,26 @@ def _entry_expired(signal, now):
 
 
 def _entry_expired_recorded(conn, signal_id):
-    row = conn.execute(
-        "SELECT 1 FROM rebound_journal WHERE event='ENTRY_EXPIRED' AND signal_id=? LIMIT 1",
-        (signal_id,),
-    ).fetchone()
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM rebound_journal WHERE event='ENTRY_EXPIRED' AND signal_id=? LIMIT 1",
+            (signal_id,),
+        ).fetchone()
+    except sqlite3.Error:
+        return False
     return row is not None
 
 
 def _request_entry_cancel(db_file, conn, signal, now):
     sid = signal["signal_id"]
-    if not _entry_expired_recorded(conn, sid):
-        created = _parse_signal_timestamp(signal.get("created_at") or signal.get("signal_time"))
-        detail = {}
-        if created is not None:
-            detail["age_seconds"] = int((now.astimezone(timezone.utc) - created).total_seconds())
-        journal.record(db_file, "ENTRY_EXPIRED", symbol=signal.get("symbol"), signal_id=sid,
-                       reason="ENTRY_TIMEOUT", detail=detail, now=now)
+    if _entry_expired_recorded(conn, sid):
+        return
+    created = _parse_signal_timestamp(signal.get("created_at") or signal.get("signal_time"))
+    detail = {}
+    if created is not None:
+        detail["age_seconds"] = int((now.astimezone(timezone.utc) - created).total_seconds())
+    journal.record(db_file, "ENTRY_EXPIRED", symbol=signal.get("symbol"), signal_id=sid,
+                   reason="ENTRY_TIMEOUT", detail=detail, now=now)
     try:
         transition_signal(
             db_file=db_file,
@@ -93,7 +100,7 @@ def _request_entry_cancel(db_file, conn, signal, now):
             source="rebound_stop_manager",
             message="Rebound entry expired before fill",
             payload={"parent_order_id": signal.get("parent_order_id")},
-            force=(signal.get("status") == "CANCEL_UNKNOWN"),
+            force=False,
         )
     except Exception as exc:
         journal.record(db_file, "ERROR", symbol=signal.get("symbol"), signal_id=sid,
@@ -216,11 +223,14 @@ def _manage(db_file, conn, broker, signal, now):
             if result == "FLAT":
                 _mark_flat_at_broker(db_file, conn, signal, position, now)
         return
-    if not broker.stop_active(signal):
+    protection = broker.protection_state(signal)
+    if protection == "EXITED":
+        return
+    if protection == "MISSING":
         reason = "UNPROTECTED"
         _update(conn, sid, now, state="CLOSING", close_reason=reason)
         journal.record(db_file, "CLOSE_REQUEST", symbol=symbol, signal_id=sid,
-                       reason=reason, detail={"stop_active": False}, now=now)
+                       reason=reason, detail={"protection_state": "MISSING"}, now=now)
         result = _close_or_record_error(db_file, broker, signal, reason, symbol, sid, now)
         if result == "FLAT":
             _mark_flat_at_broker(db_file, conn, signal, position, now)
@@ -300,7 +310,11 @@ def has_work(db_file, now=None):
                 f"AND status IN ({cancel_placeholders}) AND parent_order_id IS NOT NULL",
                 (journal.STRATEGY, *sorted(CANCELABLE_ENTRY_STATUSES)),
             ).fetchall()
-            stale_entries = sum(1 for row in rows if _entry_expired(dict(row), now)[0])
+            stale_entries = sum(
+                1 for row in rows
+                if _entry_expired(dict(row), now)[0]
+                and not _entry_expired_recorded(conn, row["signal_id"])
+            )
         try:
             open_positions = conn.execute(
                 "SELECT COUNT(*) FROM rebound_positions WHERE state != 'CLOSED'").fetchone()[0]

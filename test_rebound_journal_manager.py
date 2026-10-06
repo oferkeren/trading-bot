@@ -50,7 +50,7 @@ class FakeBroker:
         self.highs = list(highs)
         self.calls = []
         self.fail_bars = False
-        self.stop_is_active = True
+        self.protection = "ACTIVE"
         self.close_result = None
 
     def bars_since(self, symbol, since):
@@ -69,9 +69,9 @@ class FakeBroker:
     def modify_stop(self, signal, trigger):
         self.calls.append(("modify_stop", signal["signal_id"], trigger))
 
-    def stop_active(self, signal):
-        self.calls.append(("stop_active", signal["signal_id"]))
-        return self.stop_is_active
+    def protection_state(self, signal):
+        self.calls.append(("protection_state", signal["signal_id"]))
+        return self.protection
 
     def close(self, signal, reason):
         self.calls.append(("close", signal["signal_id"], reason))
@@ -176,11 +176,11 @@ class ManagerTests(Base):
         add_signal(self.db)
         broker = FakeBroker(highs=[2.05])
         manager.tick(self.db, broker, T0 + timedelta(minutes=1))
-        self.assertEqual(broker.calls, [("stop_active", "s1")])
+        self.assertEqual(broker.calls, [("protection_state", "s1")])
         broker.highs = [2.05, 2.25]
         manager.tick(self.db, broker, T0 + timedelta(minutes=2))
-        self.assertEqual(broker.calls, [("stop_active", "s1"),
-                                        ("stop_active", "s1"),
+        self.assertEqual(broker.calls, [("protection_state", "s1"),
+                                        ("protection_state", "s1"),
                                         ("modify_stop", "s1", 2.15)])
         broker.highs = [2.10]  # the stored high is kept
         manager.tick(self.db, broker, T0 + timedelta(minutes=3))
@@ -191,7 +191,7 @@ class ManagerTests(Base):
         add_signal(self.db)
         broker = FakeBroker(highs=[{"high": 2.25, "close": 2.12}])
         manager.tick(self.db, broker, T0 + timedelta(minutes=1))
-        self.assertEqual(broker.calls, [("stop_active", "s1"), ("close", "s1", "TRAIL_HIT")])
+        self.assertEqual(broker.calls, [("protection_state", "s1"), ("close", "s1", "TRAIL_HIT")])
 
     def test_error_status_with_fill_is_managed_and_not_recorded_as_exit(self):
         add_signal(self.db, status="ERROR")
@@ -199,14 +199,14 @@ class ManagerTests(Base):
         self.assertTrue(manager.has_work(self.db))
         broker = FakeBroker()
         manager.tick(self.db, broker, T0 + timedelta(minutes=20))
-        self.assertEqual(broker.calls, [("stop_active", "s1"), ("close", "s1", "MAX_HOLD")])
+        self.assertEqual(broker.calls, [("protection_state", "s1"), ("close", "s1", "MAX_HOLD")])
         self.assertNotIn("EXIT", events(self.db))
 
     def test_max_hold_close_and_retry(self):
         add_signal(self.db)
         broker = FakeBroker()
         manager.tick(self.db, broker, T0 + timedelta(minutes=20))
-        self.assertEqual(broker.calls, [("stop_active", "s1"), ("close", "s1", "MAX_HOLD")])
+        self.assertEqual(broker.calls, [("protection_state", "s1"), ("close", "s1", "MAX_HOLD")])
         manager.tick(self.db, broker, T0 + timedelta(minutes=20, seconds=30))
         self.assertEqual(len(broker.calls), 2)
         manager.tick(self.db, broker, T0 + timedelta(minutes=21, seconds=1))
@@ -215,11 +215,39 @@ class ManagerTests(Base):
     def test_missing_stop_requests_unprotected_close_before_other_actions(self):
         add_signal(self.db)
         broker = FakeBroker(highs=[2.25])
-        broker.stop_is_active = False
+        broker.protection = "MISSING"
         manager.tick(self.db, broker, T0 + timedelta(minutes=1))
-        self.assertEqual(broker.calls, [("stop_active", "s1"), ("close", "s1", "UNPROTECTED")])
+        self.assertEqual(broker.calls, [("protection_state", "s1"), ("close", "s1", "UNPROTECTED")])
         self.assertEqual(position(self.db, "s1")["state"], "CLOSING")
         self.assertEqual(position(self.db, "s1")["close_reason"], "UNPROTECTED")
+
+    def test_broker_child_fill_defers_to_monitor_exit_record(self):
+        add_signal(self.db)
+        broker = FakeBroker(highs=[2.25])
+        broker.protection = "EXITED"
+        manager.tick(self.db, broker, T0 + timedelta(minutes=1))
+        self.assertEqual(broker.calls, [("protection_state", "s1")])
+        self.assertEqual(position(self.db, "s1")["state"], "OPEN")
+        self.assertEqual(events(self.db), ["ENTRY"])
+
+        set_status(self.db, "s1", "CLOSED_SL", 1.91, -45.0)
+        manager.tick(self.db, broker, T0 + timedelta(minutes=2))
+
+        self.assertEqual(position(self.db, "s1")["state"], "CLOSED")
+        self.assertEqual([row for row in journal_rows(self.db) if row["event"] == "EXIT"],
+                         [{"event": "EXIT", "reason": "CLOSED_SL",
+                           "detail": {"status": "CLOSED_SL", "exit_price": 1.91,
+                                      "pnl": -45.0, "exit_reason": None}}])
+
+    def test_exited_at_broker_close_result_leaves_position_closing(self):
+        add_signal(self.db)
+        broker = FakeBroker()
+        broker.close_result = "EXITED_AT_BROKER"
+        manager.tick(self.db, broker, T0 + timedelta(minutes=20))
+        self.assertEqual(broker.calls, [("protection_state", "s1"), ("close", "s1", "MAX_HOLD")])
+        self.assertEqual(position(self.db, "s1")["state"], "CLOSING")
+        self.assertEqual(position(self.db, "s1")["close_reason"], "MAX_HOLD")
+        self.assertNotIn("EXIT", events(self.db))
 
     def test_flat_broker_close_marks_position_closed_and_journals_exit(self):
         add_signal(self.db)
@@ -248,6 +276,33 @@ class ManagerTests(Base):
                            "detail": {"age_seconds": 300}}])
         self.assertEqual(broker.calls, [])
 
+    def test_stale_unfilled_entry_is_not_cancel_requested_after_expiry_record_exists(self):
+        add_signal(self.db, status="SUBMITTED", fill=None, created_at="2026-10-06T13:55:00+00:00")
+        broker = FakeBroker()
+        manager.tick(self.db, broker, T0)
+        with sqlite3.connect(self.db) as conn:
+            conn.execute("UPDATE signals SET status='SUBMITTED' WHERE signal_id='s1'")
+        self.assertFalse(manager.has_work(self.db, now=T0 + timedelta(seconds=10)))
+        manager.tick(self.db, broker, T0 + timedelta(seconds=10))
+        with sqlite3.connect(self.db) as conn:
+            status = conn.execute("SELECT status FROM signals WHERE signal_id='s1'").fetchone()[0]
+            trade_events = conn.execute("SELECT event_type, source, old_status, new_status FROM trade_events").fetchall()
+        self.assertEqual(status, "SUBMITTED")
+        self.assertEqual(trade_events, [("CANCEL_REQUESTED", "rebound_stop_manager", "SUBMITTED", "CANCEL_REQUESTED")])
+        self.assertEqual(len([row for row in journal_rows(self.db) if row["event"] == "ENTRY_EXPIRED"]), 1)
+
+    def test_cancel_unknown_unfilled_entry_is_not_cancel_requested(self):
+        add_signal(self.db, status="CANCEL_UNKNOWN", fill=None, created_at="2026-10-06T13:55:00+00:00")
+        self.assertFalse(manager.has_work(self.db, now=T0))
+        broker = FakeBroker()
+        manager.tick(self.db, broker, T0)
+        with sqlite3.connect(self.db) as conn:
+            status = conn.execute("SELECT status FROM signals WHERE signal_id='s1'").fetchone()[0]
+            trade_events = conn.execute("SELECT event_type FROM trade_events").fetchall()
+        self.assertEqual(status, "CANCEL_UNKNOWN")
+        self.assertEqual(trade_events, [])
+        self.assertEqual(journal_rows(self.db), [])
+
     def test_unparseable_unfilled_entry_time_expires(self):
         add_signal(self.db, status="ACCEPTED_WAITING_MARKET", fill=None, created_at="not-a-date")
         manager.tick(self.db, FakeBroker(), T0)
@@ -259,7 +314,7 @@ class ManagerTests(Base):
         add_signal(self.db, status="SUBMITTED", fill=2.0, created_at="2026-10-06T13:55:00+00:00")
         broker = FakeBroker()
         manager.tick(self.db, broker, T0 + timedelta(minutes=20))
-        self.assertEqual(broker.calls, [("stop_active", "s1"), ("close", "s1", "MAX_HOLD")])
+        self.assertEqual(broker.calls, [("protection_state", "s1"), ("close", "s1", "MAX_HOLD")])
 
     def test_exit_recorded_once(self):
         add_signal(self.db)
@@ -275,7 +330,7 @@ class ManagerTests(Base):
         broker = FakeBroker()
         broker.fail_bars = True
         manager.tick(self.db, broker, T0 + timedelta(minutes=25))
-        self.assertEqual(broker.calls, [("stop_active", "s1"), ("close", "s1", "MAX_HOLD")])
+        self.assertEqual(broker.calls, [("protection_state", "s1"), ("close", "s1", "MAX_HOLD")])
         self.assertIn("ERROR", events(self.db))
 
     def test_broker_error_is_journaled_and_other_positions_continue(self):
@@ -290,9 +345,9 @@ class ManagerTests(Base):
             original(signal, trigger)
         broker.modify_stop = flaky
         manager.tick(self.db, broker, T0 + timedelta(minutes=1))
-        self.assertEqual(broker.calls, [("stop_active", "a"),
+        self.assertEqual(broker.calls, [("protection_state", "a"),
                                         ("close", "a", "STOP_MODIFY_FAILED"),
-                                        ("stop_active", "b"),
+                                        ("protection_state", "b"),
                                         ("modify_stop", "b", 2.15)])
         self.assertIn("ERROR", events(self.db))
 
@@ -304,7 +359,7 @@ class ManagerTests(Base):
             raise RuntimeError("ib down")
         broker.modify_stop = fail_modify
         manager.tick(self.db, broker, T0 + timedelta(minutes=1))
-        self.assertEqual(broker.calls, [("stop_active", "a"),
+        self.assertEqual(broker.calls, [("protection_state", "a"),
                                         ("close", "a", "STOP_MODIFY_FAILED")])
         self.assertEqual(position(self.db, "a")["state"], "CLOSING")
         self.assertEqual(position(self.db, "a")["close_reason"], "STOP_MODIFY_FAILED")
@@ -328,7 +383,7 @@ class ManagerTests(Base):
         for offset in (0, 5, 10):
             manager.tick(self.db, broker, first + timedelta(seconds=offset))
 
-        self.assertEqual(broker.calls, [("stop_active", "a"),
+        self.assertEqual(broker.calls, [("protection_state", "a"),
                                         ("modify_stop", "a", 2.15),
                                         ("close", "a", "STOP_MODIFY_FAILED")])
         self.assertEqual(position(self.db, "a")["state"], "CLOSING")
@@ -341,7 +396,7 @@ class ManagerTests(Base):
                                   "error": "RuntimeError('close down')"}}, rows)
 
         manager.tick(self.db, broker, first + timedelta(seconds=61))
-        self.assertEqual(broker.calls, [("stop_active", "a"),
+        self.assertEqual(broker.calls, [("protection_state", "a"),
                                         ("modify_stop", "a", 2.15),
                                         ("close", "a", "STOP_MODIFY_FAILED"),
                                         ("close", "a", "STOP_MODIFY_FAILED")])
@@ -359,7 +414,7 @@ class ManagerTests(Base):
         first = T0 + timedelta(minutes=20)
         manager.tick(self.db, broker, first)
 
-        self.assertEqual(broker.calls, [("stop_active", "s1"), ("close", "s1", "MAX_HOLD")])
+        self.assertEqual(broker.calls, [("protection_state", "s1"), ("close", "s1", "MAX_HOLD")])
         self.assertEqual(position(self.db, "s1")["state"], "CLOSING")
         rows = journal_rows(self.db)
         self.assertIn({"event": "ERROR", "reason": "CLOSE_FAILED",
@@ -369,7 +424,7 @@ class ManagerTests(Base):
         manager.tick(self.db, broker, first + timedelta(seconds=30))
         self.assertEqual(len(broker.calls), 2)
         manager.tick(self.db, broker, first + timedelta(seconds=61))
-        self.assertEqual(broker.calls, [("stop_active", "s1"),
+        self.assertEqual(broker.calls, [("protection_state", "s1"),
                                         ("close", "s1", "MAX_HOLD"),
                                         ("close", "s1", "MAX_HOLD")])
 

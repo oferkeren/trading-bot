@@ -16,6 +16,7 @@ REJECT_WAIT_SECONDS = 3
 CLOSE_TRIGGER_UP = 1.01
 CLOSE_LIMIT_DOWN = 0.97
 _ACTIVE_STATUSES = {"PreSubmitted", "Submitted", "PendingSubmit", "ApiPending", "PendingCancel"}
+_FILLED_STATUS = "Filled"
 
 
 class IBReboundBroker:
@@ -46,23 +47,33 @@ class IBReboundBroker:
             self.ib.historical_events.pop(req_id, None)
             self.ib.historical_bars.pop(req_id, None)
 
-    def _stop_order(self, signal):
+    def _stop_order(self, signal, refresh=True):
         stop_id = signal.get("stop_order_id")
         if not stop_id:
             raise LookupError(f"{signal['signal_id']}: no stop_order_id")
-        self.wc.load_order_state(self.ib)
+        if refresh:
+            self.wc.load_order_state(self.ib)
         for item in self.ib.open_orders:
             if int(item.get("order_id") or 0) == int(stop_id) \
                     and item.get("status") in _ACTIVE_STATUSES:
                 return item
         raise LookupError(f"{signal['signal_id']}: stop order {stop_id} not active")
 
-    def stop_active(self, signal):
-        try:
-            self._stop_order(signal)
-            return True
-        except LookupError:
-            return False
+    def protection_state(self, signal):
+        self.wc.load_order_state(self.ib)
+        stop_id = self._as_int(signal.get("stop_order_id"))
+        target_id = self._as_int(signal.get("target_order_id"))
+        child_ids = {order_id for order_id in (stop_id, target_id) if order_id is not None}
+        for item in list(self.ib.open_orders) + list(self.ib.completed_orders):
+            order_id = self._as_int(item.get("order_id"))
+            if order_id in child_ids and self._order_filled(item, order_id):
+                return "EXITED"
+        if stop_id is not None:
+            for item in self.ib.open_orders:
+                if self._as_int(item.get("order_id")) == stop_id \
+                        and item.get("status") in _ACTIVE_STATUSES:
+                    return "ACTIVE"
+        return "MISSING"
 
     def _rules(self, symbol):
         session = self.wc.check_market_session(self.ib, symbol)
@@ -99,14 +110,17 @@ class IBReboundBroker:
 
     def close(self, signal, reason):
         """Move the stop child to the market so the bracket closes as a stop exit."""
+        state = self.protection_state(signal)
+        if state == "EXITED":
+            return "EXITED_AT_BROKER"
         bars = self.bars_since(signal["symbol"],
                                datetime.now(timezone.utc) - timedelta(days=1))
         if not bars:
             raise LookupError(f"{signal['symbol']}: no bars to price the close")
         last = float(bars[-1]["close"])
-        try:
-            item = self._stop_order(signal)
-        except LookupError:
+        if state == "ACTIVE":
+            item = self._stop_order(signal, refresh=False)
+        else:
             return self._flatten_without_stop(signal, last)
         rule, tick = self._rules(signal["symbol"])
         trigger, _ = self.wc.normalize_price_to_market_rule(last * CLOSE_TRIGGER_UP, rule, tick,
@@ -117,6 +131,10 @@ class IBReboundBroker:
 
     def _flatten_without_stop(self, signal, last):
         self.wc.load_order_state(self.ib)
+        active_flatten = self._active_flatten_order(signal)
+        if active_flatten is not None:
+            self._replace_flatten_order(active_flatten, last)
+            return "FLATTEN_WORKING"
         self._cancel_active_bracket_children(signal)
         positions = self.wc.load_position_state(self.ib)
         symbol = str(signal["symbol"]).strip().upper()
@@ -150,6 +168,36 @@ class IBReboundBroker:
             raise RuntimeError("; ".join(self.ib.reject_messages) or "flatten order rejected")
         return "FLATTEN_SENT"
 
+    def _active_flatten_order(self, signal):
+        order_ref = f"rebound-flatten-{signal['signal_id']}"
+        for item in self.ib.open_orders:
+            if item.get("status") in _ACTIVE_STATUSES and item.get("order_ref") == order_ref:
+                return item
+        return None
+
+    def _replace_flatten_order(self, item, last):
+        symbol = str(item["symbol"]).strip().upper()
+        rule, tick = self._rules(symbol)
+        limit, _ = self.wc.normalize_price_to_market_rule(last * CLOSE_LIMIT_DOWN, rule, tick,
+                                                          ROUND_FLOOR)
+        order = Order()
+        order.orderId = int(item["order_id"])
+        order.account = item.get("account") or self.wc.IB_ACCOUNT
+        order.action = "SELL"
+        order.orderType = item.get("order_type") or "LMT"
+        order.totalQuantity = float(item.get("total_quantity") or 0)
+        order.lmtPrice = limit
+        order.tif = "DAY"
+        order.outsideRth = self.wc.ALLOW_OUTSIDE_RTH
+        order.transmit = True
+        order.orderRef = item.get("order_ref") or ""
+        self.ib.expected_order_ids = {order.orderId}
+        self.ib.reject_messages = []
+        self.ib.fatal_order_error.clear()
+        self.ib.placeOrder(order.orderId, self.wc.stock_contract(symbol), order)
+        if self.ib.fatal_order_error.wait(timeout=REJECT_WAIT_SECONDS):
+            raise RuntimeError("; ".join(self.ib.reject_messages) or "flatten modify rejected")
+
     def _cancel_active_bracket_children(self, signal):
         parent_ids = {
             self._as_int(signal.get("entry_order_id")),
@@ -175,3 +223,14 @@ class IBReboundBroker:
             return int(value)
         except (TypeError, ValueError):
             return None
+
+    def _order_filled(self, item, order_id):
+        if item.get("status") == _FILLED_STATUS:
+            return True
+        if order_id is None:
+            return False
+        fill_state = getattr(self.ib, "order_fill_state", {}).get(order_id) or {}
+        try:
+            return float(fill_state.get("filled") or item.get("filled") or 0) > 0
+        except (TypeError, ValueError):
+            return False
