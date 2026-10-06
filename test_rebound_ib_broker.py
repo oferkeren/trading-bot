@@ -255,6 +255,33 @@ class BrokerTests(unittest.TestCase):
 
         self.assertEqual(rib.IBReboundBroker(ib, fake_wc()).protection_state(SIGNAL), "MISSING")
 
+    def test_protection_state_reports_missing_when_flat_with_active_stop_and_target(self):
+        ib = FakeIB()
+        ib.positions = {}
+        broker = rib.IBReboundBroker(ib, fake_wc())
+
+        self.assertEqual(broker.protection_state(SIGNAL), "MISSING")
+        self.assertEqual(broker.close(SIGNAL, "MAX_HOLD"), "CANCEL_REQUESTED")
+        self.assertEqual(ib.cancelled, [11, 12])
+        self.assertEqual(ib.placed, [])
+
+    def test_protection_state_keeps_active_stop_active_for_long_position(self):
+        ib = FakeIB()
+        ib.positions = {"ABC": {"quantity": 500.0, "avg_cost": 2.0}}
+
+        self.assertEqual(rib.IBReboundBroker(ib, fake_wc()).protection_state(SIGNAL), "ACTIVE")
+
+    def test_protection_state_keeps_active_stop_active_when_position_check_fails(self):
+        ib = FakeIB()
+        wc = fake_wc()
+
+        def fail_position_state(_ib):
+            raise RuntimeError("position snapshot unavailable")
+
+        wc.load_position_state = fail_position_state
+
+        self.assertEqual(rib.IBReboundBroker(ib, wc).protection_state(SIGNAL), "ACTIVE")
+
     def test_flat_broker_position_cancels_active_flatten_before_flat(self):
         ib = FakeIB()
         ib.open_orders[1]["status"] = "Cancelled"

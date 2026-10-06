@@ -317,6 +317,23 @@ class ManagerTests(Base):
                                       "pnl": None, "exit_reason": "FLAT_AT_BROKER"}}])
         self.assertFalse(journal.is_busy(self.db))
 
+    def test_real_broker_flat_with_active_stop_and_target_cancels_without_ratchet(self):
+        add_signal(self.db)
+        ib = FakeIB(bars=[{"timestamp": 4102444800, "close": 2.00, "high": 2.20}])
+        ib.open_orders[1]["order_ref"] = "TM:s1:TP"
+        ib.open_orders[2]["order_ref"] = "TM:s1:SL"
+        ib.positions = {}
+        broker = rib.IBReboundBroker(ib, fake_wc())
+
+        manager.tick(self.db, broker, T0 + timedelta(minutes=1))
+
+        self.assertEqual(position(self.db, "s1")["state"], "CLOSING")
+        self.assertEqual(position(self.db, "s1")["close_reason"], "UNPROTECTED")
+        self.assertEqual(ib.cancelled, [11, 12])
+        self.assertEqual(ib.placed, [])
+        self.assertEqual([row for row in journal_rows(self.db) if row["event"] == "EXIT"], [])
+        self.assertTrue(journal.is_busy(self.db))
+
     def test_real_broker_flatten_fill_retry_marks_closed_and_clears_work(self):
         add_signal(self.db)
         ib = FakeIB(bars=[{"timestamp": 4102444800, "close": 2.00, "high": 2.0}])

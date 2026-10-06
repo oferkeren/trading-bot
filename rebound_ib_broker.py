@@ -65,12 +65,37 @@ class IBReboundBroker:
                     return "EXITED"
         for item in self._child_order_candidates(signal, "SL", open_only=True):
             if item.get("status") in _ACTIVE_STATUSES:
-                return "ACTIVE"
+                quantity = self._broker_position_quantity(signal)
+                if quantity is None:
+                    return "ACTIVE"
+                if quantity > 0:
+                    return "ACTIVE"
+                # Flat accounts must cancel active exits before closing; short accounts
+                # are not safe to ratchet with another SELL stop and close() will fail safe.
+                return "MISSING"
         if self._broker_position_flat(signal):
             if self._active_exit_orders(signal):
                 return "MISSING"
             return "FLAT"
         return "MISSING"
+
+    def _broker_position_quantity(self, signal):
+        try:
+            positions = self.wc.load_position_state(self.ib)
+        except Exception:
+            return None
+        symbol = str(signal["symbol"]).strip().upper()
+        position = positions.get(symbol) or {}
+        try:
+            return float(position.get("quantity") or 0)
+        except (TypeError, ValueError):
+            return None
+
+    def _broker_position_flat(self, signal):
+        quantity = self._broker_position_quantity(signal)
+        if quantity is None:
+            return False
+        return quantity == 0
 
     def _active_exit_orders(self, signal):
         active = []
@@ -173,18 +198,6 @@ class IBReboundBroker:
         except (TypeError, ValueError):
             return None
 
-    def _broker_position_flat(self, signal):
-        try:
-            positions = self.wc.load_position_state(self.ib)
-        except Exception:
-            return False
-        symbol = str(signal["symbol"]).strip().upper()
-        position = positions.get(symbol) or {}
-        try:
-            return float(position.get("quantity") or 0) == 0
-        except (TypeError, ValueError):
-            return False
-
     def _rules(self, symbol):
         session = self.wc.check_market_session(self.ib, symbol)
         return session.get("market_rule") or [], float(session.get("min_tick") or 0.01)
@@ -212,6 +225,11 @@ class IBReboundBroker:
             raise RuntimeError("; ".join(self.ib.reject_messages) or "stop modify rejected")
 
     def modify_stop(self, signal, trigger):
+        quantity = self._broker_position_quantity(signal)
+        if quantity is not None and quantity <= 0:
+            raise RuntimeError(
+                f"{signal['symbol']}: broker position is not long ({quantity}); refusing stop modify"
+            )
         item = self._stop_order(signal)
         rule, tick = self._rules(signal["symbol"])
         trigger, _ = self.wc.normalize_price_to_market_rule(trigger, rule, tick, ROUND_FLOOR)
