@@ -315,6 +315,48 @@ async function testFetchTimeoutUnblocksPolling() {
   assert.equal(calls.filter(call => call.url === "/dashboard-portfolio").length, 2);
 }
 
+async function testFetchTimeoutCoversBodyRead() {
+  const { doc, timers, win, instance } = harness({
+    "/dashboard-portfolio": (url, options) => ({
+      ok: true,
+      json: () => new Promise((resolve, reject) => {
+        options.signal.addEventListener("abort", () => reject(new Error("aborted")));
+      }),
+    }),
+  });
+  instance.selectTab("#positions");
+  const pending = instance.refreshActive();
+  await new Promise(resolve => setImmediate(resolve));
+  timers.tick(8000);
+  await pending;
+  assert.equal(doc.nodes.posTotalCount.textContent, "UNAVAILABLE");
+}
+
+async function testResearchFetchHasTimeout() {
+  const doc = fakeDoc();
+  const timers = fakeTimers();
+  let outcome = null;
+  const fetchImpl = async (url, options = {}) => new Promise((resolve, reject) => {
+    options.signal.addEventListener("abort", () => reject(new Error("aborted")));
+  });
+  const win = {
+    location: { hash: "" }, addEventListener() {},
+    setInterval: timers.setInterval, setTimeout: timers.setTimeout, clearTimeout: timers.clearTimeout,
+    confirm: () => true, Date, AbortController,
+  };
+  const panel = {
+    loadMicrocapResearch: async fetchFn => {
+      try { await fetchFn("/microcap-research-status"); outcome = "ok"; } catch (error) { outcome = "failed"; }
+    },
+  };
+  const instance = app.createApp({ doc, fetchImpl, win, panel });
+  const pending = instance.refreshResearch();
+  await new Promise(resolve => setImmediate(resolve));
+  timers.tick(8000);
+  await pending;
+  assert.equal(outcome, "failed");
+}
+
 function testNoUnsafeHtmlSinks() {
   const source = fs.readFileSync(require.resolve("./dashboard_app.js"), "utf8");
   assert.doesNotMatch(source, /innerHTML|outerHTML|insertAdjacentHTML|document\.write|https?:\/\//);
@@ -333,6 +375,8 @@ function testNoUnsafeHtmlSinks() {
   await testRefreshTopDoesNotRetryModeEveryFiveSeconds();
   await testModeIntervalIsGuarded();
   await testFetchTimeoutUnblocksPolling();
+  await testFetchTimeoutCoversBodyRead();
+  await testResearchFetchHasTimeout();
   testNoUnsafeHtmlSinks();
   console.log("dashboard_app tests passed");
 })().catch(error => {

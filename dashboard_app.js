@@ -280,7 +280,7 @@
       if (!reply || reply.ok !== true) {
         throw new Error("HTTP_ERROR");
       }
-      return reply.json();
+      return await reply.json();
     } finally {
       if (timeoutId !== null) {
         timers.clearTimeout(timeoutId);
@@ -368,8 +368,8 @@
     async function refreshResearch() {
       if (panel && typeof panel.loadMicrocapResearch === "function") {
         await panel.loadMicrocapResearch(
-          (url, options) => fetchImpl(url, Object.assign({ credentials: "same-origin",
-            cache: "no-store" }, options || {})),
+          (url, options) => fetchJson(fetchImpl, url, options, win)
+            .then(body => ({ ok: true, json: async () => body })),
           id => doc.getElementById(id), tag => doc.createElement(tag));
       }
     }
