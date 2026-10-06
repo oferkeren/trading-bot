@@ -4,7 +4,7 @@ broker must provide:
   bars_since(symbol, since) -> list of bar dicts with "high"
   modify_stop(signal, trigger) -> None
   close(signal, reason) -> None
-  protection_state(signal) -> "ACTIVE" | "EXITED" | "MISSING"
+  protection_state(signal) -> "ACTIVE" | "EXITED" | "FLAT" | "MISSING"
 Not affected by the kill switch: it only raises stops and closes positions.
 """
 
@@ -212,6 +212,8 @@ def tick(db_file, broker, now=None):
 def _manage(db_file, conn, broker, signal, now):
     position = _ensure_position(db_file, conn, signal, now)
     sid, symbol = position["signal_id"], position["symbol"]
+    if position["state"] == "CLOSED":
+        return
     if position["state"] == "CLOSING":
         updated = datetime.fromisoformat(position["updated_at"])
         if now - updated >= timedelta(seconds=CLOSE_RETRY_SECONDS):
@@ -225,6 +227,9 @@ def _manage(db_file, conn, broker, signal, now):
         return
     protection = broker.protection_state(signal)
     if protection == "EXITED":
+        return
+    if protection == "FLAT":
+        _mark_flat_at_broker(db_file, conn, signal, position, now)
         return
     if protection == "MISSING":
         reason = "UNPROTECTED"
@@ -295,10 +300,19 @@ def has_work(db_file, now=None):
         return False
     try:
         placeholders = ",".join("?" * len(journal.TERMINAL_STATUSES))
+        has_positions_table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='rebound_positions'"
+        ).fetchone() is not None
+        closed_position_filter = (
+            "AND NOT EXISTS ("
+            "SELECT 1 FROM rebound_positions p "
+            "WHERE p.signal_id = s.signal_id AND p.state = 'CLOSED')"
+            if has_positions_table else ""
+        )
         open_signals = conn.execute(
-            f"SELECT COUNT(*) FROM signals WHERE strategy=? "
+            f"SELECT COUNT(*) FROM signals s WHERE strategy=? "
             f"AND COALESCE(status,'') NOT IN ({placeholders}) "
-            "AND entry_fill_price IS NOT NULL",
+            f"AND entry_fill_price IS NOT NULL {closed_position_filter}",
             (journal.STRATEGY, *sorted(journal.TERMINAL_STATUSES))).fetchone()[0]
         stale_entries = 0
         columns = _signals_columns(conn)

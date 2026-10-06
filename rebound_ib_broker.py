@@ -67,7 +67,7 @@ class IBReboundBroker:
             if item.get("status") in _ACTIVE_STATUSES:
                 return "ACTIVE"
         if self._broker_position_flat(signal):
-            return "EXITED"
+            return "FLAT"
         return "MISSING"
 
     def _child_order_candidates(self, signal, role, open_only=False):
@@ -163,7 +163,7 @@ class IBReboundBroker:
         symbol = str(signal["symbol"]).strip().upper()
         position = positions.get(symbol) or {}
         try:
-            return float(position.get("quantity") or 0) <= 0
+            return float(position.get("quantity") or 0) == 0
         except (TypeError, ValueError):
             return False
 
@@ -205,6 +205,8 @@ class IBReboundBroker:
         state = self.protection_state(signal)
         if state == "EXITED":
             return "EXITED_AT_BROKER"
+        if state == "FLAT":
+            return "FLAT"
         bars = self.bars_since(signal["symbol"],
                                datetime.now(timezone.utc) - timedelta(days=1))
         if not bars:
@@ -232,8 +234,10 @@ class IBReboundBroker:
         symbol = str(signal["symbol"]).strip().upper()
         position = positions.get(symbol) or {}
         quantity = float(position.get("quantity") or 0)
-        if quantity <= 0:
+        if quantity == 0:
             return "FLAT"
+        if quantity < 0:
+            raise RuntimeError(f"{symbol}: broker position is not long ({quantity})")
         rule, tick = self._rules(symbol)
         limit, _ = self.wc.normalize_price_to_market_rule(last * CLOSE_LIMIT_DOWN, rule, tick,
                                                           ROUND_FLOOR)

@@ -232,8 +232,50 @@ class BrokerTests(unittest.TestCase):
         ib.open_orders[2]["status"] = "Cancelled"
         ib.positions = {}
         result = rib.IBReboundBroker(ib, fake_wc()).close(SIGNAL, "MAX_HOLD")
-        self.assertEqual(result, "EXITED_AT_BROKER")
+        self.assertEqual(result, "FLAT")
         self.assertEqual(ib.placed, [])
+
+    def test_protection_state_reports_flat_only_when_no_child_filled(self):
+        ib = FakeIB()
+        ib.open_orders[1]["status"] = "Cancelled"
+        ib.open_orders[2]["status"] = "Cancelled"
+        ib.completed_orders = [
+            {"account": "DU1", "con_id": 0, "order_id": 0, "perm_id": 0, "symbol": "ABC",
+             "status": "Filled", "parent_id": 0, "action": "SELL", "order_type": "LMT",
+             "total_quantity": 500.0, "order_ref": "rebound-flatten-s1"}]
+        ib.positions = {}
+
+        self.assertEqual(rib.IBReboundBroker(ib, fake_wc()).protection_state(SIGNAL), "FLAT")
+
+    def test_negative_broker_position_is_not_flat_and_close_does_not_sell_more(self):
+        ib = FakeIB(bars=[{"timestamp": 4102444800, "close": 2.00, "high": 2.0}])
+        ib.open_orders[1]["status"] = "Cancelled"
+        ib.open_orders[2]["status"] = "Cancelled"
+        ib.positions = {"ABC": {"quantity": -100.0, "avg_cost": 2.0}}
+        broker = rib.IBReboundBroker(ib, fake_wc())
+
+        self.assertEqual(broker.protection_state(SIGNAL), "MISSING")
+        with self.assertRaises(RuntimeError):
+            broker.close(SIGNAL, "MAX_HOLD")
+        self.assertEqual(ib.placed, [])
+        self.assertEqual(ib.cancelled, [])
+
+    def test_stop_child_fill_with_flat_position_remains_exited(self):
+        ib = FakeIB()
+        ib.open_orders[1]["status"] = "Cancelled"
+        ib.open_orders[2]["status"] = "Cancelled"
+        ib.completed_orders = [
+            {"account": "DU1", "con_id": 0, "order_id": 0, "perm_id": 0, "symbol": "ABC",
+             "status": "Filled", "parent_id": 0, "action": "SELL", "order_type": "STP LMT",
+             "total_quantity": 500.0, "order_ref": "ref-sl"}]
+        ib.positions = {}
+
+        broker = rib.IBReboundBroker(ib, fake_wc())
+
+        self.assertEqual(broker.protection_state(SIGNAL), "EXITED")
+        self.assertEqual(broker.close(SIGNAL, "MAX_HOLD"), "EXITED_AT_BROKER")
+        self.assertEqual(ib.placed, [])
+        self.assertEqual(ib.cancelled, [])
 
     def test_missing_stop_and_reject_raise(self):
         ib = FakeIB()

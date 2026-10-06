@@ -63,9 +63,19 @@ def is_busy(db_file):
         conn = sqlite3.connect(f"file:{db_file}?mode=ro", uri=True, timeout=10)
         try:
             placeholders = ",".join("?" * len(TERMINAL_STATUSES))
+            has_positions_table = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='rebound_positions'"
+            ).fetchone() is not None
+            closed_position_filter = (
+                "AND NOT EXISTS ("
+                "SELECT 1 FROM rebound_positions p "
+                "WHERE p.signal_id = s.signal_id AND p.state = 'CLOSED')"
+                if has_positions_table else ""
+            )
             row = conn.execute(
-                f"SELECT COUNT(*) FROM signals WHERE strategy=? "
-                f"AND COALESCE(status,'') NOT IN ({placeholders})",
+                f"SELECT COUNT(*) FROM signals s WHERE strategy=? "
+                f"AND COALESCE(status,'') NOT IN ({placeholders}) "
+                f"{closed_position_filter}",
                 (STRATEGY, *sorted(TERMINAL_STATUSES)),
             ).fetchone()
         finally:
