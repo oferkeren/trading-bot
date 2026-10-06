@@ -39,6 +39,25 @@ def ibkr_report():
     return report
 
 
+def ibkr_report_with_errors(quotes=(), news=(), bars=(), bar_reasons=()):
+    roster_status, _ = _roster_status({}, datetime(2025, 5, 28, tzinfo=timezone.utc),
+                                      pilot=True)
+    errors = lambda reasons: [{"reason": reason} for reason in reasons]
+    report = coverage_report(
+        roster_status,
+        [{"issuer_id": "0000000001", "date": "2025-05-28", "session": "regular",
+          "provider": "ibkr",
+          "bars": {"status": "observed", "errors": errors(bars), "reasons": list(bar_reasons),
+                   "intervals": {"1 min": {"count": 3}, "1 hour": {"count": 2}}},
+          "quotes": {"status": "observed", "errors": errors(quotes)},
+          "news": {"status": "unavailable", "errors": errors(news)}}],
+        sample_manifest={"status": "predeclared", "issuer_ids": ["0000000001"],
+                         "dates": ["2025-05-28"]},
+    )
+    report["request_window"] = {"start_utc": START, "end_utc": END}
+    return json.dumps(report).encode()
+
+
 def session_sec_report():
     value = sec_report()
     value["market_cap_gate"]["decision_at"] = START
@@ -109,6 +128,28 @@ class RunSampleTests(unittest.TestCase):
         self.assertTrue(result["row"]["ibkr_minute"])
         self.assertEqual(result["row"]["stage_errors"], ["ibkr:PROVIDER_ERROR"])
         self.assertIn("SAMPLE_INCOMPLETE", result["blockers"])
+
+    def test_ibkr_exit_3_with_only_known_coverage_limits_is_ok(self):
+        body = ibkr_report_with_errors(
+            quotes=["QUOTE_RESULTS_TRUNCATED"],
+            news=["NEWS_WINDOW_COVERAGE_UNVERIFIED", "NEWS_TIMESTAMP_AMBIGUOUS"])
+        result = self.run_with(FakeRunner(ibkr=(3, body)))
+        self.assertEqual(result["stages"]["ibkr"], "OK")
+        self.assertEqual(result["row"]["stage_errors"], [])
+        self.assertEqual(load_sample_result(self.dir, sample(), "a" * 64), result)
+
+    def test_ibkr_exit_3_with_any_other_error_stays_provider_error(self):
+        for body in (
+            ibkr_report_with_errors(quotes=["QUOTE_RESULTS_TRUNCATED"], bars=["PACING_VIOLATION"]),
+            ibkr_report_with_errors(news=["NEWS_WINDOW_COVERAGE_UNVERIFIED"],
+                                    bar_reasons=["IBKR_PROBE_FAILED"]),
+            ibkr_report_with_errors(news=["NEWS_WINDOW_COVERAGE_UNVERIFIED"],
+                                    quotes=["IBKR_PROBE_FAILED"]),
+        ):
+            with self.subTest(body=body[:60]):
+                result = self.run_with(FakeRunner(ibkr=(3, body)))
+                self.assertEqual(result["stages"]["ibkr"], "PROVIDER_ERROR")
+                self.assertIn("ibkr:PROVIDER_ERROR", result["row"]["stage_errors"])
 
     def test_ibkr_failure_skips_source_but_sec_still_runs(self):
         for runner, status in ((FakeRunner(ibkr=(2, b"")), "PROVIDER_ERROR"),

@@ -71,6 +71,37 @@ def _write_inputs(sample: Mapping, directory: Path) -> tuple[Path, Path, Path]:
     return paths
 
 
+# Coverage limits the probe reports as errors (exit 3) that are already shown in the
+# row's own columns and blockers; they are not provider failures.
+_KNOWN_IBKR_LIMITS = frozenset({
+    "NEWS_WINDOW_COVERAGE_UNVERIFIED", "NEWS_TIMESTAMP_AMBIGUOUS", "QUOTE_RESULTS_TRUNCATED"})
+
+
+def _only_known_limits(report: Mapping) -> bool:
+    matrix = report.get("matrix")
+    if not isinstance(matrix, list) or not matrix:
+        return False
+    seen = False
+    for entry in matrix:
+        if not isinstance(entry, Mapping):
+            return False
+        for channel in ("bars", "quotes", "news"):
+            data = entry.get(channel)
+            if not isinstance(data, Mapping):
+                continue
+            reasons = data.get("reasons", [])
+            if not isinstance(reasons, list) or "IBKR_PROBE_FAILED" in reasons:
+                return False
+            errors = data.get("errors", [])
+            if not isinstance(errors, list):
+                return False
+            for error in errors:
+                if not isinstance(error, Mapping) or error.get("reason") not in _KNOWN_IBKR_LIMITS:
+                    return False
+                seen = True
+    return seen
+
+
 def _run_ibkr(runner: StageRunner, sample: Mapping, directory: Path,
               roster: Path, manifest: Path) -> tuple[str, dict | None]:
     try:
@@ -86,7 +117,7 @@ def _run_ibkr(runner: StageRunner, sample: Mapping, directory: Path,
     if report is None:
         return "INVALID", None
     _save(directory / "ibkr-report.json", report)
-    return ("OK" if code == 0 else "PROVIDER_ERROR"), report
+    return ("OK" if code == 0 or _only_known_limits(report) else "PROVIDER_ERROR"), report
 
 
 def _run_source(runner: StageRunner, sample: Mapping, directory: Path,
