@@ -3,6 +3,7 @@ import json
 import sqlite3
 import threading
 import time
+import math
 from datetime import datetime, timezone
 
 from dotenv import load_dotenv
@@ -204,6 +205,11 @@ def safe_float(
             value
         )
 
+        if not math.isfinite(
+            value
+        ):
+            return None
+
         #
         # Ignore IBKR sentinel-like values.
         #
@@ -232,6 +238,101 @@ def safe_order_price(
         return None
 
     return value
+
+
+def normalize_account_update_pnl_key(
+    key
+):
+    text = (
+        str(
+            key
+            or ""
+        )
+        .strip()
+    )
+
+    if text.startswith(
+        "$LEDGER-"
+    ):
+        text = text[
+            len(
+                "$LEDGER-"
+            ):
+        ]
+
+    if text in {
+        "RealizedPnL",
+        "UnrealizedPnL",
+    }:
+        return text
+
+    return None
+
+
+def select_account_update_pnl_value(
+    app,
+    key
+):
+    for currency in (
+        "BASE",
+        "USD",
+    ):
+        value = (
+            app.account_update_pnl_values.get(
+                (
+                    key,
+                    currency
+                )
+            )
+        )
+
+        if value is not None:
+            return value
+
+    return None
+
+
+def apply_account_update_pnl_fallback(
+    app,
+    soft_warnings
+):
+    if app.daily_pnl is not None:
+        return False
+
+    realized = select_account_update_pnl_value(
+        app,
+        "RealizedPnL"
+    )
+
+    unrealized = select_account_update_pnl_value(
+        app,
+        "UnrealizedPnL"
+    )
+
+    if (
+        realized is None
+        or
+        unrealized is None
+    ):
+        return False
+
+    app.daily_pnl = (
+        realized
+        +
+        unrealized
+    )
+
+    if app.realized_pnl is None:
+        app.realized_pnl = realized
+
+    if app.unrealized_pnl is None:
+        app.unrealized_pnl = unrealized
+
+    soft_warnings.append(
+        "Account daily P/L derived from account updates"
+    )
+
+    return True
 
 
 # ============================================================
@@ -527,6 +628,10 @@ class StatusApp(
             threading.Event()
         )
 
+        self.account_updates_done = (
+            threading.Event()
+        )
+
         self.pnl_done = (
             threading.Event()
         )
@@ -548,6 +653,8 @@ class StatusApp(
         self.open_orders = []
 
         self.account_values = {}
+
+        self.account_update_pnl_values = {}
 
         self.daily_pnl = None
 
@@ -829,6 +936,56 @@ class StatusApp(
         reqId
     ):
         self.account_summary_done.set()
+
+
+    # --------------------------------------------------------
+    # ACCOUNT UPDATES
+    # --------------------------------------------------------
+
+    def updateAccountValue(
+        self,
+        key,
+        val,
+        currency,
+        accountName
+    ):
+        if accountName != IB_ACCOUNT:
+            return
+
+        normalized_key = normalize_account_update_pnl_key(
+            key
+        )
+
+        if normalized_key is None:
+            return
+
+        normalized_currency = (
+            str(
+                currency
+                or ""
+            )
+            .strip()
+            .upper()
+        )
+
+        self.account_update_pnl_values[
+            (
+                normalized_key,
+                normalized_currency
+            )
+        ] = safe_float(
+            val
+        )
+
+
+    def accountDownloadEnd(
+        self,
+        accountName
+    ):
+        if accountName != IB_ACCOUNT:
+            return
+
+        self.account_updates_done.set()
 
 
     # --------------------------------------------------------
@@ -1430,6 +1587,44 @@ def collect_snapshot():
                 app.realized_pnl = sum(
                     values
                 )
+
+
+        if app.daily_pnl is None:
+            app.account_updates_done.clear()
+            app.account_update_pnl_values = {}
+
+            try:
+                app.reqAccountUpdates(
+                    True,
+                    IB_ACCOUNT
+                )
+
+                app.account_updates_done.wait(
+                    timeout=5
+                )
+
+                apply_account_update_pnl_fallback(
+                    app,
+                    soft_warnings
+                )
+
+            except Exception as exc:
+                soft_warnings.append(
+                    (
+                        "Account update P/L fallback "
+                        f"failed: {exc}"
+                    )
+                )
+
+            finally:
+                try:
+                    app.reqAccountUpdates(
+                        False,
+                        IB_ACCOUNT
+                    )
+
+                except Exception:
+                    pass
 
 
         # ----------------------------------------------------

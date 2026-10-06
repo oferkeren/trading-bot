@@ -20,7 +20,12 @@ from ibapi.contract import Contract
 from ibapi.order import Order
 from ibapi.order_cancel import OrderCancel
 
-from execution_guard import check_pre_execution, ExecutionBlocked
+from execution_guard import (
+    check_pre_execution,
+    ExecutionBlocked,
+    get_runtime_status,
+    age_seconds,
+)
 from execution_freshness import (
     check_execution_freshness,
     SignalFreshnessError,
@@ -5410,6 +5415,194 @@ def bracket_is_accepted(
     return True
 
 
+def safe_finite_float(
+    value,
+):
+    try:
+        value = float(
+            value
+        )
+
+        if not math.isfinite(
+            value
+        ):
+            return None
+
+        if abs(
+            value
+        ) > 1e100:
+            return None
+
+        return value
+
+    except Exception:
+        return None
+
+
+def status_snapshot_daily_pnl(
+    *,
+    db_file,
+    max_age_seconds,
+    expected_account,
+):
+    try:
+        snapshot = get_runtime_status(
+            db_file
+        )
+
+    except Exception as exc:
+        print(
+            "PNL SOURCE | status_snapshot unavailable | "
+            f"{exc}",
+            flush=True,
+        )
+
+        return None
+
+    if not snapshot:
+        return None
+
+    snapshot_account = (
+        str(
+            snapshot.get(
+                "account"
+            )
+            or ""
+        )
+        .strip()
+    )
+
+    if snapshot_account != expected_account:
+        return None
+
+    snapshot_age = age_seconds(
+        snapshot.get(
+            "updated_at"
+        )
+    )
+
+    if (
+        snapshot_age is None
+        or
+        snapshot_age > max_age_seconds
+    ):
+        return None
+
+    return safe_finite_float(
+        snapshot.get(
+            "daily_pnl"
+        )
+    )
+
+
+def resolve_execution_daily_pnl(
+    ib,
+    *,
+    db_file=None,
+    max_age_seconds=None,
+):
+    if db_file is None:
+        db_file = DB_FILE
+
+    if max_age_seconds is None:
+        max_age_seconds = STATUS_MAX_AGE_SECONDS
+
+    pnl_request_id = (
+        9901
+    )
+
+    ib.pnl_done.clear()
+
+    ib.daily_pnl = None
+
+    ib.reqPnL(
+        pnl_request_id,
+        IB_ACCOUNT,
+        "",
+    )
+
+    pnl_received = ib.pnl_done.wait(
+        timeout=3,
+    )
+
+    failure_code = (
+        "IBKR_PNL_TIMEOUT"
+        if not pnl_received
+        else "IBKR_PNL_UNAVAILABLE"
+    )
+
+    try:
+        ib.cancelPnL(
+            pnl_request_id
+        )
+
+    except Exception:
+        pass
+
+    broker_daily_pnl = safe_finite_float(
+        ib.daily_pnl
+    )
+
+    if (
+        pnl_received
+        and
+        broker_daily_pnl is not None
+    ):
+        ib.daily_pnl = broker_daily_pnl
+
+        print(
+            "PNL SOURCE | reqPnL",
+            flush=True,
+        )
+
+        return {
+            "daily_pnl":
+                broker_daily_pnl,
+
+            "source":
+                "reqPnL",
+
+            "failure_code":
+                None,
+        }
+
+    snapshot_daily_pnl = status_snapshot_daily_pnl(
+        db_file=db_file,
+        max_age_seconds=max_age_seconds,
+        expected_account=IB_ACCOUNT,
+    )
+
+    if snapshot_daily_pnl is not None:
+        ib.daily_pnl = snapshot_daily_pnl
+
+        print(
+            "PNL SOURCE | status_snapshot",
+            flush=True,
+        )
+
+        return {
+            "daily_pnl":
+                snapshot_daily_pnl,
+
+            "source":
+                "status_snapshot",
+
+            "failure_code":
+                None,
+        }
+
+    return {
+        "daily_pnl":
+            None,
+
+        "source":
+            None,
+
+        "failure_code":
+            failure_code,
+    }
+
+
 def process_signal(
     signal,
 ):
@@ -5950,57 +6143,30 @@ def process_signal(
                 return
 
 
-        pnl_request_id = (
-            9901
+        pnl_result = resolve_execution_daily_pnl(
+            ib,
+            db_file=DB_FILE,
+            max_age_seconds=STATUS_MAX_AGE_SECONDS,
         )
 
-        ib.pnl_done.clear()
-
-        ib.daily_pnl = None
-
-
-        ib.reqPnL(
-            pnl_request_id,
-            IB_ACCOUNT,
-            "",
-        )
-
-
-        if not ib.pnl_done.wait(
-            timeout=3,
-        ):
-
+        if pnl_result[
+            "failure_code"
+        ]:
             transition(
                 signal_id,
                 "BLOCKED",
-                "IBKR_PNL_TIMEOUT",
-            )
-
-            return
-
-
-        try:
-            ib.cancelPnL(
-                pnl_request_id
-            )
-
-        except Exception:
-            pass
-
-
-        if ib.daily_pnl is None:
-
-            transition(
-                signal_id,
-                "BLOCKED",
-                "IBKR_PNL_UNAVAILABLE",
+                pnl_result[
+                    "failure_code"
+                ],
             )
 
             return
 
 
         if (
-            ib.daily_pnl
+            pnl_result[
+                "daily_pnl"
+            ]
             <=
             -abs(
                 MAX_DAILY_LOSS_USD
@@ -6014,7 +6180,9 @@ def process_signal(
 
                 message=(
                     f"Daily P/L="
-                    f"{ib.daily_pnl}"
+                    f"{pnl_result['daily_pnl']} "
+                    f"source="
+                    f"{pnl_result['source']}"
                 ),
             )
 
@@ -6144,6 +6312,11 @@ def process_signal(
 
                 "daily_pnl":
                     ib.daily_pnl,
+
+                "pnl_source":
+                    pnl_result[
+                        "source"
+                    ],
 
                 "signal_age_seconds":
                     freshness[
