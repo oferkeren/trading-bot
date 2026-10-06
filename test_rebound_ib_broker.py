@@ -29,6 +29,7 @@ class FakeIB:
         self.expected_order_ids, self.reject_messages = set(), []
         self.next_order_id = 99
         self.cancelled = []
+        self.order_fill_state = {}
         self.positions = {"ABC": {"quantity": 500.0, "avg_cost": 2.0}}
         self.completed_orders = []
         self.open_orders = [
@@ -60,7 +61,9 @@ class FakeIB:
 
 
 SIGNAL = {"signal_id": "s1", "symbol": "ABC", "entry_order_id": 10,
-          "parent_order_id": 10, "target_order_id": 11, "stop_order_id": 12}
+          "parent_order_id": 10, "target_order_id": 11, "stop_order_id": 12,
+          "target_order_ref": "ref-tp", "stop_order_ref": "ref-sl",
+          "target_perm_id": 1100, "stop_perm_id": 1200}
 
 
 class BrokerTests(unittest.TestCase):
@@ -169,12 +172,67 @@ class BrokerTests(unittest.TestCase):
         self.assertEqual(ib.placed, [])
         self.assertEqual(ib.cancelled, [])
 
-    def test_close_missing_stop_returns_flat_without_long_position(self):
+    def test_completed_stop_with_ibapi_zero_order_id_matches_order_ref(self):
         ib = FakeIB(bars=[{"timestamp": 4102444800, "close": 2.00, "high": 2.0}])
+        ib.open_orders[2]["status"] = "Cancelled"
+        ib.completed_orders = [
+            {"account": "DU1", "con_id": 0, "order_id": 0, "perm_id": 1200, "symbol": "ABC",
+             "status": "Filled", "parent_id": 10, "action": "SELL", "order_type": "STP LMT",
+             "total_quantity": 500.0, "order_ref": "ref-sl"}]
+
+        result = rib.IBReboundBroker(ib, fake_wc()).close(SIGNAL, "MAX_HOLD")
+
+        self.assertEqual(result, "EXITED_AT_BROKER")
+        self.assertEqual(ib.placed, [])
+        self.assertEqual(ib.cancelled, [])
+
+    def test_completed_target_with_ibapi_zero_order_id_matches_default_ref(self):
+        signal = dict(SIGNAL)
+        signal.pop("target_order_ref")
+        signal["signal_id"] = "abc-123"
+        ib = FakeIB()
+        ib.open_orders[1]["status"] = "Cancelled"
+        ib.open_orders[2]["status"] = "Cancelled"
+        ib.completed_orders = [
+            {"account": "DU1", "con_id": 0, "order_id": 0, "perm_id": 0, "symbol": "ABC",
+             "status": "Filled", "parent_id": 10, "action": "SELL", "order_type": "LMT",
+             "total_quantity": 500.0, "order_ref": "TM:abc-123:TP"}]
+
+        self.assertEqual(rib.IBReboundBroker(ib, fake_wc()).protection_state(signal), "EXITED")
+
+    def test_completed_target_with_ibapi_zero_order_id_matches_perm_id(self):
+        signal = dict(SIGNAL)
+        signal.pop("target_order_ref")
+        ib = FakeIB()
+        ib.open_orders[1]["status"] = "Cancelled"
+        ib.open_orders[2]["status"] = "Cancelled"
+        ib.completed_orders = [
+            {"account": "DU1", "con_id": 0, "order_id": 0, "perm_id": 1100, "symbol": "ABC",
+             "status": "Filled", "parent_id": 10, "action": "SELL", "order_type": "LMT",
+             "total_quantity": 500.0, "order_ref": ""}]
+
+        self.assertEqual(rib.IBReboundBroker(ib, fake_wc()).protection_state(signal), "EXITED")
+
+    def test_partial_target_fill_with_active_stop_remains_active_for_close(self):
+        ib = FakeIB(bars=[{"timestamp": 4102444800, "close": 2.00, "high": 2.0}])
+        ib.order_fill_state[11] = {
+            "order_id": 11, "status": "Submitted", "filled": 100.0,
+            "remaining": 400.0, "perm_id": 1100,
+        }
+
+        result = rib.IBReboundBroker(ib, fake_wc()).close(SIGNAL, "MAX_HOLD")
+
+        self.assertIsNone(result)
+        self.assertEqual(len(ib.placed), 1)
+        order = ib.placed[0][2]
+        self.assertEqual((order.orderId, order.action, order.orderType), (12, "SELL", "STP LMT"))
+
+    def test_missing_stop_with_flat_broker_position_is_exited_like(self):
+        ib = FakeIB()
         ib.open_orders[2]["status"] = "Cancelled"
         ib.positions = {}
         result = rib.IBReboundBroker(ib, fake_wc()).close(SIGNAL, "MAX_HOLD")
-        self.assertEqual(result, "FLAT")
+        self.assertEqual(result, "EXITED_AT_BROKER")
         self.assertEqual(ib.placed, [])
 
     def test_missing_stop_and_reject_raise(self):

@@ -5,6 +5,7 @@
 
 import threading
 import time
+import re
 from datetime import datetime, timedelta, timezone
 from decimal import ROUND_CEILING, ROUND_FLOOR
 
@@ -48,32 +49,123 @@ class IBReboundBroker:
             self.ib.historical_bars.pop(req_id, None)
 
     def _stop_order(self, signal, refresh=True):
-        stop_id = signal.get("stop_order_id")
-        if not stop_id:
-            raise LookupError(f"{signal['signal_id']}: no stop_order_id")
         if refresh:
             self.wc.load_order_state(self.ib)
-        for item in self.ib.open_orders:
-            if int(item.get("order_id") or 0) == int(stop_id) \
-                    and item.get("status") in _ACTIVE_STATUSES:
+        for item in self._child_order_candidates(signal, "SL", open_only=True):
+            if item.get("status") in _ACTIVE_STATUSES:
                 return item
+        stop_id = signal.get("stop_order_id")
         raise LookupError(f"{signal['signal_id']}: stop order {stop_id} not active")
 
     def protection_state(self, signal):
         self.wc.load_order_state(self.ib)
-        stop_id = self._as_int(signal.get("stop_order_id"))
-        target_id = self._as_int(signal.get("target_order_id"))
-        child_ids = {order_id for order_id in (stop_id, target_id) if order_id is not None}
-        for item in list(self.ib.open_orders) + list(self.ib.completed_orders):
-            order_id = self._as_int(item.get("order_id"))
-            if order_id in child_ids and self._order_filled(item, order_id):
-                return "EXITED"
-        if stop_id is not None:
-            for item in self.ib.open_orders:
-                if self._as_int(item.get("order_id")) == stop_id \
-                        and item.get("status") in _ACTIVE_STATUSES:
-                    return "ACTIVE"
+        for role in ("SL", "TP"):
+            for item in self._child_order_candidates(signal, role):
+                if self._order_filled(item):
+                    return "EXITED"
+        for item in self._child_order_candidates(signal, "SL", open_only=True):
+            if item.get("status") in _ACTIVE_STATUSES:
+                return "ACTIVE"
+        if self._broker_position_flat(signal):
+            return "EXITED"
         return "MISSING"
+
+    def _child_order_candidates(self, signal, role, open_only=False):
+        orders = list(self.ib.open_orders)
+        if not open_only:
+            orders += list(self.ib.completed_orders)
+        expected_ref = self._expected_child_ref(signal, role)
+        if role == "TP":
+            stored_ref = signal.get("target_order_ref")
+            stored_perm = signal.get("target_perm_id")
+            stored_id = signal.get("target_order_id")
+        else:
+            stored_ref = signal.get("stop_order_ref")
+            stored_perm = signal.get("stop_perm_id")
+            stored_id = signal.get("stop_order_id")
+        candidates = []
+        seen = set()
+        for matches in (
+            self._orders_by_ref(orders, stored_ref),
+            self._orders_by_ref(orders, expected_ref),
+            self._orders_by_perm(orders, stored_perm),
+            self._orders_by_id(orders, stored_id),
+            self._orders_by_parent_and_type(signal, orders, role),
+        ):
+            for order in matches:
+                marker = id(order)
+                if marker not in seen:
+                    seen.add(marker)
+                    candidates.append(order)
+        return candidates
+
+    def _expected_child_ref(self, signal, role):
+        builder = getattr(self.wc, "build_order_refs", None)
+        if not callable(builder):
+            key = self._sanitize_ref_component(signal["signal_id"])
+            return f"TM:{key}:{role}"
+        refs = builder(signal["signal_id"])
+        return refs["target" if role == "TP" else "stop"]
+
+    @staticmethod
+    def _sanitize_ref_component(value):
+        value = str(value or "").strip()
+        return re.sub(r"[^A-Za-z0-9_.-]", "_", value)[:80]
+
+    def _orders_by_ref(self, orders, order_ref):
+        if not order_ref:
+            return []
+        return [order for order in orders if order.get("order_ref") == order_ref]
+
+    def _orders_by_perm(self, orders, perm_id):
+        wanted = self._valid_perm_id(perm_id)
+        if wanted is None:
+            return []
+        return [order for order in orders if self._valid_perm_id(order.get("perm_id")) == wanted]
+
+    def _orders_by_id(self, orders, order_id):
+        wanted = self._as_int(order_id)
+        if wanted is None:
+            return []
+        return [order for order in orders if self._as_int(order.get("order_id")) == wanted]
+
+    def _orders_by_parent_and_type(self, signal, orders, role):
+        parent_ids = {
+            self._as_int(signal.get("entry_order_id")),
+            self._as_int(signal.get("parent_order_id")),
+        }
+        parent_ids.discard(None)
+        if not parent_ids:
+            return []
+        if role == "TP":
+            types = {"LMT"}
+        else:
+            types = {"STP", "STP LMT"}
+        return [
+            order for order in orders
+            if self._as_int(order.get("parent_id")) in parent_ids
+            and order.get("order_type") in types
+        ]
+
+    @staticmethod
+    def _valid_perm_id(value):
+        try:
+            value = int(value)
+            return value if value > 0 else None
+        except (TypeError, ValueError):
+            return None
+
+    def _broker_position_flat(self, signal):
+        try:
+            positions = self.wc.load_position_state(self.ib)
+        except Exception:
+            return False
+        symbol = str(signal["symbol"]).strip().upper()
+        position = positions.get(symbol) or {}
+        try:
+            return float(position.get("quantity") or 0) <= 0
+        except (TypeError, ValueError):
+            return False
 
     def _rules(self, symbol):
         session = self.wc.check_market_session(self.ib, symbol)
@@ -224,13 +316,17 @@ class IBReboundBroker:
         except (TypeError, ValueError):
             return None
 
-    def _order_filled(self, item, order_id):
-        if item.get("status") == _FILLED_STATUS:
+    def _order_filled(self, item):
+        order_id = self._as_int(item.get("order_id"))
+        fill_state = getattr(self.ib, "order_fill_state", {}).get(order_id) or {}
+        status = fill_state.get("status") or item.get("status")
+        if status == _FILLED_STATUS:
             return True
         if order_id is None:
             return False
-        fill_state = getattr(self.ib, "order_fill_state", {}).get(order_id) or {}
         try:
-            return float(fill_state.get("filled") or item.get("filled") or 0) > 0
+            filled = float(fill_state.get("filled") or item.get("filled") or 0)
+            remaining = float(fill_state.get("remaining") or item.get("remaining") or 0)
+            return filled > 0 and remaining == 0
         except (TypeError, ValueError):
             return False
