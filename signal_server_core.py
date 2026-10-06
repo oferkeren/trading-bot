@@ -1831,6 +1831,7 @@ VALID_STRATEGY_MODES = {
     "AUTO",
     "SCALP",
     "MOMENTUM",
+    "REBOUND",
     "BOTH",
 }
 
@@ -1884,6 +1885,7 @@ def get_strategy_mode(
                 "AUTO",
                 "SCALP",
                 "MOMENTUM",
+                "REBOUND",
                 "BOTH",
             ],
     }

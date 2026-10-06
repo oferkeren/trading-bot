@@ -188,6 +188,9 @@ class NewsVerdictTests(unittest.TestCase):
                  (self.ai(news_score=0.49), "NEWS_NOT_STRONG"),
                  (self.ai(news_score=None), "NEWS_NOT_STRONG"),
                  (self.ai(event_type="OFFERING"), "NEWS_NEGATIVE_EVENT"),
+                 (self.ai(event_type="DELISTING"), "NEWS_NEGATIVE_EVENT"),
+                 (self.ai(event_type="REVERSE_SPLIT"), "NEWS_NEGATIVE_EVENT"),
+                 (self.ai(event_type="TRADING_HALT"), "NEWS_NEGATIVE_EVENT"),
                  (self.ai(ai=None), "NEWS_GATE_UNAVAILABLE")]
         for value, reason in cases:
             with self.subTest(reason=reason):

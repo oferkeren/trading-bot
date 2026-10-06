@@ -25,7 +25,7 @@ The paper results are an experiment, not calibration. A separate later spec cove
 
 ### Universe and news
 - The existing scanner's candidates, price $0.50–$20.00.
-- The news gate passes only when the AI gate scores the company's headlines from the last 48 h as strongly positive. If the AI or news is unavailable or ambiguous, the candidate is skipped (`SKIP_NEWS_GATE`).
+- The news gate passes only when the AI gate scores the company's headlines from the last 48 h as strongly positive. Offering, dilution, lawsuit, bankruptcy, delisting, reverse split, and trading halt events are treated as negative and skipped. If the AI or news is unavailable or ambiguous, the candidate is skipped (`SKIP_NEWS_GATE`).
 
 ### Cycle detection (today's 1-minute bars, including pre-market)
 - **Spike:** a rise of at least `SPIKE_MIN_PCT = 8.0` from a local low to a local high within at most `SPIKE_MAX_BARS = 15` bars.

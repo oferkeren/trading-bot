@@ -25,6 +25,8 @@ load_dotenv(
 
 
 import ai_gate
+import rebound_journal
+import rebound_strategy
 import early_momentum
 import signal_bridge
 
@@ -577,6 +579,46 @@ def build_payload(
 # AI PROCESS CANDIDATE
 # ============================================================
 
+def process_rebound_candidate(candidate, secret, db_file=None):
+    """Strict path for microcap_rebound_v1: no bypasses, everything fails closed."""
+    db_file = db_file or rebound_journal.DEFAULT_DB
+    symbol = str(candidate.get("symbol") or "").strip().upper()
+
+    def skip(reason, detail=None):
+        rebound_journal.record_skip(db_file, symbol, reason, detail)
+        print(f"REBOUND SKIP | {symbol} | {reason}", flush=True)
+        return {"status": "REBOUND_SKIP", "symbol": symbol, "reason": reason}
+
+    if not rebound_strategy.paper_guard():
+        return skip("SKIP_NOT_PAPER")
+    if rebound_journal.is_busy(db_file):
+        return skip("SKIP_BUSY")
+    try:
+        ai_result = ai_gate.evaluate_trade_candidate(candidate)
+    except Exception as exc:
+        return skip("NEWS_GATE_ERROR", {"error": f"{type(exc).__name__}: {exc}"})
+    passed, reason = rebound_strategy.news_verdict(ai_result)
+    ai = ai_result.get("ai") if isinstance(ai_result, dict) else None
+    news = {
+        "status": ai_result.get("status") if isinstance(ai_result, dict) else None,
+        "news_count": ai_result.get("news_count") if isinstance(ai_result, dict) else None,
+        "news_score": ai.get("news_score") if isinstance(ai, dict) else None,
+        "event_type": ai.get("event_type") if isinstance(ai, dict) else None,
+    }
+    if not passed:
+        return skip(reason, news)
+    outcome = _original_process_candidate(candidate, secret)
+    rebound_journal.record(
+        db_file, "SIGNAL", symbol=symbol,
+        signal_id=(outcome or {}).get("signal_id"),
+        reason=(outcome or {}).get("status"),
+        detail={"entry": candidate.get("entry"), "stop": candidate.get("stop"),
+                "target": candidate.get("target"), "news": news,
+                "rebound": candidate.get("rebound")},
+    )
+    return outcome
+
+
 def process_candidate(
     candidate,
     secret,
@@ -584,6 +626,9 @@ def process_candidate(
     signal_bridge.validate_candidate(
         candidate
     )
+
+    if candidate.get("strategy") == rebound_strategy.STRATEGY_NAME:
+        return process_rebound_candidate(candidate, secret)
 
 
     symbol = (

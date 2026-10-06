@@ -13,6 +13,8 @@ from pathlib import Path
 
 import strategy_engine
 import scalp_strategy
+import rebound_journal
+import rebound_strategy
 
 from strategy_status import (
     publish_scanner_universe,
@@ -1809,6 +1811,7 @@ def collect_strategy_results():
     valid_modes = {
         "MOMENTUM",
         "SCALP",
+        "REBOUND",
         "AUTO",
         "BOTH",
     }
@@ -2000,7 +2003,39 @@ def collect_strategy_results():
                     )
                 )
 
-            if mode == "MOMENTUM":
+            rebound_result = None
+
+            if mode == "REBOUND":
+                rebound_bars = rebound_strategy.request_history(
+                    app,
+                    candidate,
+                    60000 + index,
+                    strategy_engine.make_contract,
+                )
+                rebound_result = rebound_strategy.analyze(
+                    candidate,
+                    rebound_bars,
+                    quote,
+                    datetime.now(timezone.utc),
+                )
+                if not rebound_result.get("qualified"):
+                    try:
+                        rebound_journal.record_skip(
+                            rebound_journal.DEFAULT_DB,
+                            rebound_result.get("symbol") or candidate.get("symbol"),
+                            rebound_result.get("skip_reason"),
+                            rebound_result.get("rebound"),
+                        )
+                    except Exception as exc:
+                        print(
+                            f"REBOUND JOURNAL ERROR | {type(exc).__name__}: {exc}",
+                            flush=True,
+                        )
+
+            if mode == "REBOUND":
+                results.append(rebound_result)
+
+            elif mode == "MOMENTUM":
                 if momentum_result is not None:
                     results.append(
                         momentum_result
