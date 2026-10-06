@@ -1,9 +1,10 @@
 import threading
 import types
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import rebound_ib_broker as rib
+import worker_core
 
 
 def fake_wc():
@@ -11,8 +12,8 @@ def fake_wc():
     wc.stock_contract = lambda symbol: ("contract", symbol)
     wc.load_order_state = lambda ib: None
     wc.check_market_session = lambda ib, symbol: {"market_rule": [], "min_tick": 0.01}
-    wc.normalize_price_to_market_rule = lambda p, rule, tick, rounding: round(p, 2)
-    wc.build_stop_limit_price = lambda action, trig, rule, tick: round(trig * 0.99, 2)
+    wc.normalize_price_to_market_rule = worker_core.normalize_price_to_market_rule
+    wc.build_stop_limit_price = worker_core.build_stop_limit_price
     return wc
 
 
@@ -60,14 +61,27 @@ class BrokerTests(unittest.TestCase):
         rib.IBReboundBroker(ib, fake_wc()).modify_stop(SIGNAL, 2.157)
         order_id, contract, order = ib.placed[0]
         self.assertEqual((order_id, order.parentId, order.action, order.orderType), (12, 10, "SELL", "STP LMT"))
-        self.assertEqual((order.auxPrice, order.lmtPrice, order.totalQuantity), (2.16, 2.14, 500.0))
+        self.assertIs(type(order.auxPrice), float)
+        self.assertIs(type(order.lmtPrice), float)
+        self.assertEqual((order.auxPrice, order.lmtPrice, order.totalQuantity), (2.15, 2.13, 500.0))
         self.assertEqual((order.tif, order.outsideRth, order.orderRef), ("GTC", True, "ref-sl"))
 
     def test_close_moves_stop_through_market(self):
         ib = FakeIB(bars=[{"timestamp": 4102444800, "close": 2.00, "high": 2.0}])
         rib.IBReboundBroker(ib, fake_wc()).close(SIGNAL, "MAX_HOLD")
         order = ib.placed[0][2]
+        self.assertIs(type(order.auxPrice), float)
+        self.assertIs(type(order.lmtPrice), float)
         self.assertEqual((order.auxPrice, order.lmtPrice), (2.02, 1.94))
+
+    def test_close_uses_two_hour_old_bar_when_no_recent_trade(self):
+        stale = datetime.now(timezone.utc) - timedelta(hours=2)
+        ib = FakeIB(bars=[{"timestamp": stale.timestamp(), "close": 3.00, "high": 3.0}])
+        rib.IBReboundBroker(ib, fake_wc()).close(SIGNAL, "MAX_HOLD")
+        order = ib.placed[0][2]
+        self.assertIs(type(order.auxPrice), float)
+        self.assertIs(type(order.lmtPrice), float)
+        self.assertEqual((order.auxPrice, order.lmtPrice), (3.04, 2.91))
 
     def test_missing_stop_and_reject_raise(self):
         ib = FakeIB()

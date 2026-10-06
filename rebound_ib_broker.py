@@ -85,21 +85,21 @@ class IBReboundBroker:
     def modify_stop(self, signal, trigger):
         item = self._stop_order(signal)
         rule, tick = self._rules(signal["symbol"])
-        trigger = self.wc.normalize_price_to_market_rule(trigger, rule, tick, ROUND_FLOOR)
-        limit = self.wc.build_stop_limit_price("BUY", trigger, rule, tick)
+        trigger, _ = self.wc.normalize_price_to_market_rule(trigger, rule, tick, ROUND_FLOOR)
+        limit, _ = self.wc.build_stop_limit_price("BUY", trigger, rule, tick)
         self._place_stop(item, trigger, limit)
 
     def close(self, signal, reason):
         """Move the stop child to the market so the bracket closes as a stop exit."""
         bars = self.bars_since(signal["symbol"],
-                               datetime.now(timezone.utc) - timedelta(minutes=10))
+                               datetime.now(timezone.utc) - timedelta(days=1))
         if not bars:
-            raise LookupError(f"{signal['symbol']}: no recent bars to price the close")
+            raise LookupError(f"{signal['symbol']}: no bars to price the close")
         last = float(bars[-1]["close"])
         item = self._stop_order(signal)
         rule, tick = self._rules(signal["symbol"])
-        trigger = self.wc.normalize_price_to_market_rule(last * CLOSE_TRIGGER_UP, rule, tick,
-                                                         ROUND_CEILING)
-        limit = self.wc.normalize_price_to_market_rule(last * CLOSE_LIMIT_DOWN, rule, tick,
-                                                       ROUND_FLOOR)
+        trigger, _ = self.wc.normalize_price_to_market_rule(last * CLOSE_TRIGGER_UP, rule, tick,
+                                                            ROUND_CEILING)
+        limit, _ = self.wc.normalize_price_to_market_rule(last * CLOSE_LIMIT_DOWN, rule, tick,
+                                                          ROUND_FLOOR)
         self._place_stop(item, trigger, limit)
