@@ -75,3 +75,8 @@ reward = `min($1.00, swing)`; target = `entry + reward`; stop = `entry - reward 
 (`rebound_strategy.exit_levels`). `risk_per_share` = `entry - stop`. Trailing stays
 R-based (`rebound_exits`), so it scales with the smaller stop. Sizing is unchanged:
 `min(floor(1000/entry), floor(55/(entry-stop)))`.
+
+Review follow-ups: skip `SKIP_STOP_IN_SPREAD` when `entry - stop < 1.5 * (ask - bid)`
+(early-premarket spreads up to 3% could put the half-swing stop inside the spread);
+the stop manager ignores bars that started before the fill, so pre-fill highs can't
+trigger an immediate trail exit with the smaller R.

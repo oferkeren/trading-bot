@@ -41,7 +41,8 @@ class IBReboundBroker:
                 except Exception:
                     pass
                 raise TimeoutError(f"historical bars timeout for {symbol}")
-            cutoff = since.timestamp() - 60
+            # Bars are stamped at their start; earlier bars can hold pre-fill highs.
+            cutoff = since.timestamp()
             return [bar for bar in self.ib.historical_bars.get(req_id, [])
                     if bar.get("timestamp") is not None and bar["timestamp"] >= cutoff]
         finally:

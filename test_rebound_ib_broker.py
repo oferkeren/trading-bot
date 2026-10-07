@@ -73,7 +73,15 @@ class BrokerTests(unittest.TestCase):
         ib = FakeIB(bars=[{"timestamp": t - 120, "high": 9}, {"timestamp": t - 60, "high": 2},
                           {"timestamp": t + 60, "high": 3}, {"timestamp": None, "high": 99}])
         bars = rib.IBReboundBroker(ib, fake_wc()).bars_since("ABC", since)
-        self.assertEqual([b["high"] for b in bars], [2, 3])
+        # Bars that started before the fill (incl. the fill minute) can hold pre-fill highs.
+        self.assertEqual([b["high"] for b in bars], [3])
+
+    def test_bars_since_keeps_bar_starting_at_fill_time(self):
+        since = datetime(2026, 10, 6, 14, 0, tzinfo=timezone.utc)
+        t = int(since.timestamp())
+        ib = FakeIB(bars=[{"timestamp": t - 1, "high": 9}, {"timestamp": t, "high": 4}])
+        bars = rib.IBReboundBroker(ib, fake_wc()).bars_since("ABC", since)
+        self.assertEqual([b["high"] for b in bars], [4])
         self.assertEqual((ib.historical_events, ib.historical_bars), ({}, {}))
 
     def test_modify_stop_reuses_child_identity(self):

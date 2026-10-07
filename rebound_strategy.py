@@ -25,6 +25,7 @@ MAX_POSITION_USD = 1000.0
 MAX_RISK_USD = 55.0  # headroom under the server's $60 MAX_RISK_PER_TRADE_USD
 TARGET_USD = 1.00  # target = entry + min(TARGET_USD, cycle swing); stop = half that below
 MIN_SWING_USD = 0.20
+MIN_STOP_SPREAD_MULT = 1.5  # stop distance must exceed 1.5x the bid/ask spread
 MAX_SYMBOL_LOSSES = 2
 NEWS_MIN_SCORE = 0.5
 NEGATIVE_EVENTS = frozenset({
@@ -281,6 +282,9 @@ def analyze(candidate, bars, quote, now, env=None, symbol_state=None):
     if levels is None:
         return skip("SKIP_STOP_INVALID", **diagnostics)
     stop, target = levels
+    if entry - stop < MIN_STOP_SPREAD_MULT * (ask - bid):
+        return skip("SKIP_STOP_IN_SPREAD", stop_distance=round(entry - stop, 4),
+                    spread=round(ask - bid, 4), **diagnostics)
     if math.floor(MAX_POSITION_USD / entry) < 1:
         return skip("SKIP_SIZE", **diagnostics)
     return {"symbol": symbol, "action": "BUY", "entry": entry, "stop": stop,

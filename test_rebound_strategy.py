@@ -241,6 +241,7 @@ class EarlyPremarketAnalyzeTests(unittest.TestCase):
         self.assertEqual(result["skip_reason"], "SKIP_CYCLES")
         self.assertEqual(result["rebound"]["session"], "RTH")
 
+    @patch.object(rs, "MIN_STOP_SPREAD_MULT", 0.0)  # isolate the spread cap from the stop guard
     def test_early_spread_limit_is_three_percent(self):
         wide = quote(1.061, 1.035)  # ~2.5%
         self.assertTrue(self.run_at(EARLY, wide)["qualified"])
@@ -331,6 +332,14 @@ class DollarScalpTests(unittest.TestCase):
         self.assertTrue(result["qualified"], result)
         self.assertEqual((result["stop"], result["target"]), (3.241, 3.871))
         self.assertEqual(result["rebound"]["risk_per_share"], 0.21)
+
+    def test_stop_inside_spread_is_skipped(self):
+        closes = [round(c * 10, 4) for c in EARLY_CLOSES]  # ~$10, swing $0.5 -> stop $0.25
+        bars = make_bars(closes + [10.6], start=EARLY)
+        tight = rs.analyze({"symbol": "x"}, bars, quote(10.61, 10.59), now_after(bars), PAPER)
+        self.assertTrue(tight["qualified"], tight)
+        wide = rs.analyze({"symbol": "x"}, bars, quote(10.61, 10.35), now_after(bars), PAPER)
+        self.assertEqual(wide["skip_reason"], "SKIP_STOP_IN_SPREAD")
 
     def test_swing_floor_is_twenty_cents(self):
         self.assertEqual(rs.MIN_SWING_USD, 0.20)
