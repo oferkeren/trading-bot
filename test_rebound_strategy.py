@@ -100,9 +100,16 @@ class AnalyzeTests(unittest.TestCase):
         for now in (late, saturday):
             self.assertEqual(self.skip(self.run_case(bars=bars, now=now)), "SKIP_SESSION")
 
-    def test_one_cycle_is_not_enough(self):
-        closes = [1.00, 1.00, 1.00, 1.04, 1.08, 1.12, 1.10, 1.08, 1.06, 1.06, 1.06]
+    def test_zero_cycles_is_not_enough(self):
+        closes = [1.00] * 11
         self.assertEqual(self.skip(self.run_case(closes=closes)), "SKIP_CYCLES")
+
+    def test_one_cycle_is_enough(self):
+        closes = [1.00, 1.00, 1.00, 1.04, 1.08, 1.12, 1.10, 1.08, 1.06, 1.06, 1.06]
+        bars = make_bars(closes + [1.08])
+        result = rs.analyze({"symbol": "x"}, bars, quote(1.081, 1.079), now_after(bars), PAPER)
+        self.assertTrue(result["qualified"], result)
+        self.assertEqual(result["rebound"]["cycles"], 1)
 
     def test_dip_below_previous_fade_low_is_rejected(self):
         # A retrace <= 70% already implies a higher low, so a deeper dip fails as RETRACE.

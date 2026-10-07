@@ -1,4 +1,4 @@
-"""Micro-cap rebound strategy (paper only): buy the dip after >= 2 spike-and-fade cycles."""
+"""Micro-cap rebound strategy (paper only): buy the dip after >= 1 spike-and-fade cycle."""
 
 import math
 import os
@@ -15,7 +15,7 @@ MAX_PRICE = 20.00
 SPIKE_MIN_PCT = 8.0
 SPIKE_MAX_BARS = 15
 FADE_MIN_RETRACE = 0.40
-MIN_CYCLES = 2
+MIN_CYCLES = 1
 ENTRY_RETRACE_MIN = 0.40
 ENTRY_RETRACE_MAX = 0.70
 MIN_ROOM_TO_PEAK = 0.25
@@ -235,7 +235,7 @@ def analyze(candidate, bars, quote, now, env=None, symbol_state=None):
     cycles = detect_cycles(clean, profile)
     if len(cycles) < MIN_CYCLES:
         return skip("SKIP_CYCLES", cycles=len(cycles))
-    last_cycle, previous = cycles[-1], cycles[-2]
+    last_cycle = cycles[-1]
     after_peak = clean[last_cycle.peak_index + 1:]
     if _find_spike(clean, last_cycle.fade_index, profile) is not None:
         return skip("SKIP_NEW_SPIKE", cycles=len(cycles))
@@ -253,10 +253,12 @@ def analyze(candidate, bars, quote, now, env=None, symbol_state=None):
         return skip("SKIP_SAME_CYCLE", last_exit_ts=last_exit_ts, **diagnostics)
     if not (ENTRY_RETRACE_MIN <= retrace <= ENTRY_RETRACE_MAX):
         return skip("SKIP_RETRACE", **diagnostics)
-    previous_fade_low = min(bar["low"] for bar in
-                            clean[previous.peak_index + 1:last_cycle.low_index + 1])
-    if dip_low <= previous_fade_low:
-        return skip("SKIP_LOWER_LOW", previous_fade_low=previous_fade_low, **diagnostics)
+    if len(cycles) >= 2:
+        previous = cycles[-2]
+        previous_fade_low = min(bar["low"] for bar in
+                                clean[previous.peak_index + 1:last_cycle.low_index + 1])
+        if dip_low <= previous_fade_low:
+            return skip("SKIP_LOWER_LOW", previous_fade_low=previous_fade_low, **diagnostics)
     trigger, prior = clean[-1], clean[-2]
     if trigger["timestamp"] - prior["timestamp"] != BAR_SECONDS:
         return skip("SKIP_BARS_STALE")

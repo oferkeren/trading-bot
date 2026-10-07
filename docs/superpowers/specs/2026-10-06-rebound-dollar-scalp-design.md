@@ -61,3 +61,9 @@ Unit tests: swing filter pass/skip; fixed stop/target values; stop ≤ 0 skip;
 (today only, per symbol, loss counting, latest exit); bridge passes symbol state and
 fails closed; rebound cooldown is 75 s. Existing tests that assumed dip-low stops/3R
 targets are updated. Docs: `OPERATIONS.md` rebound section.
+
+## Amendment 2026-10-07: one cycle is enough
+
+User request (no trades with 2 cycles + $1 swing): `MIN_CYCLES = 1`. With a single
+cycle the higher-low check (`SKIP_LOWER_LOW`) is skipped because there is no previous
+fade; with 2+ cycles it still applies. All other rules are unchanged.
