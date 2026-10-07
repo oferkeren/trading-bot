@@ -1617,7 +1617,10 @@ def process_candidate(
                     "",
                 )
             ).startswith(
-                "scalp_"
+                (
+                    "scalp_",
+                    "microcap_rebound_",
+                )
             )
             else
             COOLDOWN_SECONDS
@@ -2045,12 +2048,31 @@ def collect_strategy_results():
                     60000 + index,
                     strategy_engine.make_contract,
                 )
-                rebound_result = rebound_strategy.analyze(
-                    candidate,
-                    rebound_bars,
-                    quote,
-                    datetime.now(timezone.utc),
-                )
+                now_utc = datetime.now(timezone.utc)
+                try:
+                    symbol_state = rebound_journal.symbol_day_state(
+                        rebound_journal.DEFAULT_DB,
+                        candidate.get("symbol"),
+                        now_utc,
+                    )
+                except Exception as exc:
+                    symbol_state = None
+                    rebound_result = {
+                        "symbol": str(candidate.get("symbol") or "").strip().upper(),
+                        "strategy": rebound_strategy.STRATEGY_NAME,
+                        "timeframe": rebound_strategy.TIMEFRAME,
+                        "qualified": False,
+                        "skip_reason": "SKIP_SYMBOL_STATE",
+                        "rebound": {"error": f"{type(exc).__name__}: {exc}"},
+                    }
+                if symbol_state is not None:
+                    rebound_result = rebound_strategy.analyze(
+                        candidate,
+                        rebound_bars,
+                        quote,
+                        now_utc,
+                        symbol_state=symbol_state,
+                    )
                 if not rebound_result.get("qualified"):
                     try:
                         rebound_journal.record_skip(

@@ -153,7 +153,7 @@ class OriginalBridgeReboundGateTests(unittest.TestCase):
     def test_original_process_candidate_posts_gated_rebound(self):
         candidate = dict(CANDIDATE, _rebound_gated=True)
         with patch.object(signal_bridge, "signal_already_sent", return_value=False), \
-                patch.object(signal_bridge, "symbol_action_in_cooldown", return_value=(False, None)), \
+                patch.object(signal_bridge, "symbol_action_in_cooldown", return_value=(False, None)) as cooldown, \
                 patch.object(signal_bridge, "enforce_mode_api", return_value={"mode": "TEST", "test_mode": True}), \
                 patch.object(signal_bridge, "record_sent_signal"), \
                 patch.object(signal_bridge, "send_payload", return_value=(200, {"ok": True}, "ok")) as send:
@@ -162,6 +162,7 @@ class OriginalBridgeReboundGateTests(unittest.TestCase):
         payload = send.call_args.args[0]
         self.assertEqual(payload["strategy"], "microcap_rebound_v1")
         self.assertNotIn("_rebound_gated", payload)
+        self.assertEqual(cooldown.call_args.args[2], 75)
 
 
 class ReboundModeTests(unittest.TestCase):
@@ -188,15 +189,54 @@ class ReboundModeTests(unittest.TestCase):
                     patch.object(signal_bridge.strategy_engine, "request_history") as momentum, \
                     patch.object(signal_bridge.scalp_strategy, "request_history") as scalp, \
                     patch.object(signal_bridge.rebound_strategy, "request_history", return_value=[]), \
+                    patch.object(signal_bridge.rebound_journal, "symbol_day_state",
+                                 return_value={"losses": 2, "last_exit_ts": None}) as day_state, \
                     patch.object(signal_bridge.rebound_strategy, "analyze", return_value=skip) as analyze, \
                     patch.object(signal_bridge.rebound_journal, "record_skip") as record_skip, \
                     patch.object(signal_bridge.time, "sleep"):
                 results = signal_bridge.collect_strategy_results()
         self.assertEqual(results, [skip])
         self.assertEqual(analyze.call_args.args[2], {"bid": 1.99, "ask": 2.0})
+        self.assertEqual(analyze.call_args.kwargs["symbol_state"],
+                         {"losses": 2, "last_exit_ts": None})
+        day_state.assert_called_once()
         record_skip.assert_called_once_with(rebound_journal.DEFAULT_DB, "ABC", "SKIP_CYCLES", {"cycles": 1})
         momentum.assert_not_called()
         scalp.assert_not_called()
+
+    def test_collect_rebound_skips_when_symbol_state_lookup_fails(self):
+        with tempfile.TemporaryDirectory() as home:
+            mode_dir = Path(home) / ".cache" / "tradingmax"
+            mode_dir.mkdir(parents=True)
+            (mode_dir / "strategy_mode.txt").write_text("REBOUND\n", encoding="utf-8")
+            app = MagicMock()
+            app.market_data = {1: {"bid": 1.99, "ask": 2.0}}
+            app.isConnected.return_value = False
+            with patch.object(signal_bridge.Path, "home", return_value=Path(home)), \
+                    patch.object(signal_bridge, "mark_phase"), \
+                    patch.object(signal_bridge, "record_bridge_mode"), \
+                    patch.object(signal_bridge, "record_analysis"), \
+                    patch.object(signal_bridge.strategy_engine, "get_candidates",
+                                 return_value=[{"symbol": "ABC"}]), \
+                    patch.object(signal_bridge.strategy_engine, "TradingMaxStrategy", return_value=app), \
+                    patch.object(signal_bridge.strategy_engine, "connect_strategy"), \
+                    patch.object(signal_bridge.strategy_engine, "start_live", return_value={"ABC": 1}), \
+                    patch.object(signal_bridge.strategy_engine, "stop_live"), \
+                    patch.object(signal_bridge.strategy_engine, "request_history"), \
+                    patch.object(signal_bridge.scalp_strategy, "request_history"), \
+                    patch.object(signal_bridge.rebound_strategy, "request_history", return_value=[]), \
+                    patch.object(signal_bridge.rebound_journal, "symbol_day_state",
+                                 side_effect=sqlite3.OperationalError("locked")), \
+                    patch.object(signal_bridge.rebound_strategy, "analyze") as analyze, \
+                    patch.object(signal_bridge.rebound_journal, "record_skip") as record_skip, \
+                    patch.object(signal_bridge.time, "sleep"):
+                results = signal_bridge.collect_strategy_results()
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["skip_reason"], "SKIP_SYMBOL_STATE")
+        self.assertEqual(results[0]["symbol"], "ABC")
+        analyze.assert_not_called()
+        record_skip.assert_called_once()
+        self.assertEqual(record_skip.call_args.args[2], "SKIP_SYMBOL_STATE")
 
     def test_server_accepts_rebound_mode(self):
         source = Path(signal_bridge.__file__).with_name("signal_server_core.py").read_text(encoding="utf-8")
