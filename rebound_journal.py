@@ -13,6 +13,7 @@ STRATEGY = "microcap_rebound_v1"
 DEFAULT_DB = str(Path(__file__).resolve().with_name("trading.db"))
 TERMINAL_STATUSES = frozenset(TERMINAL_STATES)
 SKIP_DEDUPE_MINUTES = 10
+NEW_YORK = ZoneInfo("America/New_York")
 
 
 def connect(db_file):
@@ -97,6 +98,35 @@ def is_busy(db_file):
         return bool(row and row[0])
     except Exception:
         return True
+
+
+def symbol_day_state(db_file, symbol, now):
+    """Today's (New York date) losses and latest exit time for ``symbol`` from EXIT rows."""
+    symbol = str(symbol or "").strip().upper()
+    today = now.astimezone(NEW_YORK).date()
+    losses, last_exit = 0, None
+    conn = connect(db_file)
+    try:
+        rows = conn.execute(
+            "SELECT ts, detail FROM rebound_journal WHERE event='EXIT' AND symbol=?",
+            (symbol,),
+        ).fetchall()
+    finally:
+        conn.close()
+    for ts, detail in rows:
+        stamp = datetime.fromisoformat(ts)
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=timezone.utc)
+        if stamp.astimezone(NEW_YORK).date() != today:
+            continue
+        last_exit = max(last_exit or stamp.timestamp(), stamp.timestamp())
+        try:
+            pnl = json.loads(detail or "{}").get("pnl")
+        except (TypeError, ValueError, AttributeError):
+            pnl = None
+        if isinstance(pnl, (int, float)) and not isinstance(pnl, bool) and pnl < 0:
+            losses += 1
+    return {"losses": losses, "last_exit_ts": last_exit}
 
 
 def summary(db_file, limit=50):

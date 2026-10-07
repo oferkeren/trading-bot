@@ -268,6 +268,25 @@ class DollarScalpTests(unittest.TestCase):
         self.assertEqual(result["skip_reason"], "SKIP_SWING")
         self.assertAlmostEqual(result["rebound"]["swing"], 0.14)
 
+    def test_two_losses_block_symbol(self):
+        result = self.run_case(DOLLAR, 11.5, quote(11.51, 11.50),
+                               symbol_state={"losses": 2, "last_exit_ts": None})
+        self.assertEqual(result["skip_reason"], "SKIP_SYMBOL_LOSSES")
+        result = self.run_case(DOLLAR, 11.5, quote(11.51, 11.50),
+                               symbol_state={"losses": 1, "last_exit_ts": None})
+        self.assertTrue(result["qualified"], result)
+
+    def test_same_cycle_after_exit_is_skipped(self):
+        bars = make_bars(DOLLAR + [11.5])
+        clean = rs._clean_bars(bars, now_after(bars))
+        last_low_ts = clean[rs.detect_cycles(clean)[-1].low_index]["timestamp"]
+        result = self.run_case(DOLLAR, 11.5, quote(11.51, 11.50),
+                               symbol_state={"losses": 0, "last_exit_ts": last_low_ts})
+        self.assertEqual(result["skip_reason"], "SKIP_SAME_CYCLE")
+        result = self.run_case(DOLLAR, 11.5, quote(11.51, 11.50),
+                               symbol_state={"losses": 0, "last_exit_ts": last_low_ts - 1})
+        self.assertTrue(result["qualified"], result)
+
 
 class NewsVerdictTests(unittest.TestCase):
     def ai(self, **overrides):

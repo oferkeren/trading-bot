@@ -205,6 +205,10 @@ def analyze(candidate, bars, quote, now, env=None, symbol_state=None):
     profile = profile_for(now)
     if local.weekday() >= 5 or profile is None:
         return _skip(symbol, "SKIP_SESSION")
+    state = symbol_state or {}
+    if (state.get("losses") or 0) >= MAX_SYMBOL_LOSSES:
+        return _skip(symbol, "SKIP_SYMBOL_LOSSES", session=profile.session,
+                     losses=state.get("losses"))
 
     def skip(reason, **diagnostics):
         return _skip(symbol, reason, session=profile.session, **diagnostics)
@@ -243,6 +247,9 @@ def analyze(candidate, bars, quote, now, env=None, symbol_state=None):
                    "swing": round(spike_range, 4)}
     if spike_range < MIN_SWING_USD:
         return skip("SKIP_SWING", **diagnostics)
+    last_exit_ts = state.get("last_exit_ts")
+    if last_exit_ts is not None and clean[last_cycle.low_index]["timestamp"] <= last_exit_ts:
+        return skip("SKIP_SAME_CYCLE", last_exit_ts=last_exit_ts, **diagnostics)
     if not (ENTRY_RETRACE_MIN <= retrace <= ENTRY_RETRACE_MAX):
         return skip("SKIP_RETRACE", **diagnostics)
     previous_fade_low = min(bar["low"] for bar in

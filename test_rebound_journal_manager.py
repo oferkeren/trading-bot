@@ -203,6 +203,38 @@ class JournalTests(Base):
         self.assertEqual(len(result["trades"]), 50)
 
 
+class SymbolDayStateTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.db = os.path.join(self.tmp.name, "t.db")
+
+    def exit(self, symbol, pnl, when):
+        journal.record(self.db, "EXIT", symbol=symbol, signal_id=f"{symbol}-{when}",
+                       reason="MAX_HOLD", detail={"pnl": pnl}, now=when)
+
+    def test_counts_losses_and_latest_exit_today_only(self):
+        ny = ZoneInfo("America/New_York")
+        now = datetime(2026, 10, 6, 12, 0, tzinfo=ny)
+        self.exit("ABC", -10.0, now - timedelta(days=1))
+        self.exit("ABC", -5.0, now - timedelta(hours=2))
+        self.exit("ABC", 20.0, now - timedelta(hours=1))
+        self.exit("XYZ", -1.0, now - timedelta(minutes=5))
+        state = journal.symbol_day_state(self.db, "abc", now)
+        self.assertEqual(state["losses"], 1)
+        self.assertEqual(state["last_exit_ts"], (now - timedelta(hours=1)).timestamp())
+
+    def test_empty_or_missing_table(self):
+        now = datetime(2026, 10, 6, 12, 0, tzinfo=timezone.utc)
+        self.assertEqual(journal.symbol_day_state(self.db, "ABC", now),
+                         {"losses": 0, "last_exit_ts": None})
+
+    def test_null_or_bad_pnl_is_not_a_loss(self):
+        now = datetime(2026, 10, 6, 16, 0, tzinfo=timezone.utc)
+        self.exit("ABC", None, now - timedelta(minutes=10))
+        self.assertEqual(journal.symbol_day_state(self.db, "ABC", now)["losses"], 0)
+
+
 class ManagerTests(Base):
     def test_entry_then_ratchet(self):
         add_signal(self.db)
