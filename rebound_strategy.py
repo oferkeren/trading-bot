@@ -23,9 +23,10 @@ MAX_SPREAD_PCT_RTH = 0.8
 MAX_SPREAD_PCT_EXT = 1.5
 MAX_POSITION_USD = 1000.0
 MAX_RISK_USD = 55.0  # headroom under the server's $60 MAX_RISK_PER_TRADE_USD
-STOP_BUFFER_PCT = 0.005
-MAX_STOP_PCT = 0.06
-TARGET_R = 3.0
+STOP_USD = 0.50
+TARGET_USD = 1.00
+MIN_SWING_USD = 1.00
+MAX_SYMBOL_LOSSES = 2
 NEWS_MIN_SCORE = 0.5
 NEGATIVE_EVENTS = frozenset({
     "OFFERING",
@@ -193,7 +194,7 @@ def _skip(symbol, reason, **diagnostics):
             "qualified": False, "skip_reason": reason, "rebound": diagnostics}
 
 
-def analyze(candidate, bars, quote, now, env=None):
+def analyze(candidate, bars, quote, now, env=None, symbol_state=None):
     """Return a qualified BUY signal dict or a skip dict with ``skip_reason``."""
     symbol = str((candidate or {}).get("symbol") or "").strip().upper()
     if not symbol:
@@ -238,7 +239,10 @@ def analyze(candidate, bars, quote, now, env=None):
     dip_low = min(bar["low"] for bar in after_peak)
     retrace = (last_cycle.peak - dip_low) / spike_range
     diagnostics = {"cycles": len(cycles), "retrace": round(retrace, 4),
-                   "peak": last_cycle.peak, "spike_low": last_cycle.low, "dip_low": dip_low}
+                   "peak": last_cycle.peak, "spike_low": last_cycle.low, "dip_low": dip_low,
+                   "swing": round(spike_range, 4)}
+    if spike_range < MIN_SWING_USD:
+        return skip("SKIP_SWING", **diagnostics)
     if not (ENTRY_RETRACE_MIN <= retrace <= ENTRY_RETRACE_MAX):
         return skip("SKIP_RETRACE", **diagnostics)
     previous_fade_low = min(bar["low"] for bar in
@@ -255,19 +259,16 @@ def analyze(candidate, bars, quote, now, env=None):
     if last_cycle.peak - ask < MIN_ROOM_TO_PEAK * spike_range:
         return skip("SKIP_CHASE", **diagnostics)
     entry = round(ask, 4)
-    stop = round(dip_low * (1 - STOP_BUFFER_PCT), 4)
-    risk = entry - stop
-    if risk <= 0:
+    stop = round(entry - STOP_USD, 4)
+    if stop <= 0:
         return skip("SKIP_STOP_INVALID", **diagnostics)
-    if risk / entry > MAX_STOP_PCT:
-        return skip("SKIP_STOP_TOO_WIDE", stop_pct=round(risk / entry * 100, 3), **diagnostics)
     if math.floor(MAX_POSITION_USD / entry) < 1:
         return skip("SKIP_SIZE", **diagnostics)
     return {"symbol": symbol, "action": "BUY", "entry": entry, "stop": stop,
-            "target": round(entry + TARGET_R * risk, 4), "strategy": STRATEGY_NAME,
+            "target": round(entry + TARGET_USD, 4), "strategy": STRATEGY_NAME,
             "timeframe": TIMEFRAME, "qualified": True, "hard_pass": True,
             "hard_failures": [],
-            "rebound": {**diagnostics, "risk_per_share": round(risk, 4),
+            "rebound": {**diagnostics, "risk_per_share": STOP_USD,
                         "session": profile.session}}
 
 

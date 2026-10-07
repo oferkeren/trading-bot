@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -62,6 +63,11 @@ class DetectCyclesTests(unittest.TestCase):
 
 
 class AnalyzeTests(unittest.TestCase):
+    def setUp(self):
+        patcher = patch.object(rs, "MIN_SWING_USD", 0.0)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def run_case(self, closes=None, q=None, env=PAPER, bars=None, now=None):
         bars = bars if bars is not None else make_bars((closes or TWO_CYCLES) + [TRIGGER])
         return rs.analyze({"symbol": "abcd"}, bars, q or quote(), now or now_after(bars), env)
@@ -72,9 +78,9 @@ class AnalyzeTests(unittest.TestCase):
         self.assertEqual((result["symbol"], result["action"], result["strategy"]),
                          ("ABCD", "BUY", "microcap_rebound_v1"))
         self.assertEqual(result["entry"], 1.151)
-        self.assertEqual(result["stop"], round(1.13 * 0.995, 4))
-        risk = result["entry"] - result["stop"]
-        self.assertAlmostEqual(result["target"], round(result["entry"] + 3 * risk, 4))
+        self.assertEqual(result["stop"], round(1.151 - 0.50, 4))
+        self.assertEqual(result["target"], round(1.151 + 1.00, 4))
+        self.assertEqual(result["rebound"]["risk_per_share"], 0.5)
         self.assertEqual(result["rebound"]["cycles"], 2)
         self.assertTrue(result["hard_pass"])
 
@@ -130,12 +136,9 @@ class AnalyzeTests(unittest.TestCase):
         result = self.run_case(bars=bars, q=quote(1.151, 1.137))
         self.assertTrue(result["qualified"], result)  # 1.2% allowed pre-market
 
-    def test_stop_too_wide(self):
-        closes = [1.00, 1.00, 1.00, 1.10, 1.20, 1.30, 1.25, 1.20, 1.16,
-                  1.30, 1.45, 1.60, 1.50, 1.40, 1.33, 1.33, 1.33, 1.33, 1.33]
-        bars = make_bars(closes + [1.42])
-        result = self.run_case(bars=bars, q=quote(1.421, 1.419))
-        self.assertEqual(self.skip(result), "SKIP_STOP_TOO_WIDE")
+    def test_stop_must_stay_above_zero(self):
+        with patch.object(rs, "STOP_USD", 2.0):
+            self.assertEqual(self.skip(self.run_case()), "SKIP_STOP_INVALID")
 
     def test_price_bounds_and_invalid_inputs(self):
         self.assertEqual(self.skip(self.run_case(q=quote(25.0, 24.99))), "SKIP_PRICE")
@@ -206,6 +209,11 @@ class ProfileTests(unittest.TestCase):
 
 
 class EarlyPremarketAnalyzeTests(unittest.TestCase):
+    def setUp(self):
+        patcher = patch.object(rs, "MIN_SWING_USD", 0.0)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def run_at(self, start, q):
         bars = make_bars(EARLY_CLOSES + [EARLY_TRIGGER], start=start)
         return rs.analyze({"symbol": "abcd"}, bars, q, now_after(bars), PAPER)
@@ -215,7 +223,7 @@ class EarlyPremarketAnalyzeTests(unittest.TestCase):
         self.assertTrue(result["qualified"], result)
         self.assertEqual(result["rebound"]["cycles"], 2)
         self.assertEqual(result["rebound"]["session"], "EARLY_PRE")
-        self.assertEqual(result["stop"], round(1.05 * 0.995, 4))
+        self.assertEqual(result["stop"], round(1.061 - 0.50, 4))
 
     def test_same_bars_in_regular_hours_are_not_cycles(self):
         result = self.run_at(datetime(2026, 10, 6, 10, 0, tzinfo=NY), quote(1.061, 1.059))
@@ -236,6 +244,29 @@ class EarlyPremarketAnalyzeTests(unittest.TestCase):
         result = rs.analyze({"symbol": "abcd"}, bars, quote(), now_after(bars), PAPER)
         self.assertTrue(result["qualified"], result)
         self.assertEqual(result["rebound"]["session"], "RTH")
+
+
+DOLLAR = [c * 10 for c in TWO_CYCLES]  # same pattern on a ~$10 stock: swings $1.2 and $1.4
+
+
+class DollarScalpTests(unittest.TestCase):
+    def run_case(self, closes, trigger, q, symbol_state=None):
+        bars = make_bars(closes + [trigger])
+        return rs.analyze({"symbol": "abcd"}, bars, q, now_after(bars), PAPER,
+                          symbol_state=symbol_state)
+
+    def test_dollar_swing_qualifies_with_fixed_exits(self):
+        result = self.run_case(DOLLAR, 11.5, quote(11.51, 11.50))
+        self.assertTrue(result["qualified"], result)
+        self.assertEqual((result["entry"], result["stop"], result["target"]),
+                         (11.51, 11.01, 12.51))
+        self.assertAlmostEqual(result["rebound"]["swing"], 1.4)
+
+    def test_small_swing_is_skipped(self):
+        bars = make_bars(TWO_CYCLES + [TRIGGER])
+        result = rs.analyze({"symbol": "abcd"}, bars, quote(), now_after(bars), PAPER)
+        self.assertEqual(result["skip_reason"], "SKIP_SWING")
+        self.assertAlmostEqual(result["rebound"]["swing"], 0.14)
 
 
 class NewsVerdictTests(unittest.TestCase):
