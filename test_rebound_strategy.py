@@ -140,6 +140,8 @@ class AnalyzeTests(unittest.TestCase):
 
     def test_spread(self):
         self.assertEqual(self.skip(self.run_case(q=quote(1.151, 1.13))), "SKIP_SPREAD")
+        rth_mid = self.run_case(q=quote(1.151, 1.137))  # ~1.2% now allowed in RTH
+        self.assertNotEqual(rth_mid.get("skip_reason"), "SKIP_SPREAD")
         bars = make_bars(TWO_CYCLES + [TRIGGER], start=datetime(2026, 10, 6, 7, 0, tzinfo=NY))
         result = self.run_case(bars=bars, q=quote(1.151, 1.137))
         self.assertTrue(result["qualified"], result)  # 1.2% allowed pre-market
@@ -207,7 +209,7 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual(rs.profile_for(self.at(8, 0)).max_spread_pct, 1.5)
         rth = rs.profile_for(self.at(10, 0))
         self.assertEqual((rth.spike_min_pct, rth.spike_max_bars, rth.max_spread_pct),
-                         (8.0, 15, 0.8))
+                         (8.0, 15, 1.5))
         self.assertEqual(rs.profile_for(self.at(17, 0)).max_spread_pct, 1.5)
 
     def test_detect_cycles_uses_profile(self):
