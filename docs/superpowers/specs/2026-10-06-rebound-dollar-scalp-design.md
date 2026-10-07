@@ -67,3 +67,11 @@ targets are updated. Docs: `OPERATIONS.md` rebound section.
 User request (no trades with 2 cycles + $1 swing): `MIN_CYCLES = 1`. With a single
 cycle the higher-low check (`SKIP_LOWER_LOW`) is skipped because there is no previous
 fade; with 2+ cycles it still applies. All other rules are unchanged.
+
+## Amendment 2026-10-07: swing-scaled exits
+
+User request (still no trades; most movers swing < $1): `MIN_SWING_USD = 0.20`;
+reward = `min($1.00, swing)`; target = `entry + reward`; stop = `entry - reward / 2`
+(`rebound_strategy.exit_levels`). `risk_per_share` = `entry - stop`. Trailing stays
+R-based (`rebound_exits`), so it scales with the smaller stop. Sizing is unchanged:
+`min(floor(1000/entry), floor(55/(entry-stop)))`.

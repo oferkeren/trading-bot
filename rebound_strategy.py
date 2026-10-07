@@ -23,9 +23,8 @@ MAX_SPREAD_PCT_RTH = 0.8
 MAX_SPREAD_PCT_EXT = 1.5
 MAX_POSITION_USD = 1000.0
 MAX_RISK_USD = 55.0  # headroom under the server's $60 MAX_RISK_PER_TRADE_USD
-STOP_USD = 0.50
-TARGET_USD = 1.00
-MIN_SWING_USD = 1.00
+TARGET_USD = 1.00  # target = entry + min(TARGET_USD, cycle swing); stop = half that below
+MIN_SWING_USD = 0.20
 MAX_SYMBOL_LOSSES = 2
 NEWS_MIN_SCORE = 0.5
 NEGATIVE_EVENTS = frozenset({
@@ -189,6 +188,15 @@ def news_verdict(ai_result):
     return True, "NEWS_STRONG_POSITIVE"
 
 
+def exit_levels(entry, swing):
+    """(stop, target) for a dip entry: aim for the cycle swing capped at $1, risk half of it."""
+    reward = min(TARGET_USD, swing)
+    stop = round(entry - reward / 2, 4)
+    if reward <= 0 or stop <= 0:
+        return None
+    return stop, round(entry + reward, 4)
+
+
 def _skip(symbol, reason, **diagnostics):
     return {"symbol": symbol, "strategy": STRATEGY_NAME, "timeframe": TIMEFRAME,
             "qualified": False, "skip_reason": reason, "rebound": diagnostics}
@@ -269,16 +277,17 @@ def analyze(candidate, bars, quote, now, env=None, symbol_state=None):
     if last_cycle.peak - ask < MIN_ROOM_TO_PEAK * spike_range:
         return skip("SKIP_CHASE", **diagnostics)
     entry = round(ask, 4)
-    stop = round(entry - STOP_USD, 4)
-    if stop <= 0:
+    levels = exit_levels(entry, spike_range)
+    if levels is None:
         return skip("SKIP_STOP_INVALID", **diagnostics)
+    stop, target = levels
     if math.floor(MAX_POSITION_USD / entry) < 1:
         return skip("SKIP_SIZE", **diagnostics)
     return {"symbol": symbol, "action": "BUY", "entry": entry, "stop": stop,
-            "target": round(entry + TARGET_USD, 4), "strategy": STRATEGY_NAME,
+            "target": target, "strategy": STRATEGY_NAME,
             "timeframe": TIMEFRAME, "qualified": True, "hard_pass": True,
             "hard_failures": [],
-            "rebound": {**diagnostics, "risk_per_share": STOP_USD,
+            "rebound": {**diagnostics, "risk_per_share": round(entry - stop, 4),
                         "session": profile.session}}
 
 

@@ -78,9 +78,10 @@ class AnalyzeTests(unittest.TestCase):
         self.assertEqual((result["symbol"], result["action"], result["strategy"]),
                          ("ABCD", "BUY", "microcap_rebound_v1"))
         self.assertEqual(result["entry"], 1.151)
-        self.assertEqual(result["stop"], round(1.151 - 0.50, 4))
-        self.assertEqual(result["target"], round(1.151 + 1.00, 4))
-        self.assertEqual(result["rebound"]["risk_per_share"], 0.5)
+        # swing 0.14 < $1 -> target = +swing, stop = half of that below entry
+        self.assertEqual(result["target"], round(1.151 + 0.14, 4))
+        self.assertEqual(result["stop"], round(1.151 - 0.07, 4))
+        self.assertEqual(result["rebound"]["risk_per_share"], 0.07)
         self.assertEqual(result["rebound"]["cycles"], 2)
         self.assertTrue(result["hard_pass"])
 
@@ -143,9 +144,10 @@ class AnalyzeTests(unittest.TestCase):
         result = self.run_case(bars=bars, q=quote(1.151, 1.137))
         self.assertTrue(result["qualified"], result)  # 1.2% allowed pre-market
 
-    def test_stop_must_stay_above_zero(self):
-        with patch.object(rs, "STOP_USD", 2.0):
-            self.assertEqual(self.skip(self.run_case()), "SKIP_STOP_INVALID")
+    def test_exit_levels(self):
+        self.assertEqual(rs.exit_levels(11.51, 1.4), (11.01, 12.51))
+        self.assertEqual(rs.exit_levels(3.451, 0.42), (3.241, 3.871))
+        self.assertIsNone(rs.exit_levels(0.50, 1.2))  # stop would be 0
 
     def test_price_bounds_and_invalid_inputs(self):
         self.assertEqual(self.skip(self.run_case(q=quote(25.0, 24.99))), "SKIP_PRICE")
@@ -230,7 +232,9 @@ class EarlyPremarketAnalyzeTests(unittest.TestCase):
         self.assertTrue(result["qualified"], result)
         self.assertEqual(result["rebound"]["cycles"], 2)
         self.assertEqual(result["rebound"]["session"], "EARLY_PRE")
-        self.assertEqual(result["stop"], round(1.061 - 0.50, 4))
+        swing = result["rebound"]["swing"]
+        self.assertEqual(result["target"], round(1.061 + swing, 4))
+        self.assertEqual(result["stop"], round(1.061 - swing / 2, 4))
 
     def test_same_bars_in_regular_hours_are_not_cycles(self):
         result = self.run_at(datetime(2026, 10, 6, 10, 0, tzinfo=NY), quote(1.061, 1.059))
@@ -319,6 +323,17 @@ class DollarScalpTests(unittest.TestCase):
         result = self.run_case(closes, trigger, quote(11.91, 11.90),
                                symbol_state={"losses": 0, "last_exit_ts": dip_low_ts})
         self.assertEqual(result["skip_reason"], "SKIP_SAME_CYCLE")
+
+
+    def test_mid_swing_scales_target_and_stop(self):
+        closes = [round(c * 3, 4) for c in TWO_CYCLES]  # ~$3 stock, last swing $0.42
+        result = self.run_case(closes, 3.45, quote(3.451, 3.449))
+        self.assertTrue(result["qualified"], result)
+        self.assertEqual((result["stop"], result["target"]), (3.241, 3.871))
+        self.assertEqual(result["rebound"]["risk_per_share"], 0.21)
+
+    def test_swing_floor_is_twenty_cents(self):
+        self.assertEqual(rs.MIN_SWING_USD, 0.20)
 
 
 class NewsVerdictTests(unittest.TestCase):
