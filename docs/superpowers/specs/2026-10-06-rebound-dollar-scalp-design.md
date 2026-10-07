@@ -28,13 +28,19 @@ buy the dip again. Stop trading a stock for the day after **2 losses** on it.
 6. **Same-stock re-entry**
    - New `rebound_journal.symbol_day_state(db_file, symbol, now)` returns
      `{"losses": int, "last_exit_ts": float | None}` from today's (New York date)
-     `EXIT` journal rows for that symbol; a loss is `detail.pnl < 0`.
+     `EXIT` journal rows for that symbol. A loss is finite numeric `detail.pnl < 0`;
+     additionally, `reason == "FLAT_AT_BROKER"` with missing, non-numeric, or non-finite
+     `detail.pnl` counts as a loss (fail closed because the flatten P/L is not known yet).
+     Other exits with missing, non-numeric, or non-finite P/L do not count as losses.
    - `analyze(..., symbol_state=None)`:
      - `losses >= MAX_SYMBOL_LOSSES` (2) → `SKIP_SYMBOL_LOSSES` (checked right after
        the session check, before quotes/bars).
-     - If `last_exit_ts` is set and the traded cycle's low bar timestamp is
-       `<= last_exit_ts` → `SKIP_SAME_CYCLE` (the dip must belong to a cycle that
-       started after the last exit).
+     - Compute the current entry dip-low from the bars after the latest cycle peak
+       (`clean[last_cycle.peak_index + 1:]`), using the lowest `low` and the earliest
+       bar on ties. If `last_exit_ts` is set and that dip-low bar timestamp is
+       `<= last_exit_ts` → `SKIP_SAME_CYCLE`. This requires price to come down after
+       the last exit while still allowing a prior winning entry dip to become the next
+       cycle's spike low.
    - `signal_bridge` REBOUND dispatch passes
      `symbol_state=rebound_journal.symbol_day_state(DEFAULT_DB, symbol, now)`; if that
      lookup raises, the symbol is skipped with `SKIP_SYMBOL_STATE` (fail closed).

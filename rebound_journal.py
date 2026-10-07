@@ -1,6 +1,7 @@
 """SQLite journal for microcap_rebound_v1 decisions and managed positions."""
 
 import json
+import math
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -108,12 +109,12 @@ def symbol_day_state(db_file, symbol, now):
     conn = connect(db_file)
     try:
         rows = conn.execute(
-            "SELECT ts, detail FROM rebound_journal WHERE event='EXIT' AND symbol=?",
+            "SELECT ts, reason, detail FROM rebound_journal WHERE event='EXIT' AND symbol=?",
             (symbol,),
         ).fetchall()
     finally:
         conn.close()
-    for ts, detail in rows:
+    for ts, reason, detail in rows:
         stamp = datetime.fromisoformat(ts)
         if stamp.tzinfo is None:
             stamp = stamp.replace(tzinfo=timezone.utc)
@@ -124,7 +125,9 @@ def symbol_day_state(db_file, symbol, now):
             pnl = json.loads(detail or "{}").get("pnl")
         except (TypeError, ValueError, AttributeError):
             pnl = None
-        if isinstance(pnl, (int, float)) and not isinstance(pnl, bool) and pnl < 0:
+        finite_pnl = isinstance(pnl, (int, float)) and not isinstance(pnl, bool) \
+            and math.isfinite(pnl)
+        if (finite_pnl and pnl < 0) or (reason == "FLAT_AT_BROKER" and not finite_pnl):
             losses += 1
     return {"losses": losses, "last_exit_ts": last_exit}
 

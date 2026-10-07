@@ -234,6 +234,23 @@ class SymbolDayStateTests(unittest.TestCase):
         self.exit("ABC", None, now - timedelta(minutes=10))
         self.assertEqual(journal.symbol_day_state(self.db, "ABC", now)["losses"], 0)
 
+    def test_flat_at_broker_without_finite_pnl_counts_as_loss(self):
+        now = datetime(2026, 10, 6, 16, 0, tzinfo=timezone.utc)
+        journal.record(self.db, "EXIT", symbol="ABC", signal_id="flat-none",
+                       reason="FLAT_AT_BROKER", detail={"pnl": None}, now=now)
+        journal.record(self.db, "EXIT", symbol="ABC", signal_id="flat-bad",
+                       reason="FLAT_AT_BROKER", detail={"pnl": "unknown"},
+                       now=now - timedelta(minutes=1))
+
+        self.assertEqual(journal.symbol_day_state(self.db, "ABC", now)["losses"], 2)
+
+    def test_non_flat_exit_without_finite_pnl_does_not_count_as_loss(self):
+        now = datetime(2026, 10, 6, 16, 0, tzinfo=timezone.utc)
+        journal.record(self.db, "EXIT", symbol="ABC", signal_id="cancelled",
+                       reason="ENTRY_CANCELLED", detail={"pnl": None}, now=now)
+
+        self.assertEqual(journal.symbol_day_state(self.db, "ABC", now)["losses"], 0)
+
 
 class ManagerTests(Base):
     def test_entry_then_ratchet(self):

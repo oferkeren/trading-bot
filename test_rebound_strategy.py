@@ -279,13 +279,39 @@ class DollarScalpTests(unittest.TestCase):
     def test_same_cycle_after_exit_is_skipped(self):
         bars = make_bars(DOLLAR + [11.5])
         clean = rs._clean_bars(bars, now_after(bars))
-        last_low_ts = clean[rs.detect_cycles(clean)[-1].low_index]["timestamp"]
+        last_cycle = rs.detect_cycles(clean)[-1]
+        after_peak = clean[last_cycle.peak_index + 1:]
+        dip_low_bar = min(after_peak, key=lambda bar: (bar["low"], bar["timestamp"]))
         result = self.run_case(DOLLAR, 11.5, quote(11.51, 11.50),
-                               symbol_state={"losses": 0, "last_exit_ts": last_low_ts})
+                               symbol_state={"losses": 0,
+                                             "last_exit_ts": dip_low_bar["timestamp"]})
         self.assertEqual(result["skip_reason"], "SKIP_SAME_CYCLE")
         result = self.run_case(DOLLAR, 11.5, quote(11.51, 11.50),
-                               symbol_state={"losses": 0, "last_exit_ts": last_low_ts - 1})
+                               symbol_state={"losses": 0,
+                                             "last_exit_ts": dip_low_bar["timestamp"] - 1})
         self.assertTrue(result["qualified"], result)
+
+    def test_fade_after_winning_exit_can_start_next_cycle(self):
+        closes = [10.00, 10.00, 10.50, 11.20, 10.60] + [11.20] * 16 + [
+            12.30, 11.75, 11.75
+        ]
+        trigger = 11.90
+        bars = make_bars(closes + [trigger])
+        clean = rs._clean_bars(bars, now_after(bars))
+        last_cycle = rs.detect_cycles(clean)[-1]
+        peak_ts = clean[last_cycle.peak_index]["timestamp"]
+        dip_low_ts = clean[last_cycle.fade_index]["timestamp"]
+
+        result = self.run_case(closes, trigger, quote(11.91, 11.90))
+        self.assertTrue(result["qualified"], result)
+
+        result = self.run_case(closes, trigger, quote(11.91, 11.90),
+                               symbol_state={"losses": 0, "last_exit_ts": peak_ts})
+        self.assertTrue(result["qualified"], result)
+
+        result = self.run_case(closes, trigger, quote(11.91, 11.90),
+                               symbol_state={"losses": 0, "last_exit_ts": dip_low_ts})
+        self.assertEqual(result["skip_reason"], "SKIP_SAME_CYCLE")
 
 
 class NewsVerdictTests(unittest.TestCase):

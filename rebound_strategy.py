@@ -248,7 +248,8 @@ def analyze(candidate, bars, quote, now, env=None, symbol_state=None):
     if spike_range < MIN_SWING_USD:
         return skip("SKIP_SWING", **diagnostics)
     last_exit_ts = state.get("last_exit_ts")
-    if last_exit_ts is not None and clean[last_cycle.low_index]["timestamp"] <= last_exit_ts:
+    dip_low_bar = min(after_peak, key=lambda bar: (bar["low"], bar["timestamp"]))
+    if last_exit_ts is not None and dip_low_bar["timestamp"] <= last_exit_ts:
         return skip("SKIP_SAME_CYCLE", last_exit_ts=last_exit_ts, **diagnostics)
     if not (ENTRY_RETRACE_MIN <= retrace <= ENTRY_RETRACE_MAX):
         return skip("SKIP_RETRACE", **diagnostics)
