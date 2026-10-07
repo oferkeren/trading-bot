@@ -361,9 +361,16 @@ class NewsVerdictTests(unittest.TestCase):
     def test_pass(self):
         self.assertEqual(rs.news_verdict(self.ai()), (True, "NEWS_STRONG_POSITIVE"))
 
+    def test_reduce_with_strong_news_passes_at_reduced_size(self):
+        self.assertEqual(rs.news_verdict(self.ai(status="REDUCE")), (True, "NEWS_STRONG_REDUCED"))
+        self.assertEqual(rs.REDUCED_SIZE_FACTOR, 0.5)
+
     def test_fail_closed(self):
         cases = [(None, "NEWS_GATE_UNAVAILABLE"), (self.ai(status="BLOCK"), "AI_BLOCK"),
-                 (self.ai(status="REDUCE"), "AI_REDUCE"), (self.ai(status="SKIP"), "AI_SKIP"),
+                 (self.ai(status="SKIP"), "AI_SKIP"),
+                 (self.ai(status="REDUCE", news_count=0), "NO_RECENT_NEWS"),
+                 (self.ai(status="REDUCE", news_score=0.4), "NEWS_NOT_STRONG"),
+                 (self.ai(status="REDUCE", event_type="OFFERING"), "NEWS_NEGATIVE_EVENT"),
                  (self.ai(news_count=0), "NO_RECENT_NEWS"),
                  (self.ai(news_count=True), "NO_RECENT_NEWS"),
                  (self.ai(news_score=0.49), "NEWS_NOT_STRONG"),

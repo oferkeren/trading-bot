@@ -80,3 +80,7 @@ Review follow-ups: skip `SKIP_STOP_IN_SPREAD` when `entry - stop < 1.5 * (ask - 
 (early-premarket spreads up to 3% could put the half-swing stop inside the spread);
 the stop manager ignores bars that started before the fill, so pre-fill highs can't
 trigger an immediate trail exit with the smaller R.
+
+## Amendment (2026-10-07): trade REDUCE at half size
+
+The AI gate downgrades every BUY from PASS to REDUCE when the SPY/QQQ/IWM average is ≤ −0.5% (BEAR), which blocked all rebound entries on red market days even with strong positive news. `news_verdict` now accepts `REDUCE` when the strategy's own news rules still pass (≥1 item, score ≥ 0.5, no negative event) and returns `NEWS_STRONG_REDUCED`; the bridge then halves both the position cap and the risk cap (`REDUCED_SIZE_FACTOR = 0.5`). BLOCK/SKIP still reject.

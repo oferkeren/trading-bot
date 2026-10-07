@@ -22,6 +22,8 @@ MIN_ROOM_TO_PEAK = 0.25
 MAX_SPREAD_PCT_RTH = 1.5  # stop-in-spread guard (1.5x) also protects
 MAX_SPREAD_PCT_EXT = 1.5
 MAX_POSITION_USD = 1000.0
+# AI REDUCE (e.g. broad-market BEAR downgrade) still trades if our news rules pass, at this size.
+REDUCED_SIZE_FACTOR = 0.5
 MAX_RISK_USD = 55.0  # headroom under the server's $60 MAX_RISK_PER_TRADE_USD
 TARGET_USD = 1.00  # target = entry + min(TARGET_USD, cycle swing); stop = half that below
 MIN_SWING_USD = 0.20
@@ -172,7 +174,7 @@ def news_verdict(ai_result):
     if not isinstance(ai_result, dict):
         return False, "NEWS_GATE_UNAVAILABLE"
     status = str(ai_result.get("status") or "").strip().upper()
-    if status != "PASS":
+    if status not in ("PASS", "REDUCE"):
         return False, f"AI_{status or 'NONE'}"
     count = ai_result.get("news_count")
     if isinstance(count, bool) or not isinstance(count, int) or count < 1:
@@ -186,7 +188,7 @@ def news_verdict(ai_result):
         return False, "NEWS_NOT_STRONG"
     if str(ai.get("event_type") or "").strip().upper() in NEGATIVE_EVENTS:
         return False, "NEWS_NEGATIVE_EVENT"
-    return True, "NEWS_STRONG_POSITIVE"
+    return True, "NEWS_STRONG_POSITIVE" if status == "PASS" else "NEWS_STRONG_REDUCED"
 
 
 def exit_levels(entry, swing):

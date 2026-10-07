@@ -614,9 +614,10 @@ def process_rebound_candidate(candidate, secret, db_file=None):
         return skip("SKIP_SIZE")
     if not (math.isfinite(entry) and math.isfinite(stop)) or entry <= 0 or stop >= entry:
         return skip("SKIP_SIZE")
+    size_factor = rebound_strategy.REDUCED_SIZE_FACTOR if reason == "NEWS_STRONG_REDUCED" else 1.0
     quantity = min(
-        math.floor(rebound_strategy.MAX_POSITION_USD / entry),
-        math.floor(rebound_strategy.MAX_RISK_USD / (entry - stop)),
+        math.floor(rebound_strategy.MAX_POSITION_USD * size_factor / entry),
+        math.floor(rebound_strategy.MAX_RISK_USD * size_factor / (entry - stop)),
     )
     if quantity < 1:
         return skip("SKIP_SIZE")
@@ -630,7 +631,7 @@ def process_rebound_candidate(candidate, secret, db_file=None):
         reason=(outcome or {}).get("status"),
         detail={"entry": final_candidate.get("entry"), "stop": final_candidate.get("stop"),
                 "target": final_candidate.get("target"), "quantity": quantity,
-                "news": news, "rebound": final_candidate.get("rebound")},
+                "size_factor": size_factor, "news": news, "rebound": final_candidate.get("rebound")},
     )
     return outcome
 

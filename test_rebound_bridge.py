@@ -60,6 +60,19 @@ class ProcessReboundCandidateTests(unittest.TestCase):
         self.assertEqual(posted_candidate["_ai_final_quantity"], 500)
         self.assertEqual(self.journal_with_detail()[0][2]["quantity"], 500)
 
+    def test_reduce_with_strong_news_posts_half_size(self):
+        self.run_with(MagicMock(return_value={**STRONG, "status": "REDUCE"}))
+        posted_candidate = self.post.call_args.args[0]
+        self.assertEqual(posted_candidate["_ai_final_quantity"], 250)
+        self.assertEqual(self.journal_with_detail()[0][2]["size_factor"], 0.5)
+
+    def test_reduce_halves_risk_cap_too(self):
+        candidate = {**CANDIDATE, "entry": 2.0, "stop": 1.88}
+        with patch.object(ai_signal_bridge.ai_gate, "evaluate_trade_candidate",
+                          MagicMock(return_value={**STRONG, "status": "REDUCE"})):
+            ai_signal_bridge.process_rebound_candidate(candidate, "s", db_file=self.db)
+        self.assertEqual(self.post.call_args.args[0]["_ai_final_quantity"], 229)
+
     def test_rebound_payload_includes_designed_quantity_without_gate_marker(self):
         self.run_with(MagicMock(return_value=STRONG))
         posted_candidate = self.post.call_args.args[0]
