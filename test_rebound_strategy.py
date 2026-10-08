@@ -152,7 +152,7 @@ class AnalyzeTests(unittest.TestCase):
         self.assertIsNone(rs.exit_levels(0.50, 1.2))  # stop would be 0
 
     def test_price_bounds_and_invalid_inputs(self):
-        self.assertEqual(self.skip(self.run_case(q=quote(25.0, 24.99))), "SKIP_PRICE")
+        self.assertEqual(self.skip(self.run_case(q=quote(80.5, 80.49))), "SKIP_PRICE")
         self.assertEqual(self.skip(self.run_case(q={"bid": None, "ask": 1})), "SKIP_QUOTE_INVALID")
         self.assertEqual(self.skip(self.run_case(q=quote(1.10, 1.20))), "SKIP_QUOTE_INVALID")
         bad = make_bars(TWO_CYCLES + [TRIGGER])
@@ -342,6 +342,11 @@ class DollarScalpTests(unittest.TestCase):
         self.assertTrue(tight["qualified"], tight)
         wide = rs.analyze({"symbol": "x"}, bars, quote(10.61, 10.35), now_after(bars), PAPER)
         self.assertEqual(wide["skip_reason"], "SKIP_STOP_IN_SPREAD")
+
+    def test_price_cap_is_eighty_dollars(self):
+        import scanner
+        self.assertEqual(rs.MAX_PRICE, 80.0)
+        self.assertGreaterEqual(scanner.MAX_PRICE, rs.MAX_PRICE)
 
     def test_swing_floor_is_twenty_cents(self):
         self.assertEqual(rs.MIN_SWING_USD, 0.20)
