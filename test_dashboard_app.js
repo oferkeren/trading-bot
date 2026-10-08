@@ -97,6 +97,21 @@ function testTopBar() {
   assert.equal(doc.nodes.killButton.textContent, "Enable kill switch");
 }
 
+function testAccount() {
+  const doc = fakeDoc();
+  app.renderAccount(doc, { broker: { net_liquidation: 10352.71, total_cash_value: 10352.71,
+    available_funds: 9000, daily_pnl: -12.5, snapshot_age_seconds: 4 } });
+  assert.equal(doc.nodes.acctNetLiq.textContent, "10,352.71");
+  assert.equal(doc.nodes.acctCash.textContent, "10,352.71");
+  assert.equal(doc.nodes.acctAvailable.textContent, "9,000.00");
+  assert.equal(doc.nodes.acctDailyPnl.textContent, "-12.50");
+  assert.match(doc.nodes.acctDailyPnl.className, /neg/);
+  app.renderAccount(doc, { broker: { net_liquidation: 1, total_cash_value: 1, snapshot_age_seconds: 61 } });
+  assert.equal(doc.nodes.acctCash.textContent, "STALE");
+  app.renderAccount(doc, null);
+  assert.equal(doc.nodes.acctNetLiq.textContent, "UNAVAILABLE");
+}
+
 function testPositionsAndOrders() {
   const doc = fakeDoc();
   const portfolio = {
@@ -402,6 +417,7 @@ function testNoUnsafeHtmlSinks() {
 (async () => {
   testPureHelpers();
   testTopBar();
+  testAccount();
   testPositionsAndOrders();
   testHealth();
   await testKillSwitchFlow();

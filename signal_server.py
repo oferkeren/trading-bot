@@ -2306,6 +2306,16 @@ def dashboard_summary(
                     "available_funds"
                 ),
 
+            "total_cash_value":
+                runtime.get(
+                    "total_cash_value"
+                ),
+
+            "buying_power":
+                runtime.get(
+                    "buying_power"
+                ),
+
             "daily_pnl":
                 runtime.get(
                     "daily_pnl"

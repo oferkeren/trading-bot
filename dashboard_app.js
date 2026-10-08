@@ -8,6 +8,7 @@
   const RESEARCH_POLL_MS = 60000;
   const REBOUND_POLL_MS = 15000;
   const REBOUND_KPI_IDS = ["reboundTrades", "reboundWinLoss", "reboundPnl"];
+  const ACCOUNT_IDS = ["acctNetLiq", "acctCash", "acctAvailable", "acctDailyPnl"];
   const POSITION_IDS = ["posManagedCount", "posTotalCount", "posMarketValue", "posUnrealized",
     "posUnprotected"];
 
@@ -169,6 +170,23 @@
       setText(doc, "killButton", "Enable kill switch");
     }
     return typeof kill === "boolean" ? kill : null;
+  }
+
+  function renderAccount(doc, summary) {
+    const broker = object(object(summary).broker);
+    const age = broker.snapshot_age_seconds;
+    if (!Number.isFinite(age)) {
+      ACCOUNT_IDS.forEach(id => setText(doc, id, "UNAVAILABLE", "kpi-value muted"));
+      return;
+    }
+    if (age > IBKR_MAX_AGE_SECONDS) {
+      ACCOUNT_IDS.forEach(id => setText(doc, id, "STALE", "kpi-value muted"));
+      return;
+    }
+    setText(doc, "acctNetLiq", num(broker.net_liquidation), "kpi-value");
+    setText(doc, "acctCash", num(broker.total_cash_value), "kpi-value");
+    setText(doc, "acctAvailable", num(broker.available_funds), "kpi-value");
+    setText(doc, "acctDailyPnl", signed(broker.daily_pnl), "kpi-value " + pnlClass(broker.daily_pnl));
   }
 
   function renderModePanel(doc, mode) {
@@ -367,6 +385,7 @@
         status: status.status === "fulfilled" ? status.value : null,
         mode: state.mode,
       });
+      renderAccount(doc, state.summary);
     }
 
     async function refreshActive() {
@@ -541,7 +560,7 @@
   }
 
   const api = { TABS, tabFromHash, ibkrState, modeLabel, killSwitchBody, modeConfirmations,
-    renderTopBar, renderPositions, renderOrders, renderHealth, renderRebound, markUnavailable,
+    renderTopBar, renderAccount, renderPositions, renderOrders, renderHealth, renderRebound, markUnavailable,
     createApp };
   if (typeof module !== "undefined" && module.exports) {
     module.exports = api;

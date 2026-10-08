@@ -26,6 +26,7 @@ REQUIRED_IDS = {
     "modeText", "modeAccount", "modePaperBtn", "modeLiveBtn", "modeMessage",
     "killModal", "killModalTitle", "killModalText", "killReason", "killError",
     "killCancel", "killConfirm",
+    "acctNetLiq", "acctCash", "acctAvailable", "acctDailyPnl",
 }
 REMOVED_MARKERS = ("Strategy Pipeline", "Top Gainers", "Scanner Universe", "Hot Pool",
                    "Trading Day", "Systemd Services", "Recent Signals", "Event Stream",

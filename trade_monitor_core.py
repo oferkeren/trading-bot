@@ -1981,6 +1981,26 @@ def repair_identity(
     )
 
 
+def merge_split_exit(entry_fill, target_fill, stop_fill):
+    """IBKR OCA reduce-on-fill can split one exit across TP and SL.
+
+    Returns (dominant_leg, merged_fill) when the combined exit does not exceed the
+    entry, else None (a real double exit).
+    """
+    if not entry_fill:
+        return None
+    shares = target_fill["shares"] + stop_fill["shares"]
+    if shares > entry_fill["shares"] + 1e-9:
+        return None
+    price = (
+        target_fill["shares"] * target_fill["price"]
+        + stop_fill["shares"] * stop_fill["price"]
+    ) / shares
+    times = [t for t in (target_fill.get("time"), stop_fill.get("time")) if t]
+    leg = "TP" if target_fill["shares"] > stop_fill["shares"] else "SL"
+    return leg, {"shares": shares, "price": price, "time": max(times) if times else None}
+
+
 def calculate_realized_pnl(
     action,
     entry_fill,
@@ -2183,6 +2203,19 @@ def reconcile_signal(
         stop_execs
     )
 
+
+    split_exit = (
+        merge_split_exit(entry_fill, target_fill, stop_fill)
+        if target_fill and stop_fill
+        else None
+    )
+
+    if split_exit:
+        leg, merged = split_exit
+        if leg == "TP":
+            target_fill, stop_fill = merged, None
+        else:
+            target_fill, stop_fill = None, merged
 
     if (
         target_fill
